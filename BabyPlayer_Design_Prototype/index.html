@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BabyPlayer V1 设计稿</title>
+  <link rel="stylesheet" href="styles.css?v=4" />
+</head>
+<body>
+  <main class="prototype-shell">
+    <aside class="screen-index" aria-label="设计页面目录">
+      <div class="index-brand">
+        <span class="brand-orbit"></span>
+        <div>
+          <strong>BabyPlayer</strong>
+          <small>V1 页面设计稿</small>
+        </div>
+      </div>
+      <p class="index-note">方向键模拟遥控器，Enter 确认，Esc 返回。</p>
+      <nav id="screen-links"></nav>
+    </aside>
+    <section class="stage-wrap">
+      <div id="stage" class="stage" aria-live="polite"></div>
+    </section>
+  </main>
+  <script src="app.js?v=4"></script>
+</body>
+</html>
