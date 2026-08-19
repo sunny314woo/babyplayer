@@ -45,7 +45,7 @@ V1 需求与 UI 已冻结，允许进入开发。当前先验证 Jellyfin 与 tv
 ## 当前技术 Spike
 
 - [x] 安装并启动 Jellyfin 10.11.11（Apple Silicon）
-- [ ] 完成 Jellyfin 初始化并扫描至少一条测试视频
+- [x] 完成 Jellyfin 初始化并扫描至少一条测试视频（当前已扫描 3 条 MP4）
 - [ ] 创建最小 tvOS SwiftUI 工程并通过 `xcodebuild`
 - [ ] 验证 Jellyfin Quick Connect
 - [ ] 获取一条真实测试视频
