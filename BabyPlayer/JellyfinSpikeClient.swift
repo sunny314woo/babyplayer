@@ -1,8 +1,8 @@
 //
 // JellyfinSpikeClient.swift
 // 用途：封装技术 Spike 所需的最小 Jellyfin HTTP API。
-// 主要功能：服务器探测、Quick Connect、读取首条视频和生成直放 URL。
-// 最近修改：2026-07-29 创建真实 Jellyfin 端到端验证链路。
+// 主要功能：服务器探测、Quick Connect、读取视频库和生成直放 URL。
+// 最近修改：2026-08-20 从单视频 Spike 扩展为全量媒体列表。
 //
 
 import Foundation
@@ -75,16 +75,37 @@ struct JellyfinMediaSource: Decodable {
     }
 }
 
+/// Jellyfin 章节标记；可在服务器已标注时识别片头和片尾。
+struct JellyfinChapter: Decodable {
+    let startPositionTicks: Int64
+    let name: String
+
+    enum CodingKeys: String, CodingKey {
+        case startPositionTicks = "StartPositionTicks"
+        case name = "Name"
+    }
+}
+
 /// 首页查询返回的最小视频模型。
-struct JellyfinMediaItem: Decodable {
+struct JellyfinMediaItem: Decodable, Identifiable {
     let id: String
     let name: String
+    let collectionType: String?
+    let artists: [String]?
+    let runTimeTicks: Int64?
     let mediaSources: [JellyfinMediaSource]?
+    let imageTags: [String: String]?
+    let chapters: [JellyfinChapter]?
 
     enum CodingKeys: String, CodingKey {
         case id = "Id"
         case name = "Name"
+        case collectionType = "CollectionType"
+        case artists = "Artists"
+        case runTimeTicks = "RunTimeTicks"
         case mediaSources = "MediaSources"
+        case imageTags = "ImageTags"
+        case chapters = "Chapters"
     }
 }
 
@@ -97,6 +118,17 @@ private struct JellyfinItemsResponse: Decodable {
     }
 }
 
+/// Jellyfin 后台任务状态，用于等待媒体库扫描结束。
+private struct JellyfinScheduledTask: Decodable {
+    let key: String
+    let state: String
+
+    enum CodingKeys: String, CodingKey {
+        case key = "Key"
+        case state = "State"
+    }
+}
+
 /// Spike 可显示的普通错误；不会泄漏服务器响应正文或访问令牌。
 enum JellyfinSpikeError: LocalizedError {
     case invalidServerAddress
@@ -105,6 +137,7 @@ enum JellyfinSpikeError: LocalizedError {
     case httpStatus(Int)
     case quickConnectDisabled
     case incompleteAuthentication
+    case musicVideoLibraryNotFound
     case noVideo
     case unsupportedMedia
 
@@ -122,6 +155,8 @@ enum JellyfinSpikeError: LocalizedError {
             return "服务器未开启 Quick Connect"
         case .incompleteAuthentication:
             return "配对已批准，但没有取得完整授权"
+        case .musicVideoLibraryNotFound:
+            return "Jellyfin 中没有找到“音乐视频”媒体库"
         case .noVideo:
             return "媒体库中还没有可用视频"
         case .unsupportedMedia:
@@ -194,27 +229,49 @@ struct JellyfinSpikeClient {
         )
     }
 
-    /// 查询当前用户可见的第一条视频；输入为认证用户和令牌，输出为一个媒体项。
-    func fetchFirstVideo(userID: String, accessToken: String) async throws -> JellyfinMediaItem {
+    /// 查询“音乐视频”媒体库；其它 Jellyfin 媒体库不会混入 BabyPlayer。
+    func fetchVideos(userID: String, accessToken: String) async throws -> [JellyfinMediaItem] {
+        let views: JellyfinItemsResponse = try await send(
+            path: "UserViews",
+            queryItems: [URLQueryItem(name: "userId", value: userID)],
+            accessToken: accessToken
+        )
+        guard let musicVideoLibrary = views.items.first(where: {
+            $0.collectionType?.caseInsensitiveCompare("musicvideos") == .orderedSame
+        }) ?? views.items.first(where: {
+            $0.name.caseInsensitiveCompare("音乐视频") == .orderedSame
+        }) else {
+            throw JellyfinSpikeError.musicVideoLibraryNotFound
+        }
+
         let response: JellyfinItemsResponse = try await send(
             path: "Items",
             queryItems: [
                 URLQueryItem(name: "userId", value: userID),
+                URLQueryItem(name: "parentId", value: musicVideoLibrary.id),
                 URLQueryItem(name: "recursive", value: "true"),
-                URLQueryItem(name: "includeItemTypes", value: "Video,Movie,Episode,MusicVideo"),
+                URLQueryItem(name: "includeItemTypes", value: "Video,MusicVideo"),
                 URLQueryItem(name: "mediaTypes", value: "Video"),
-                URLQueryItem(name: "fields", value: "MediaSources,Path"),
+                // 【MODIFIED】同时请求 ImageTags，避免服务器已有封面因字段缺失被误判为无封面。
+                URLQueryItem(name: "fields", value: "MediaSources,Path,Chapters,Artists,ImageTags"),
                 URLQueryItem(name: "sortBy", value: "SortName"),
                 URLQueryItem(name: "sortOrder", value: "Ascending"),
-                URLQueryItem(name: "limit", value: "1")
+                URLQueryItem(name: "limit", value: "200")
             ],
             accessToken: accessToken
         )
 
-        guard let firstVideo = response.items.first else {
+        guard !response.items.isEmpty else {
             throw JellyfinSpikeError.noVideo
         }
-        return firstVideo
+        return response.items
+    }
+
+    /// 保留 Spike 的单视频调用语义，供首条视频快捷播放使用。
+    func fetchFirstVideo(userID: String, accessToken: String) async throws -> JellyfinMediaItem {
+        try await fetchVideos(userID: userID, accessToken: accessToken).first ?? {
+            throw JellyfinSpikeError.noVideo
+        }()
     }
 
     /// 【MODIFIED】生成 AVPlayer 可直接请求的 Jellyfin 静态视频 URL；访问令牌只存在 URL 内存值中。
@@ -237,6 +294,41 @@ struct JellyfinSpikeClient {
                 URLQueryItem(name: "api_key", value: accessToken)
             ]
         )
+    }
+
+    /// 生成带认证的 Jellyfin 横版封面 URL；无封面时返回 nil，由 UI 显示占位图。
+    func primaryImageURL(for item: JellyfinMediaItem, accessToken: String, maxWidth: Int = 620) -> URL? {
+        guard let tag = item.imageTags?["Primary"] else { return nil }
+        return try? endpointURL(
+            path: "Items/\(item.id)/Images/Primary",
+            queryItems: [
+                URLQueryItem(name: "maxWidth", value: String(maxWidth)),
+                URLQueryItem(name: "quality", value: "88"),
+                URLQueryItem(name: "tag", value: tag),
+                URLQueryItem(name: "api_key", value: accessToken)
+            ]
+        )
+    }
+
+    /// 触发 Jellyfin 完整媒体库扫描，会检测新增、移动和已删除的文件。
+    func startLibraryScan(accessToken: String) async throws {
+        try await sendWithoutResponse(
+            path: "Library/Refresh",
+            method: "POST",
+            accessToken: accessToken
+        )
+    }
+
+    /// 读取后台任务；返回 true 表示媒体库扫描仍在运行。
+    func isLibraryScanRunning(accessToken: String) async throws -> Bool {
+        let tasks: [JellyfinScheduledTask] = try await send(
+            path: "ScheduledTasks",
+            accessToken: accessToken
+        )
+        return tasks.contains {
+            $0.key.caseInsensitiveCompare("RefreshLibrary") == .orderedSame
+                && $0.state.caseInsensitiveCompare("Running") == .orderedSame
+        }
     }
 
     /// 执行并解码一个 Jellyfin 请求；副作用仅为网络访问，不记录请求正文或令牌。
@@ -267,6 +359,27 @@ struct JellyfinSpikeClient {
             return try JSONDecoder().decode(Response.self, from: data)
         } catch {
             throw JellyfinSpikeError.invalidResponse
+        }
+    }
+
+    /// 执行不返回 JSON 正文的 Jellyfin 操作（例如开始扫描）。
+    private func sendWithoutResponse(
+        path: String,
+        method: String,
+        accessToken: String
+    ) async throws {
+        let url = try endpointURL(path: path)
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(authorizationHeader(accessToken: accessToken), forHTTPHeaderField: "Authorization")
+
+        let (_, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw JellyfinSpikeError.invalidResponse
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw JellyfinSpikeError.httpStatus(httpResponse.statusCode)
         }
     }
 

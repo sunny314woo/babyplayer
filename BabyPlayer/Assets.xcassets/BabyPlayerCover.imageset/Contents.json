@@ -1,0 +1,13 @@
+{
+  "images" : [
+    {
+      "filename" : "BabyPlayerCover.png",
+      "idiom" : "tv",
+      "scale" : "1x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

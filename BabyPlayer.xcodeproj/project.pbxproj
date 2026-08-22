@@ -12,6 +12,10 @@
 		A10000000000000000000003 /* SpikeViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* SpikeViewModel.swift */; };
 		A10000000000000000000004 /* SpikeRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* SpikeRootView.swift */; };
 		A10000000000000000000005 /* SystemPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* SystemPlayerView.swift */; };
+		A10000000000000000000008 /* LyricsRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* LyricsRepository.swift */; };
+		A10000000000000000000009 /* MediaCoverLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* MediaCoverLoader.swift */; };
+		A1000000000000000000000A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* Assets.xcassets */; };
+		A1000000000000000000000B /* BabyLyricsCatalog.json in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* BabyLyricsCatalog.json */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,6 +26,10 @@
 		A20000000000000000000005 /* SystemPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemPlayerView.swift; sourceTree = "<group>"; };
 		A20000000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A20000000000000000000007 /* BabyPlayer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BabyPlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000000000000000000008 /* LyricsRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsRepository.swift; sourceTree = "<group>"; };
+		A20000000000000000000009 /* MediaCoverLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaCoverLoader.swift; sourceTree = "<group>"; };
+		A2000000000000000000000A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A2000000000000000000000B /* BabyLyricsCatalog.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = BabyLyricsCatalog.json; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -51,6 +59,10 @@
 				A20000000000000000000003 /* SpikeViewModel.swift */,
 				A20000000000000000000004 /* SpikeRootView.swift */,
 				A20000000000000000000005 /* SystemPlayerView.swift */,
+				A20000000000000000000008 /* LyricsRepository.swift */,
+				A20000000000000000000009 /* MediaCoverLoader.swift */,
+				A2000000000000000000000A /* Assets.xcassets */,
+				A2000000000000000000000B /* BabyLyricsCatalog.json */,
 				A20000000000000000000006 /* Info.plist */,
 			);
 			path = BabyPlayer;
@@ -122,6 +134,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A1000000000000000000000A /* Assets.xcassets in Resources */,
+				A1000000000000000000000B /* BabyLyricsCatalog.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -137,6 +151,8 @@
 				A10000000000000000000003 /* SpikeViewModel.swift in Sources */,
 				A10000000000000000000004 /* SpikeRootView.swift in Sources */,
 				A10000000000000000000005 /* SystemPlayerView.swift in Sources */,
+				A10000000000000000000008 /* LyricsRepository.swift in Sources */,
+				A10000000000000000000009 /* MediaCoverLoader.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -183,7 +199,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				SDKROOT = appletvos;
 				SWIFT_COMPILATION_MODE = wholemodule;
-		};
+			};
 			name = Release;
 		};
 		A90000000000000000000003 /* Debug */ = {
@@ -191,15 +207,19 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = RD2D85V483;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = BabyPlayer/Info.plist;
-				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				MARKETING_VERSION = 0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.wufengyu.BabyPlayer;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 3;
 				TVOS_DEPLOYMENT_TARGET = 18.0;
@@ -211,15 +231,19 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = RD2D85V483;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = BabyPlayer/Info.plist;
-				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				MARKETING_VERSION = 0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.wufengyu.BabyPlayer;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 3;
 				TVOS_DEPLOYMENT_TARGET = 18.0;
