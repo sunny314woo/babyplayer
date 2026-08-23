@@ -1,11 +1,22 @@
 //
 // BabyPlayerASR.swift
 // Apple TV 本地提取 M4A、管理音频缓存、调用独立 ASR 代理并在本地匹配歌词。
+// 当前主要功能：缓存/额度预检、腾讯声音证据、确定性同歌判断、AI 歌词校时与渐进修复。
+// 最近修改：2026-08-23 为 Version C 引入全局单调 alignment 和非 raw-ASR 的 AI Lyrics v1。
+// 最近修改：2026-08-23 让远程 MP4 先加载音轨再导出，并将片头片尾边界安全裁剪到真实媒体时长。
+// 最近修改：2026-08-23 为 tvOS 不能直接导出的 Jellyfin 网络 MP4 增加低优先级临时下载回退。
+// 最近修改：2026-08-23 取消完整 M4A 前置与长期音频库，改用可复用的临时 ASR 分段、全局时间戳合并和首段早停。
 //
 
 import AVFoundation
 import CryptoKit
 import Foundation
+import OSLog
+
+private let babyPlayerASRLogger = Logger(
+    subsystem: "com.wufengyu.BabyPlayer",
+    category: "AILyrics"
+)
 
 struct BabyPlayerASRWord: Codable, Sendable {
     let text: String
@@ -94,6 +105,61 @@ enum BabyPlayerASRError: LocalizedError {
         case .audioExportFailed:
             return "暂时无法从这个视频提取歌曲音频"
         }
+    }
+}
+
+// 【MODIFIED】单曲循环下可恢复错误使用集中的封顶退避，不影响播放线程。
+enum BabyPlayerAIAnalysisRetryPolicy {
+    static let delaysSeconds: [TimeInterval] = [2, 5, 12, 30, 60]
+
+    /// 计算退避时间；输入为已连续失败次数，输出秒数，不修改状态。
+    static func delay(afterFailureCount count: Int) -> TimeInterval {
+        guard let last = delaysSeconds.last else { return 60 }
+        guard count > 0 else { return delaysSeconds.first ?? last }
+        return delaysSeconds[min(count - 1, delaysSeconds.count - 1)]
+    }
+
+    /// 判断错误是否适合后台重试；输入为 Error，输出布尔值，不修改 UI/repository。
+    static func shouldRetry(_ error: Error) -> Bool {
+        if error is URLError { return true }
+        guard let asrError = error as? BabyPlayerASRError else { return false }
+        switch asrError {
+        case .audioExportFailed, .invalidResponse, .server:
+            return true
+        case .notConfigured, .cacheMiss, .monthlyLimit:
+            return false
+        }
+    }
+}
+
+struct BabyPlayerAudioExportWindow: Equatable, Sendable {
+    let startSeconds: Double
+    let durationSeconds: Double
+}
+
+// 【MODIFIED】片头/片尾只是首选歌曲边界，不能因元数据越界让 AI 歌词整体不可用。
+enum BabyPlayerAudioExportPolicy {
+    static let minimumUsableDuration: Double = 1
+
+    /// 把建议片段裁剪到真实资产时长；输入起点、时长和资产时长，输出可选安全窗口，不修改状态。
+    static func clampedWindow(
+        startSeconds: Double,
+        durationSeconds: Double,
+        assetDurationSeconds: Double
+    ) -> BabyPlayerAudioExportWindow? {
+        guard assetDurationSeconds.isFinite,
+              assetDurationSeconds >= minimumUsableDuration else { return nil }
+        let requestedStart = max(0, startSeconds)
+        let safeStart = requestedStart <= assetDurationSeconds - minimumUsableDuration
+            ? requestedStart
+            : 0
+        let available = assetDurationSeconds - safeStart
+        let safeDuration = min(max(0, durationSeconds), available)
+        guard safeDuration >= minimumUsableDuration else { return nil }
+        return BabyPlayerAudioExportWindow(
+            startSeconds: safeStart,
+            durationSeconds: safeDuration
+        )
     }
 }
 
@@ -247,6 +313,351 @@ private extension Data {
     }
 }
 
+// 【MODIFIED】ASR 只准备短命分段；它不代表播放器缓存，也不会成为长期离线音频资产。
+struct BabyPlayerASRAudioSegment: Equatable, Sendable {
+    let index: Int
+    let startSeconds: Double
+    let durationSeconds: Double
+
+    var endSeconds: Double { startSeconds + durationSeconds }
+    var isTemporary: Bool { true }
+
+    /// 生成服务端 segment cache key；输入为媒体 fingerprint，输出稳定 SHA256，不修改状态。
+    func fingerprint(mediaFingerprint: String) -> String {
+        let startMilliseconds = Int((startSeconds * 1_000).rounded())
+        let durationMilliseconds = Int((durationSeconds * 1_000).rounded())
+        let raw = "babyplayer-asr-segment-v1|\(mediaFingerprint)|\(index)|\(startMilliseconds)|\(durationMilliseconds)"
+        return SHA256.hash(data: Data(raw.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
+// 【MODIFIED】分段长度与 overlap 只在这里定义，后续可按真实儿歌数据统一调整。
+enum BabyPlayerASRSegmentPolicy {
+    static let durationSeconds: Double = 60
+    static let overlapSeconds: Double = 3
+    static let minimumUsableDurationSeconds: Double = 1
+    static var advanceSeconds: Double { durationSeconds - overlapSeconds }
+
+    /// 计算歌曲在源媒体中的安全窗口；输入为媒体描述，输出起点与歌曲时长，不修改状态。
+    static func songWindow(for media: LyricsMediaDescriptor) -> BabyPlayerAudioExportWindow? {
+        let totalDuration = media.durationSeconds ?? 0
+        guard totalDuration >= minimumUsableDurationSeconds else { return nil }
+        let requestedStart = max(0, media.songStartSeconds ?? 0)
+        let safeStart = requestedStart <= totalDuration - minimumUsableDurationSeconds
+            ? requestedStart
+            : 0
+        let requestedEnd = min(totalDuration, media.songEndSeconds ?? totalDuration)
+        let safeEnd = requestedEnd > safeStart ? requestedEnd : totalDuration
+        let duration = safeEnd - safeStart
+        guard duration >= minimumUsableDurationSeconds else { return nil }
+        return BabyPlayerAudioExportWindow(startSeconds: safeStart, durationSeconds: duration)
+    }
+
+    /// 为媒体建立歌曲相对分段；输入为媒体描述，输出按 index 排序的临时 segment，不修改状态。
+    static func segments(for media: LyricsMediaDescriptor) -> [BabyPlayerASRAudioSegment] {
+        guard let window = songWindow(for: media) else { return [] }
+        return segments(forSongDuration: window.durationSeconds)
+    }
+
+    /// 为歌曲时长建立连续覆盖计划；输入为秒数，输出含固定 overlap 的 segment，不修改状态。
+    static func segments(forSongDuration songDuration: Double) -> [BabyPlayerASRAudioSegment] {
+        guard songDuration >= minimumUsableDurationSeconds,
+              durationSeconds > overlapSeconds,
+              advanceSeconds > 0 else { return [] }
+        var result: [BabyPlayerASRAudioSegment] = []
+        var start: Double = 0
+        var index = 0
+        while start < songDuration {
+            let duration = min(durationSeconds, songDuration - start)
+            guard duration >= minimumUsableDurationSeconds else { break }
+            result.append(BabyPlayerASRAudioSegment(
+                index: index,
+                startSeconds: start,
+                durationSeconds: duration
+            ))
+            if start + duration >= songDuration { break }
+            start += advanceSeconds
+            index += 1
+        }
+        return result
+    }
+}
+
+struct BabyPlayerASRSegmentResult: Sendable {
+    let segment: BabyPlayerASRAudioSegment
+    let analysis: BabyPlayerASRAnalysis
+}
+
+// 【MODIFIED】Tencent 分段局部 timestamp 在本地转换为歌曲全局 timestamp，并在 overlap 内确定性去重。
+enum BabyPlayerASRSegmentMerger {
+    private struct IndexedWord {
+        let segment: BabyPlayerASRAudioSegment
+        let word: BabyPlayerASRWord
+        let localOrder: Int
+    }
+
+    /// 合并分段分析；输入为按任意顺序到达的 segment result，输出单调、去重的完整 ASR 证据，不修改状态。
+    static func merge(_ results: [BabyPlayerASRSegmentResult]) -> BabyPlayerASRAnalysis {
+        precondition(!results.isEmpty, "At least one ASR segment result is required")
+        let sortedResults = results.sorted { $0.segment.index < $1.segment.index }
+        var accepted: [IndexedWord] = []
+
+        for result in sortedResults {
+            let globalWords = result.analysis.segments.flatMap(\.words).enumerated().map { order, word in
+                IndexedWord(
+                    segment: result.segment,
+                    word: BabyPlayerASRWord(
+                        text: word.text,
+                        startSeconds: result.segment.startSeconds + word.startSeconds,
+                        endSeconds: result.segment.startSeconds + word.endSeconds
+                    ),
+                    localOrder: order
+                )
+            }
+            for indexed in globalWords {
+                let isInsideLeadingOverlap = indexed.segment.index > 0
+                    && indexed.word.startSeconds
+                        <= indexed.segment.startSeconds + BabyPlayerASRSegmentPolicy.overlapSeconds
+                let isDuplicate = isInsideLeadingOverlap && accepted.contains { existing in
+                    normalize(existing.word.text) == normalize(indexed.word.text)
+                        && abs(existing.word.startSeconds - indexed.word.startSeconds)
+                            <= BabyPlayerASRSegmentPolicy.overlapSeconds
+                }
+                if !isDuplicate {
+                    accepted.append(indexed)
+                }
+            }
+        }
+
+        accepted.sort {
+            if $0.word.startSeconds != $1.word.startSeconds {
+                return $0.word.startSeconds < $1.word.startSeconds
+            }
+            if $0.segment.index != $1.segment.index {
+                return $0.segment.index < $1.segment.index
+            }
+            return $0.localOrder < $1.localOrder
+        }
+        let words = accepted.map(\.word)
+        let shiftedSegmentBounds = sortedResults.flatMap { result in
+            result.analysis.segments.map { segment in
+                (
+                    result.segment.startSeconds + segment.startSeconds,
+                    result.segment.startSeconds + segment.endSeconds
+                )
+            }
+        }
+        let start = words.first?.startSeconds ?? shiftedSegmentBounds.map(\.0).min() ?? 0
+        let end = words.last?.endSeconds ?? shiftedSegmentBounds.map(\.1).max() ?? start
+        let transcript = words.isEmpty
+            ? sortedResults.map(\.analysis.transcript).filter { !$0.isEmpty }.joined(separator: " ")
+            : words.map(\.text).joined(separator: " ")
+        let last = sortedResults.last!.analysis
+        return BabyPlayerASRAnalysis(
+            status: last.status,
+            cacheHit: sortedResults.allSatisfy(\.analysis.cacheHit),
+            provider: last.provider,
+            engineType: last.engineType,
+            audioDurationSeconds: sortedResults.map(\.segment.endSeconds).max() ?? end,
+            transcript: transcript,
+            segments: [BabyPlayerASRSegment(
+                text: transcript,
+                startSeconds: start,
+                endSeconds: end,
+                words: words
+            )],
+            monthlyUsedSeconds: sortedResults.map(\.analysis.monthlyUsedSeconds).max() ?? 0,
+            monthlyReservedSeconds: last.monthlyReservedSeconds,
+            monthlyLimitSeconds: last.monthlyLimitSeconds
+        )
+    }
+
+    /// 规范化 overlap 比较文本；输入为单词，输出小写字母数字序列，不修改状态。
+    private static func normalize(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .unicodeScalars
+            .filter(CharacterSet.alphanumerics.contains)
+            .map(String.init)
+            .joined()
+    }
+}
+
+// 【MODIFIED】第一段只有在内容证据明确不相干时早停；证据不足不会被误判成 mismatch。
+enum BabyPlayerASRFirstSegmentPolicy {
+    private static let clearlyMismatchedConfidence = 0.30
+    private static let clearlyMismatchedContentEvidence = 0.18
+
+    /// 判断是否继续其余 segment；输入为第一段最佳同歌证据，输出继续与否，不修改状态。
+    static func shouldContinue(after evidence: BabyPlayerSameSongEvidence?) -> Bool {
+        guard let evidence else { return true }
+        let strongestContent = max(
+            evidence.normalizedTextSimilarity,
+            evidence.orderedTokenSimilarity,
+            evidence.asrCoverage
+        )
+        return !(evidence.sameSongConfidence < clearlyMismatchedConfidence
+            && strongestContent < clearlyMismatchedContentEvidence)
+    }
+}
+
+struct BabyPlayerPreparedASRSegment: Sendable {
+    let segment: BabyPlayerASRAudioSegment
+    let fileURL: URL
+    let generatedDurationSeconds: Double
+    let fileSize: Int64
+}
+
+// 【MODIFIED】媒体源无关的临时分段提取器；只理解可访问 AVAsset，不保存完整歌曲副本。
+actor BabyPlayerASRAudioSegmentPreparer {
+    static let shared = BabyPlayerASRAudioSegmentPreparer()
+    private let fileManager = FileManager.default
+
+    /// 生成一个临时 M4A segment；输入为队列媒体和分段，输出临时文件元数据，会修改临时目录但不修改 repository/UI。
+    func prepare(
+        item: BabyPlayerQueueItem,
+        segment: BabyPlayerASRAudioSegment
+    ) async throws -> BabyPlayerPreparedASRSegment {
+        try Task.checkCancellation()
+        guard let songWindow = BabyPlayerASRSegmentPolicy.songWindow(for: item.lyricsMedia) else {
+            throw BabyPlayerASRError.audioExportFailed
+        }
+        let sourceStart = songWindow.startSeconds + segment.startSeconds
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("BabyPlayer-ASR-Segments", isDirectory: true)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = directory
+            .appendingPathComponent("segment-\(segment.index)-\(UUID().uuidString)")
+            .appendingPathExtension("m4a")
+        babyPlayerASRLogger.info(
+            "Segment preparation start index=\(segment.index, privacy: .public) start=\(segment.startSeconds, privacy: .public) intendedDuration=\(segment.durationSeconds, privacy: .public)"
+        )
+        do {
+            let asset = AVURLAsset(url: item.url)
+            babyPlayerASRLogger.info(
+                "Remote AVAsset extraction start index=\(segment.index, privacy: .public)"
+            )
+            do {
+                try await export(
+                    asset: asset,
+                    sourceStartSeconds: sourceStart,
+                    durationSeconds: segment.durationSeconds,
+                    to: destination
+                )
+            } catch {
+                try Task.checkCancellation()
+                babyPlayerASRLogger.info(
+                    "Segment fallback path start index=\(segment.index, privacy: .public) mode=audio-composition"
+                )
+                try await exportThroughAudioComposition(
+                    asset: asset,
+                    sourceStartSeconds: sourceStart,
+                    durationSeconds: segment.durationSeconds,
+                    to: destination
+                )
+            }
+            try Task.checkCancellation()
+            let attributes = try fileManager.attributesOfItem(atPath: destination.path)
+            let bytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            let generatedDuration = try await AVURLAsset(url: destination).load(.duration).seconds
+            babyPlayerASRLogger.info(
+                "Segment extraction completed index=\(segment.index, privacy: .public) generatedDuration=\(generatedDuration, privacy: .public) fileSize=\(bytes, privacy: .public)"
+            )
+            return BabyPlayerPreparedASRSegment(
+                segment: segment,
+                fileURL: destination,
+                generatedDurationSeconds: generatedDuration,
+                fileSize: bytes
+            )
+        } catch is CancellationError {
+            try? fileManager.removeItem(at: destination)
+            babyPlayerASRLogger.notice(
+                "Segment task cancelled index=\(segment.index, privacy: .public)"
+            )
+            throw CancellationError()
+        } catch {
+            try? fileManager.removeItem(at: destination)
+            let nsError = error as NSError
+            babyPlayerASRLogger.error(
+                "Segment extraction failed index=\(segment.index, privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)"
+            )
+            throw BabyPlayerASRError.audioExportFailed
+        }
+    }
+
+    /// 删除已上传的临时 segment；输入为 prepared segment，无输出，会修改临时目录。
+    func remove(_ prepared: BabyPlayerPreparedASRSegment) {
+        try? fileManager.removeItem(at: prepared.fileURL)
+    }
+
+    /// 直接从可访问媒体导出指定时间段；输入为 AVAsset、源时间范围和目标 URL，无输出，会创建临时 M4A。
+    private func export(
+        asset: AVAsset,
+        sourceStartSeconds: Double,
+        durationSeconds: Double,
+        to destination: URL
+    ) async throws {
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        let loadedDuration = try await asset.load(.duration).seconds
+        guard !audioTracks.isEmpty,
+              let window = BabyPlayerAudioExportPolicy.clampedWindow(
+                startSeconds: sourceStartSeconds,
+                durationSeconds: durationSeconds,
+                assetDurationSeconds: loadedDuration
+              ),
+              let exporter = AVAssetExportSession(
+                asset: asset,
+                presetName: AVAssetExportPresetAppleM4A
+              ) else {
+            throw BabyPlayerASRError.audioExportFailed
+        }
+        exporter.timeRange = CMTimeRange(
+            start: CMTime(seconds: window.startSeconds, preferredTimescale: 600),
+            duration: CMTime(seconds: window.durationSeconds, preferredTimescale: 600)
+        )
+        try await exporter.export(to: destination, as: .m4a)
+    }
+
+    /// 用音频 composition 重试同一短时间段；输入为源 AVAsset、时间范围和目标 URL，无输出，会替换失败的临时文件。
+    private func exportThroughAudioComposition(
+        asset: AVAsset,
+        sourceStartSeconds: Double,
+        durationSeconds: Double,
+        to destination: URL
+    ) async throws {
+        if fileManager.fileExists(atPath: destination.path) {
+            try? fileManager.removeItem(at: destination)
+        }
+        guard let audioTrack = try await asset.loadTracks(withMediaType: .audio).first else {
+            throw BabyPlayerASRError.audioExportFailed
+        }
+        let loadedDuration = try await asset.load(.duration).seconds
+        guard let window = BabyPlayerAudioExportPolicy.clampedWindow(
+            startSeconds: sourceStartSeconds,
+            durationSeconds: durationSeconds,
+            assetDurationSeconds: loadedDuration
+        ) else { throw BabyPlayerASRError.audioExportFailed }
+        let composition = AVMutableComposition()
+        guard let compositionTrack = composition.addMutableTrack(
+            withMediaType: .audio,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else { throw BabyPlayerASRError.audioExportFailed }
+        let sourceRange = CMTimeRange(
+            start: CMTime(seconds: window.startSeconds, preferredTimescale: 600),
+            duration: CMTime(seconds: window.durationSeconds, preferredTimescale: 600)
+        )
+        try compositionTrack.insertTimeRange(sourceRange, of: audioTrack, at: .zero)
+        guard let exporter = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetAppleM4A
+        ) else { throw BabyPlayerASRError.audioExportFailed }
+        try await exporter.export(to: destination, as: .m4a)
+    }
+}
+
+// 【MODIFIED】2026-08-23 冻结：完整歌曲 M4A 音频库已取消。保留历史实现仅供迁移审计，禁止参与编译或被 UI 调用。
+#if false
 struct BabyPlayerAudioCacheEntry: Codable, Identifiable, Sendable {
     var id: String
     let title: String
@@ -333,13 +744,32 @@ actor BabyPlayerAudioCache {
         if fileManager.fileExists(atPath: playbackDestination.path) {
             try fileManager.removeItem(at: playbackDestination)
         }
-        let asset = AVURLAsset(url: item.url)
-        try await export(
-            asset: asset,
-            startSeconds: start,
-            durationSeconds: fullDuration,
-            to: playbackDestination
-        )
+        var asset = AVURLAsset(url: item.url)
+        var temporaryMediaURL: URL?
+        defer {
+            if let temporaryMediaURL {
+                try? fileManager.removeItem(at: temporaryMediaURL)
+            }
+        }
+        do {
+            try await export(
+                asset: asset,
+                startSeconds: start,
+                durationSeconds: fullDuration,
+                to: playbackDestination
+            )
+        } catch BabyPlayerASRError.audioExportFailed where !item.url.isFileURL {
+            // 【MODIFIED】AVPlayer 仍使用原网络 URL 播放；只有后台提取改用短命临时文件。
+            let downloadedURL = try await downloadRemoteMediaForExtraction(from: item.url)
+            temporaryMediaURL = downloadedURL
+            asset = AVURLAsset(url: downloadedURL)
+            try await export(
+                asset: asset,
+                startSeconds: start,
+                durationSeconds: fullDuration,
+                to: playbackDestination
+            )
+        }
         let attributes = try fileManager.attributesOfItem(atPath: playbackDestination.path)
         let bytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
 
@@ -409,7 +839,11 @@ actor BabyPlayerAudioCache {
 
     nonisolated static func completeSongDuration(for media: LyricsMediaDescriptor) -> Double {
         let totalDuration = media.durationSeconds ?? 0
-        let start = max(0, media.songStartSeconds ?? 0)
+        // 【MODIFIED】越界的片头边界回退为 0，不让分析因跳过设置而直接作废。
+        let requestedStart = max(0, media.songStartSeconds ?? 0)
+        let start = requestedStart <= totalDuration - BabyPlayerAudioExportPolicy.minimumUsableDuration
+            ? requestedStart
+            : 0
         let songEnd = min(totalDuration, media.songEndSeconds ?? totalDuration)
         let available = songEnd > start ? songEnd - start : max(0, totalDuration - start)
         return available
@@ -449,21 +883,68 @@ actor BabyPlayerAudioCache {
         durationSeconds: Double,
         to destination: URL
     ) async throws {
-        guard let exporter = AVAssetExportSession(
-            asset: asset,
-            presetName: AVAssetExportPresetAppleM4A
-        ) else { throw BabyPlayerASRError.audioExportFailed }
-        exporter.timeRange = CMTimeRange(
-            start: CMTime(seconds: startSeconds, preferredTimescale: 600),
-            duration: CMTime(seconds: durationSeconds, preferredTimescale: 600)
-        )
         do {
+            // 【MODIFIED】远程 Jellyfin MP4 在创建 exporter 前必须先加载音轨与真实时长。
+            let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+            let loadedDuration = try await asset.load(.duration).seconds
+            guard !audioTracks.isEmpty,
+                  let window = BabyPlayerAudioExportPolicy.clampedWindow(
+                    startSeconds: startSeconds,
+                    durationSeconds: durationSeconds,
+                    assetDurationSeconds: loadedDuration
+                  ),
+                  let exporter = AVAssetExportSession(
+                    asset: asset,
+                    presetName: AVAssetExportPresetAppleM4A
+                  ) else {
+                throw BabyPlayerASRError.audioExportFailed
+            }
+            exporter.timeRange = CMTimeRange(
+                start: CMTime(seconds: window.startSeconds, preferredTimescale: 600),
+                duration: CMTime(seconds: window.durationSeconds, preferredTimescale: 600)
+            )
             try await exporter.export(to: destination, as: .m4a)
         } catch {
             if fileManager.fileExists(atPath: destination.path) {
                 try? fileManager.removeItem(at: destination)
             }
-            throw error
+            let nsError = error as NSError
+            babyPlayerASRLogger.error(
+                "Audio export failed domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)"
+            )
+            throw BabyPlayerASRError.audioExportFailed
+        }
+    }
+
+    // 【MODIFIED】仅当 AVAssetExportSession 无法直接读取远程 MP4 时使用低优先级下载回退。
+    /// 下载用于音频提取的临时媒体；输入为已认证 Jellyfin URL，输出系统临时 URL，会使用网络但不修改 UI/repository。
+    private func downloadRemoteMediaForExtraction(from sourceURL: URL) async throws -> URL {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.networkServiceType = .background
+        configuration.timeoutIntervalForRequest = 90
+        configuration.timeoutIntervalForResource = 600
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        do {
+            let (temporaryURL, response) = try await session.download(from: sourceURL)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  fileManager.fileExists(atPath: temporaryURL.path) else {
+                throw BabyPlayerASRError.audioExportFailed
+            }
+            // 【MODIFIED】URLSession 的 download URL 只在回调生命期可靠，先移到本 App 的临时目录再返回。
+            let fileExtension = sourceURL.pathExtension.isEmpty ? "mp4" : sourceURL.pathExtension
+            let stableTemporaryURL = fileManager.temporaryDirectory
+                .appendingPathComponent("BabyPlayer-ASR-\(UUID().uuidString)")
+                .appendingPathExtension(fileExtension)
+            try fileManager.moveItem(at: temporaryURL, to: stableTemporaryURL)
+            return stableTemporaryURL
+        } catch {
+            let nsError = error as NSError
+            babyPlayerASRLogger.error(
+                "Temporary media download failed domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)"
+            )
+            throw BabyPlayerASRError.audioExportFailed
         }
     }
 
@@ -521,109 +1002,288 @@ actor BabyPlayerAudioCache {
         }
     }
 }
+#endif
+
+// 【MODIFIED】对外携带集中计算的同歌证据，供受限 DeepSeek repair 请求使用。
+struct BabyPlayerSameSongEvidence: Codable, Sendable {
+    let normalizedTextSimilarity: Double
+    let orderedTokenSimilarity: Double
+    let titleSimilarity: Double
+    let asrCoverage: Double
+    let temporalOrder: Double
+    let sameSongConfidence: Double
+}
 
 struct BabyPlayerASRMatchOutcome: Sendable {
     let candidates: [LyricsCandidate]
     let selected: LyricsCandidate?
     let offsetSeconds: Double?
     let message: String
+    let shouldAutomaticallyApply: Bool
+    let sameSongEvidence: BabyPlayerSameSongEvidence?
+
+    // 【MODIFIED】区分“可生成 AI candidate”与“证据强到可自动展示”。
+    /// 创建匹配结果；输入为候选、可选 AI 结果、偏移、消息和自动应用许可，输出为不可变结果，不修改状态。
+    init(
+        candidates: [LyricsCandidate],
+        selected: LyricsCandidate?,
+        offsetSeconds: Double?,
+        message: String,
+        shouldAutomaticallyApply: Bool = false,
+        sameSongEvidence: BabyPlayerSameSongEvidence? = nil
+    ) {
+        self.candidates = candidates
+        self.selected = selected
+        self.offsetSeconds = offsetSeconds
+        self.message = message
+        self.shouldAutomaticallyApply = shouldAutomaticallyApply
+        self.sameSongEvidence = sameSongEvidence
+    }
 }
+
+/// AI v1 渐进回调；输入为已确定性校时的 outcome，输出为 Void，回到 MainActor 更新 UI/repository。
+typealias BabyPlayerAILyricsProgressHandler = @MainActor @Sendable (
+    BabyPlayerASRMatchOutcome
+) async -> Void
+
+// 【MODIFIED】同 fingerprint 共享一份轻量 in-flight Task；切歌/页面退出可按 key 安全取消。
+actor BabyPlayerASRTaskRegistry {
+    private struct Entry {
+        let id: UUID
+        let task: Task<BabyPlayerASRMatchOutcome, Error>
+    }
+
+    private var inFlight: [String: Entry] = [:]
+
+    /// 复用或创建分析任务；输入为 fingerprint 和工作闭包，输出共享结果，会修改 registry 内存状态。
+    func value(
+        for fingerprint: String,
+        operation: @escaping @Sendable () async throws -> BabyPlayerASRMatchOutcome
+    ) async throws -> BabyPlayerASRMatchOutcome {
+        if let existing = inFlight[fingerprint] {
+            return try await existing.task.value
+        }
+        let entryID = UUID()
+        let task = Task { try await operation() }
+        inFlight[fingerprint] = Entry(id: entryID, task: task)
+        defer {
+            if inFlight[fingerprint]?.id == entryID {
+                inFlight[fingerprint] = nil
+            }
+        }
+        return try await task.value
+    }
+
+    /// 取消指定媒体工作；输入为 fingerprint，无输出，会取消并移除 registry task。
+    func cancel(_ fingerprint: String) {
+        if let entry = inFlight.removeValue(forKey: fingerprint) {
+            babyPlayerASRLogger.notice("Analysis task cancelled for media fingerprint")
+            entry.task.cancel()
+        }
+    }
+
+    /// 取消全部媒体工作；无输入输出，会清空 registry。
+    func cancelAll() {
+        if !inFlight.isEmpty {
+            babyPlayerASRLogger.notice(
+                "All analysis tasks cancelled count=\(self.inFlight.count, privacy: .public)"
+            )
+        }
+        for entry in inFlight.values { entry.task.cancel() }
+        inFlight.removeAll()
+    }
+}
+
+// 【MODIFIED】UI 阶段与真实链路一一对应；只有进入上传时才使用 recognizing。
+enum BabyPlayerASRProcessingStage: Equatable, Sendable {
+    case preparingAudio(index: Int, total: Int)
+    case recognizing(index: Int, total: Int)
+    case aligning
+    case refining
+}
+
+/// ASR 阶段回调；输入为真实处理阶段，无输出，回到 MainActor 更新 UI。
+typealias BabyPlayerASRStageHandler = @MainActor @Sendable (
+    BabyPlayerASRProcessingStage
+) async -> Void
 
 actor BabyPlayerASRCoordinator {
     static let shared = BabyPlayerASRCoordinator()
-    private var inFlight: [String: Task<BabyPlayerASRMatchOutcome, Error>] = [:]
+    private let taskRegistry = BabyPlayerASRTaskRegistry()
 
     func analyze(
         item: BabyPlayerQueueItem,
         candidates: [LyricsCandidate],
-        reference: LyricsPlainTextReference?
+        reference: LyricsPlainTextReference?,
+        onStage: BabyPlayerASRStageHandler? = nil,
+        onAILyricsV1: BabyPlayerAILyricsProgressHandler? = nil
     ) async throws -> BabyPlayerASRMatchOutcome {
         let fingerprint = item.lyricsMedia.asrFingerprint
-        if let existing = inFlight[fingerprint] {
-            return try await existing.value
-        }
-        let task = Task {
+        return try await taskRegistry.value(for: fingerprint) {
             try await Self.performAnalysis(
                 item: item,
                 candidates: candidates,
                 reference: reference,
-                fingerprint: fingerprint
+                fingerprint: fingerprint,
+                onStage: onStage,
+                onAILyricsV1: onAILyricsV1
             )
         }
-        inFlight[fingerprint] = task
-        defer { inFlight[fingerprint] = nil }
-        return try await task.value
+    }
+
+    /// 取消指定媒体分析；输入为 fingerprint，无输出，会终止临时提取/上传并清理 registry。
+    func cancel(mediaFingerprint: String) async {
+        await taskRegistry.cancel(mediaFingerprint)
+    }
+
+    /// 页面生命周期结束时取消全部分析；无输入输出，会终止 coordinator 持有的所有工作。
+    func cancelAll() async {
+        await taskRegistry.cancelAll()
     }
 
     private static func performAnalysis(
         item: BabyPlayerQueueItem,
         candidates: [LyricsCandidate],
         reference: LyricsPlainTextReference?,
-        fingerprint: String
+        fingerprint: String,
+        onStage: BabyPlayerASRStageHandler?,
+        onAILyricsV1: BabyPlayerAILyricsProgressHandler?
     ) async throws -> BabyPlayerASRMatchOutcome {
         let client = try BabyPlayerASRClient()
-        let analysis: BabyPlayerASRAnalysis
-        var reusedServerCache = false
-        do {
-            analysis = try await client.cachedAnalysis(mediaFingerprint: fingerprint)
-            reusedServerCache = true
-        } catch BabyPlayerASRError.cacheMiss {
-            // 缓存查询优先；只有明确未命中后才检查额度、提取并上传。
-            let expectedDuration = BabyPlayerAudioCache.recognitionDuration(for: item.lyricsMedia)
-            guard expectedDuration >= 1 else { throw BabyPlayerASRError.audioExportFailed }
-            let usage = try await client.usage()
-            try BabyPlayerASRQuotaPolicy.validate(usage, requestedSeconds: expectedDuration)
-            let sample = try await BabyPlayerAudioCache.shared.cachedOrExtract(item: item)
-            analysis = try await client.analyze(
-                sampleURL: sample.recognitionURL,
-                durationSeconds: sample.recognitionDurationSeconds,
-                mediaFingerprint: fingerprint
+        let plannedSegments = BabyPlayerASRSegmentPolicy.segments(for: item.lyricsMedia)
+        guard !plannedSegments.isEmpty else { throw BabyPlayerASRError.audioExportFailed }
+        var segmentResults: [BabyPlayerASRSegmentResult] = []
+        for segment in plannedSegments {
+            try Task.checkCancellation()
+            babyPlayerASRLogger.info(
+                "Next segment start index=\(segment.index, privacy: .public) total=\(plannedSegments.count, privacy: .public) start=\(segment.startSeconds, privacy: .public) duration=\(segment.durationSeconds, privacy: .public)"
             )
+            let segmentFingerprint = segment.fingerprint(mediaFingerprint: fingerprint)
+            let segmentAnalysis: BabyPlayerASRAnalysis
+            do {
+                segmentAnalysis = try await client.cachedAnalysis(
+                    mediaFingerprint: segmentFingerprint
+                )
+            } catch BabyPlayerASRError.cacheMiss {
+                let usage = try await client.usage()
+                try BabyPlayerASRQuotaPolicy.validate(
+                    usage,
+                    requestedSeconds: segment.durationSeconds
+                )
+                await onStage?(.preparingAudio(
+                    index: segment.index + 1,
+                    total: plannedSegments.count
+                ))
+                let prepared = try await BabyPlayerASRAudioSegmentPreparer.shared.prepare(
+                    item: item,
+                    segment: segment
+                )
+                do {
+                    try Task.checkCancellation()
+                    await onStage?(.recognizing(
+                        index: segment.index + 1,
+                        total: plannedSegments.count
+                    ))
+                    babyPlayerASRLogger.info(
+                        "Upload /v1/analyze start index=\(segment.index, privacy: .public) duration=\(prepared.generatedDurationSeconds, privacy: .public) fileSize=\(prepared.fileSize, privacy: .public)"
+                    )
+                    segmentAnalysis = try await client.analyze(
+                        sampleURL: prepared.fileURL,
+                        durationSeconds: min(
+                            segment.durationSeconds,
+                            prepared.generatedDurationSeconds
+                        ),
+                        mediaFingerprint: segmentFingerprint
+                    )
+                    babyPlayerASRLogger.info(
+                        "/v1/analyze response received index=\(segment.index, privacy: .public) status=\(segmentAnalysis.status, privacy: .public)"
+                    )
+                } catch {
+                    await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
+                    throw error
+                }
+                await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
+            }
+            segmentResults.append(BabyPlayerASRSegmentResult(
+                segment: segment,
+                analysis: segmentAnalysis
+            ))
+
+            if segment.index == 0, plannedSegments.count > 1 {
+                let firstAnalysis = BabyPlayerASRSegmentMerger.merge(segmentResults)
+                let preliminary = BabyPlayerLyricsSoundMatcher.match(
+                    analysis: firstAnalysis,
+                    candidates: candidates.first.map { [$0] } ?? [],
+                    reference: reference,
+                    sampleStartSeconds: item.lyricsMedia.songStartSeconds ?? 0,
+                    mediaTitle: item.lyricsMedia.searchTitle
+                )
+                if !BabyPlayerASRFirstSegmentPolicy.shouldContinue(
+                    after: preliminary.sameSongEvidence
+                ) {
+                    babyPlayerASRLogger.notice(
+                        "First segment clearly mismatched; remaining segments stopped"
+                    )
+                    return preliminary
+                }
+            }
         }
+        babyPlayerASRLogger.info(
+            "All segments completed count=\(segmentResults.count, privacy: .public)"
+        )
+        let analysis = BabyPlayerASRSegmentMerger.merge(segmentResults)
+        await onStage?(.aligning)
+        babyPlayerASRLogger.info("Alignment start")
         let result = BabyPlayerLyricsSoundMatcher.match(
             analysis: analysis,
             candidates: candidates,
             reference: reference,
-            sampleStartSeconds: item.lyricsMedia.songStartSeconds ?? 0
+            sampleStartSeconds: item.lyricsMedia.songStartSeconds ?? 0,
+            mediaTitle: item.lyricsMedia.searchTitle
         )
+        babyPlayerASRLogger.info(
+            "Alignment end selected=\(result.selected != nil, privacy: .public) autoApply=\(result.shouldAutomaticallyApply, privacy: .public)"
+        )
+        // 【MODIFIED】T1 在确定性 retiming 完成的立即时刻发布，绝不等 DeepSeek。
+        if result.selected != nil {
+            await onAILyricsV1?(result)
+        }
         let finalResult: BabyPlayerASRMatchOutcome
+        // 【MODIFIED】没有通过 same-song + alignment 的 AI v1 时，DeepSeek 没有修复对象，直接保留普通歌词。
+        guard let aiLyricsV1 = result.selected else { return result }
         do {
+            await onStage?(.refining)
+            babyPlayerASRLogger.info("DeepSeek refinement start")
             let refined = try await BabyPlayerLyricsRefinerClient().refine(
                 analysis: analysis,
-                candidates: candidates,
-                reference: reference,
+                aiLyricsV1: aiLyricsV1,
+                evidence: result.sameSongEvidence,
                 mediaFingerprint: fingerprint
             )
             finalResult = BabyPlayerASRMatchOutcome(
                 candidates: [refined] + result.candidates.filter { $0.id != refined.id },
                 selected: refined,
                 offsetSeconds: item.lyricsMedia.songStartSeconds ?? 0,
-                message: "DeepSeek Flash 已校正文案，并保留腾讯 ASR 时间轴"
+                message: "AI 优化完成",
+                shouldAutomaticallyApply: result.shouldAutomaticallyApply,
+                sameSongEvidence: result.sameSongEvidence
             )
+            babyPlayerASRLogger.info("DeepSeek refinement end status=completed")
         } catch BabyPlayerASRError.notConfigured {
+            babyPlayerASRLogger.info("DeepSeek refinement end status=not-configured")
             finalResult = result
         } catch {
+            let nsError = error as NSError
+            babyPlayerASRLogger.error(
+                "DeepSeek refinement end status=failed domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)"
+            )
             finalResult = BabyPlayerASRMatchOutcome(
                 candidates: result.candidates,
                 selected: result.selected,
                 offsetSeconds: result.offsetSeconds,
-                message: "\(result.message) · AI 文案校正暂不可用"
-            )
-        }
-        if reusedServerCache {
-            // VPS 缓存命中时先立即使用转写，再以低优先级补齐本地完整 M4A。
-            // 音频库和识别缓存是两份独立资产，命中不应让本地音频永久缺失。
-            Task(priority: .utility) {
-                _ = try? await BabyPlayerAudioCache.shared.cachedOrExtract(item: item)
-                await BabyPlayerAudioCache.shared.markAnalyzed(
-                    mediaID: item.id,
-                    matchedTitle: finalResult.selected?.trackName
-                )
-            }
-        } else {
-            await BabyPlayerAudioCache.shared.markAnalyzed(
-                mediaID: item.id,
-                matchedTitle: finalResult.selected?.trackName
+                message: "\(result.message) · 文字优化失败",
+                shouldAutomaticallyApply: result.shouldAutomaticallyApply,
+                sameSongEvidence: result.sameSongEvidence
             )
         }
         return finalResult
@@ -631,11 +1291,56 @@ actor BabyPlayerASRCoordinator {
 }
 
 enum BabyPlayerLyricsSoundMatcher {
+    // 【MODIFIED】全局单调 alignment 的所有调参都集中在此，避免算法内散落 magic number。
+    private enum AlignmentPolicy {
+        static let minimumLineSimilarity = 0.38
+        static let maximumLengthUnderrun = 2
+        static let maximumLengthOverrun = 3
+        static let lineSkipPenalty = 0.58
+        static let leadingWordSkipPenalty = 0.006
+        static let internalWordSkipPenalty = 0.08
+        static let trailingWordSkipPenalty = 0.006
+        static let matchBaseReward = 0.9
+        static let matchTokenReward = 0.22
+        static let minimumLineCoverage = 0.55
+        static let minimumWordCoverage = 0.45
+        static let comparisonEpsilon = 0.000_001
+    }
+
+    private struct AlignmentPredecessor {
+        let row: Int
+        let column: Int
+        let matchedLineIndex: Int?
+        let matchedWordIndex: Int?
+        let matchedWordCount: Int
+    }
+
+    // 【MODIFIED】Version C 的同歌置信度只在这里定义权重和阈值。
+    private enum SameSongPolicy {
+        static let normalizedTextWeight = 0.28
+        static let orderedPhraseWeight = 0.30
+        static let titleWeight = 0.14
+        static let asrCoverageWeight = 0.18
+        static let temporalOrderWeight = 0.10
+        static let missingTitleEvidence = 0.50
+        static let minimumContentEvidence = 0.30
+        static let minimumTemporalOrder = 0.75
+        static let minimumConfidenceForAICandidate = 0.43
+        static let minimumConfidenceForAutomaticApply = 0.58
+        static let minimumAutomaticLead = 0.06
+    }
+
+    private struct ScoredCandidate {
+        let candidate: LyricsCandidate
+        let evidence: BabyPlayerSameSongEvidence
+    }
+
     static func match(
         analysis: BabyPlayerASRAnalysis,
         candidates: [LyricsCandidate],
         reference: LyricsPlainTextReference?,
         sampleStartSeconds: Double,
+        mediaTitle: String? = nil,
         preferSoundTimeline: Bool = true
     ) -> BabyPlayerASRMatchOutcome {
         let transcript = analysis.transcript.isEmpty
@@ -651,7 +1356,9 @@ enum BabyPlayerLyricsSoundMatcher {
             )
         }
 
-        var available = candidates
+        // 【MODIFIED】重新分析时从普通来源重建同 anchor AI Lyrics，不把旧 AI v2 嵌套成新 AI identity。
+        let ordinaryCandidates = candidates.filter { $0.identityAnchor == nil }
+        var available = ordinaryCandidates.isEmpty ? candidates : ordinaryCandidates
         if let reference,
            !available.contains(where: { $0.id == reference.id }),
            let aligned = alignedReferenceCandidate(
@@ -663,14 +1370,21 @@ enum BabyPlayerLyricsSoundMatcher {
         }
         let scored = available.map { candidate in
             let lyricTokens = tokens(candidate.lines.map(\.text).joined(separator: " "))
-            let sound = similarity(transcriptTokens, lyricTokens)
-            let metadata = Double(candidate.matchPercentage) / 100
-            return (candidate, sound, sound * 0.8 + metadata * 0.2)
+            return ScoredCandidate(
+                candidate: candidate,
+                evidence: sameSongEvidence(
+                    transcriptTokens: transcriptTokens,
+                    lyricTokens: lyricTokens,
+                    mediaTitle: mediaTitle,
+                    candidate: candidate,
+                    analysis: analysis
+                )
+            )
         }.sorted {
-            if $0.2 == $1.2 {
-                return $0.0.persistentIdentifier < $1.0.persistentIdentifier
+            if $0.evidence.sameSongConfidence == $1.evidence.sameSongConfidence {
+                return $0.candidate.persistentIdentifier < $1.candidate.persistentIdentifier
             }
-            return $0.2 > $1.2
+            return $0.evidence.sameSongConfidence > $1.evidence.sameSongConfidence
         }
 
         guard let best = scored.first else {
@@ -679,60 +1393,153 @@ enum BabyPlayerLyricsSoundMatcher {
                 message: "没有可供声音核验的歌词"
             )
         }
-        let margin = best.2 - (scored.dropFirst().first?.2 ?? 0)
-        let confident = best.1 >= 0.48 && (scored.count == 1 || margin >= 0.08)
+        let runnerUpConfidence = scored.dropFirst().first?.evidence.sameSongConfidence ?? 0
+        let margin = best.evidence.sameSongConfidence - runnerUpConfidence
+        let permitsAICandidate = best.evidence.sameSongConfidence
+            >= SameSongPolicy.minimumConfidenceForAICandidate
+            && max(
+                best.evidence.normalizedTextSimilarity,
+                best.evidence.orderedTokenSimilarity
+            ) >= SameSongPolicy.minimumContentEvidence
+            && best.evidence.temporalOrder >= SameSongPolicy.minimumTemporalOrder
+        let permitsAutomaticApply = permitsAICandidate
+            && best.evidence.sameSongConfidence >= SameSongPolicy.minimumConfidenceForAutomaticApply
+            && (scored.count == 1 || margin >= SameSongPolicy.minimumAutomaticLead)
         var selected: LyricsCandidate?
         var offset: Double?
         var message: String
-        if confident && best.0.providerName == "本地歌本·自动校时" {
-            selected = best.0
+        if permitsAICandidate && best.candidate.providerName?.contains("本地歌本") == true {
+            selected = best.candidate
             offset = sampleStartSeconds
             message = "已用声音时间戳校准本地歌本"
-        } else if confident,
+        } else if permitsAICandidate,
                   preferSoundTimeline,
-                  let retimed = retimedCandidate(best.0, analysis: analysis) {
+                  let retimed = retimedCandidate(best.candidate, analysis: analysis) {
             selected = retimed
             offset = sampleStartSeconds
-            message = "已忽略网络时间轴，并用声音逐行重新校时"
-        } else if confident,
+            message = "AI 校时完成"
+        } else if permitsAICandidate,
                   !preferSoundTimeline,
                   let estimated = estimatedOffset(
                 segments: analysis.segments,
-                lines: best.0.lines,
+                lines: best.candidate.lines,
                 sampleStartSeconds: sampleStartSeconds
                   ) {
-            selected = best.0
+            selected = best.candidate
             offset = estimated
             message = "声音核验已匹配并校正整体偏移"
-        } else if preferSoundTimeline,
-                  let direct = directASRCandidate(analysis) {
-            selected = direct
-            offset = sampleStartSeconds
-            message = confident
-                ? "歌词文字可匹配但无法可靠逐行对齐，已使用声音识别字幕"
-                : "歌词候选不明确，已使用声音识别字幕"
         } else {
-            selected = confident ? best.0 : nil
+            // 【MODIFIED】Version C 中声音时间线是生成 AI 结果的必要条件；对齐失败时不自动绑定 raw ASR 或旧时间轴。
+            selected = (!preferSoundTimeline && permitsAICandidate) ? best.candidate : nil
             offset = nil
-            message = confident
-                ? "声音已确认歌词，但时间轴不足以自动校准"
-                : "声音核验结果接近，请家长确认"
+            message = permitsAICandidate
+                ? "已确认大致是同一首歌，但时间证据不足，保留普通歌词"
+                : "未确认匹配，保留普通歌词"
         }
         let referenceScore = reference.map { similarity(transcriptTokens, tokens($0.plainLyrics)) }
         let referenceMessage = referenceScore.map { " · 歌本核验 \(Int($0 * 100)) 分" } ?? ""
-        var orderedCandidates = scored.map(\.0)
+        var orderedCandidates = scored.map(\.candidate)
         if let selected,
            !orderedCandidates.contains(where: { $0.persistentIdentifier == selected.persistentIdentifier }) {
-            // 重校时版本替代同源的旧 LRC，避免 UI 同时显示两个相同标题。
-            orderedCandidates.removeAll { $0.id == selected.id }
+            // 【MODIFIED】AI v1 是独立可选对象，保留原普通候选；DeepSeek v2 只更新这一 AI identity。
             orderedCandidates.insert(selected, at: 0)
         }
         return BabyPlayerASRMatchOutcome(
             candidates: orderedCandidates,
             selected: selected,
             offsetSeconds: offset,
-            message: "\(message)\(referenceMessage)"
+            message: "\(message)\(referenceMessage)",
+            shouldAutomaticallyApply: permitsAutomaticApply && selected != nil,
+            sameSongEvidence: best.evidence
         )
+    }
+
+    // 【MODIFIED】综合文本、顺序、标题、coverage 和时间单调性，不用单一 similarity magic number。
+    /// 计算 sameSongConfidence；输入为 ASR/歌词 tokens、标题、候选和时间证据，输出为集中证据结构，不修改状态。
+    private static func sameSongEvidence(
+        transcriptTokens: [String],
+        lyricTokens: [String],
+        mediaTitle: String?,
+        candidate: LyricsCandidate,
+        analysis: BabyPlayerASRAnalysis
+    ) -> BabyPlayerSameSongEvidence {
+        let normalizedText = similarity(transcriptTokens, lyricTokens)
+        let ordered = orderedTokenCoverage(query: transcriptTokens, reference: lyricTokens)
+        let title: Double
+        if let mediaTitle, !tokens(mediaTitle).isEmpty {
+            title = symmetricOrderedSimilarity(tokens(mediaTitle), tokens(candidate.trackName))
+        } else {
+            title = max(
+                SameSongPolicy.missingTitleEvidence,
+                Double(candidate.matchPercentage) / 100
+            )
+        }
+        let coverage = multisetCoverage(query: transcriptTokens, reference: lyricTokens)
+        let temporal = temporalOrderScore(analysis)
+        let confidence = normalizedText * SameSongPolicy.normalizedTextWeight
+            + ordered * SameSongPolicy.orderedPhraseWeight
+            + title * SameSongPolicy.titleWeight
+            + coverage * SameSongPolicy.asrCoverageWeight
+            + temporal * SameSongPolicy.temporalOrderWeight
+        return BabyPlayerSameSongEvidence(
+            normalizedTextSimilarity: normalizedText,
+            orderedTokenSimilarity: ordered,
+            titleSimilarity: title,
+            asrCoverage: coverage,
+            temporalOrder: temporal,
+            sameSongConfidence: confidence
+        )
+    }
+
+    /// 计算 ASR token 按原顺序在歌词中的覆盖；输入两个 token 序列，输出 0...1，不修改状态。
+    private static func orderedTokenCoverage(query: [String], reference: [String]) -> Double {
+        guard !query.isEmpty, !reference.isEmpty else { return 0 }
+        var previous = Array(repeating: 0, count: reference.count + 1)
+        for queryToken in query {
+            var current = Array(repeating: 0, count: reference.count + 1)
+            for referenceIndex in reference.indices {
+                if queryToken == reference[referenceIndex] {
+                    current[referenceIndex + 1] = previous[referenceIndex] + 1
+                } else {
+                    current[referenceIndex + 1] = max(
+                        previous[referenceIndex + 1],
+                        current[referenceIndex]
+                    )
+                }
+            }
+            previous = current
+        }
+        return Double(previous.last ?? 0) / Double(query.count)
+    }
+
+    /// 对短标题做对称顺序比较；输入两个 token 序列，输出 0...1，不修改状态。
+    private static func symmetricOrderedSimilarity(_ lhs: [String], _ rhs: [String]) -> Double {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
+        return min(
+            orderedTokenCoverage(query: lhs, reference: rhs),
+            orderedTokenCoverage(query: rhs, reference: lhs)
+        )
+    }
+
+    /// 计算含重复词的 ASR coverage；输入查询和参考 tokens，输出 0...1，不修改状态。
+    private static func multisetCoverage(query: [String], reference: [String]) -> Double {
+        guard !query.isEmpty else { return 0 }
+        var counts = Dictionary(grouping: reference, by: { $0 }).mapValues(\.count)
+        var matches = 0
+        for token in query where (counts[token] ?? 0) > 0 {
+            matches += 1
+            counts[token, default: 0] -= 1
+        }
+        return Double(matches) / Double(query.count)
+    }
+
+    /// 检查 ASR sentence/word timestamps 的单调性；输入为 analysis，输出 0...1 的有序边比例，不修改状态。
+    private static func temporalOrderScore(_ analysis: BabyPlayerASRAnalysis) -> Double {
+        let wordTimes = analysis.segments.flatMap(\.words).map(\.startSeconds)
+        let times = wordTimes.count >= 2 ? wordTimes : analysis.segments.map(\.startSeconds)
+        guard times.count >= 2 else { return 1 }
+        let orderedEdges = zip(times, times.dropFirst()).filter { $0 <= $1 }.count
+        return Double(orderedEdges) / Double(times.count - 1)
     }
 
     private static func retimedCandidate(
@@ -743,37 +1550,17 @@ enum BabyPlayerLyricsSoundMatcher {
         guard let timed = retimedLines(rawLines, words: analysis.segments.flatMap(\.words)) else {
             return nil
         }
+        let anchor = "ai-source:\(candidate.persistentIdentifier)"
         return LyricsCandidate(
-            id: candidate.id,
+            id: aiCandidateID(identityAnchor: anchor),
             trackName: candidate.trackName,
             artistName: candidate.artistName,
             albumName: candidate.albumName,
             duration: max(analysis.audioDurationSeconds, timed.last?.time ?? 0),
             lines: timed,
             matchScore: candidate.matchScore,
-            providerName: "\(candidate.providerName ?? "网络歌词")·声音重校时"
-        )
-    }
-
-    private static func directASRCandidate(_ analysis: BabyPlayerASRAnalysis) -> LyricsCandidate? {
-        let lines = analysis.segments.compactMap { segment -> TimedLyricLine? in
-            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return nil }
-            return TimedLyricLine(time: segment.startSeconds, text: text)
-        }
-        guard !lines.isEmpty else { return nil }
-        let raw = lines.map { "\($0.time)|\($0.text)" }.joined(separator: "\n")
-        let digest = SHA256.hash(data: Data(raw.utf8))
-        let numericID = digest.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-        return LyricsCandidate(
-            id: -1_000_000_000 - Int(numericID),
-            trackName: "声音识别字幕",
-            artistName: "腾讯 ASR",
-            albumName: nil,
-            duration: max(analysis.audioDurationSeconds, lines.last?.time ?? 0),
-            lines: lines,
-            matchScore: 0,
-            providerName: "腾讯 ASR·声音时间轴"
+            providerName: "AI 校时歌词",
+            identityAnchor: anchor
         )
     }
 
@@ -787,49 +1574,161 @@ enum BabyPlayerLyricsSoundMatcher {
             .filter { !$0.isEmpty }
         let words = analysis.segments.flatMap(\.words)
         guard let timed = retimedLines(rawLines, words: words) else { return nil }
+        let anchor = "ai-songbook:\(reference.id)"
         return LyricsCandidate(
-            id: reference.id,
+            id: aiCandidateID(identityAnchor: anchor),
             trackName: reference.title,
             artistName: reference.artist,
             albumName: "本地歌本",
             duration: max(analysis.audioDurationSeconds, timed.last?.time ?? 0),
             lines: timed,
             matchScore: 0,
-            providerName: "本地歌本·自动校时"
+            providerName: "本地歌本·AI校准",
+            identityAnchor: anchor
         )
     }
 
+    // 【MODIFIED】以动态规划同时优化所有歌词行，前奏噪声可跳过，中间错误跳过会受更高惩罚。
+    /// 建立全局单调时间轴；输入为原歌词行和按时间排列的 ASR words，输出为可选校时行，不修改 repository/UI。
     private static func retimedLines(
         _ rawLines: [String],
         words: [BabyPlayerASRWord]
     ) -> [TimedLyricLine]? {
         guard rawLines.count >= 2, words.count >= 3 else { return nil }
-        var cursor = 0
-        var timed: [TimedLyricLine] = []
-        for line in rawLines {
-            let lineTokens = tokens(line)
-            guard !lineTokens.isEmpty, cursor < words.count else { continue }
-            var best: (index: Int, length: Int, score: Double)?
-            let maximumStart = min(words.count - 1, cursor + 50)
-            for start in cursor...maximumStart {
-                let minimumLength = max(1, lineTokens.count - 2)
-                let maximumLength = min(words.count - start, lineTokens.count + 3)
+        let rowCount = rawLines.count + 1
+        let columnCount = words.count + 1
+        let stateCount = rowCount * columnCount
+        var scores = Array(repeating: -Double.infinity, count: stateCount)
+        var predecessors = Array<AlignmentPredecessor?>(repeating: nil, count: stateCount)
+        scores[0] = 0
+
+        func index(_ row: Int, _ column: Int) -> Int { row * columnCount + column }
+        func update(
+            row: Int,
+            column: Int,
+            score: Double,
+            predecessor: AlignmentPredecessor
+        ) {
+            let target = index(row, column)
+            if score > scores[target] + AlignmentPolicy.comparisonEpsilon {
+                scores[target] = score
+                predecessors[target] = predecessor
+            }
+        }
+
+        for row in 0..<rowCount {
+            for column in 0..<columnCount {
+                let current = scores[index(row, column)]
+                guard current.isFinite else { continue }
+                if row < rawLines.count {
+                    update(
+                        row: row + 1,
+                        column: column,
+                        score: current - AlignmentPolicy.lineSkipPenalty,
+                        predecessor: .init(
+                            row: row,
+                            column: column,
+                            matchedLineIndex: nil,
+                            matchedWordIndex: nil,
+                            matchedWordCount: 0
+                        )
+                    )
+                }
+                if column < words.count {
+                    let penalty = row == 0
+                        ? AlignmentPolicy.leadingWordSkipPenalty
+                        : AlignmentPolicy.internalWordSkipPenalty
+                    update(
+                        row: row,
+                        column: column + 1,
+                        score: current - penalty,
+                        predecessor: .init(
+                            row: row,
+                            column: column,
+                            matchedLineIndex: nil,
+                            matchedWordIndex: nil,
+                            matchedWordCount: 0
+                        )
+                    )
+                }
+                guard row < rawLines.count, column < words.count else { continue }
+                let lineTokens = tokens(rawLines[row])
+                guard !lineTokens.isEmpty else { continue }
+                let minimumLength = max(1, lineTokens.count - AlignmentPolicy.maximumLengthUnderrun)
+                let maximumLength = min(
+                    words.count - column,
+                    lineTokens.count + AlignmentPolicy.maximumLengthOverrun
+                )
                 guard minimumLength <= maximumLength else { continue }
                 for length in minimumLength...maximumLength {
-                    let recognized = words[start..<(start + length)].map(\.text).joined(separator: " ")
-                    let score = similarity(lineTokens, tokens(recognized))
-                    if score > (best?.score ?? 0) { best = (start, length, score) }
+                    let recognized = words[column..<(column + length)].map(\.text).joined(separator: " ")
+                    let rawSimilarity = similarity(lineTokens, tokens(recognized))
+                    // 【MODIFIED】防止包含下一句的长窗口因“覆盖查询词”得到虚高分。
+                    let lengthPrecision = Double(min(lineTokens.count, length))
+                        / Double(max(lineTokens.count, length))
+                    let matchSimilarity = rawSimilarity * lengthPrecision
+                    guard matchSimilarity >= AlignmentPolicy.minimumLineSimilarity else { continue }
+                    let reward = matchSimilarity * (
+                        AlignmentPolicy.matchBaseReward
+                        + Double(min(lineTokens.count, 8)) * AlignmentPolicy.matchTokenReward
+                    )
+                    update(
+                        row: row + 1,
+                        column: column + length,
+                        score: current + reward,
+                        predecessor: .init(
+                            row: row,
+                            column: column,
+                            matchedLineIndex: row,
+                            matchedWordIndex: column,
+                            matchedWordCount: length
+                        )
+                    )
                 }
             }
-            guard let best, best.score >= 0.45 else { continue }
-            timed.append(TimedLyricLine(time: words[best.index].startSeconds, text: line))
-            cursor = min(words.count, best.index + best.length)
         }
-        let recognizedCoverage = Double(cursor) / Double(words.count)
+
+        var bestColumn = 0
+        var bestScore = -Double.infinity
+        for column in 0..<columnCount {
+            let score = scores[index(rawLines.count, column)]
+                - Double(words.count - column) * AlignmentPolicy.trailingWordSkipPenalty
+            if score > bestScore {
+                bestScore = score
+                bestColumn = column
+            }
+        }
+        var row = rawLines.count
+        var column = bestColumn
+        var timed: [TimedLyricLine] = []
+        var matchedWordCount = 0
+        while row > 0 || column > 0 {
+            guard let previous = predecessors[index(row, column)] else { break }
+            if let lineIndex = previous.matchedLineIndex,
+               let wordIndex = previous.matchedWordIndex {
+                timed.append(TimedLyricLine(
+                    time: words[wordIndex].startSeconds,
+                    text: rawLines[lineIndex]
+                ))
+                matchedWordCount += previous.matchedWordCount
+            }
+            row = previous.row
+            column = previous.column
+        }
+        timed.reverse()
+        let recognizedCoverage = Double(matchedWordCount) / Double(words.count)
         let lineCoverage = Double(timed.count) / Double(rawLines.count)
         guard timed.count >= 2,
-              recognizedCoverage >= 0.55 || lineCoverage >= 0.55 else { return nil }
+              recognizedCoverage >= AlignmentPolicy.minimumWordCoverage
+                || lineCoverage >= AlignmentPolicy.minimumLineCoverage else { return nil }
         return timed
+    }
+
+    /// 从 AI source anchor 生成稳定的负数 candidate ID；输入为 anchor，输出为可与 LRCLIB/歌本 ID 区分的 Int，不修改状态。
+    private static func aiCandidateID(identityAnchor: String) -> Int {
+        let digest = SHA256.hash(data: Data(identityAnchor.utf8))
+        let numericID = digest.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        return -1_000_000_000 - Int(numericID % 900_000_000)
     }
 
     private static func estimatedOffset(
@@ -904,16 +1803,13 @@ extension LyricsMediaDescriptor {
     }
 }
 
+// 【MODIFIED】家长设置只读取服务端月度额度；不再枚举、创建或删除完整歌曲 M4A 音频库。
 @MainActor
-final class BabyPlayerAudioCacheViewModel: ObservableObject {
-    @Published private(set) var entries: [BabyPlayerAudioCacheEntry] = []
-    @Published private(set) var totalBytes: Int64 = 0
+final class BabyPlayerASRUsageViewModel: ObservableObject {
     @Published private(set) var usageText = "读取中…"
 
     func refresh() {
         Task {
-            entries = await BabyPlayerAudioCache.shared.entries()
-            totalBytes = await BabyPlayerAudioCache.shared.totalBytes()
             do {
                 let usage = try await BabyPlayerASRClient().usage()
                 let reserved = usage.reservedSeconds > 0
@@ -924,30 +1820,6 @@ final class BabyPlayerAudioCacheViewModel: ObservableObject {
                 usageText = (error as? LocalizedError)?.errorDescription ?? "暂时不可用"
             }
         }
-    }
-
-    func delete(_ entry: BabyPlayerAudioCacheEntry) {
-        Task {
-            try? await BabyPlayerAudioCache.shared.delete(mediaID: entry.id)
-            refresh()
-        }
-    }
-
-    func deleteAll() {
-        Task {
-            try? await BabyPlayerAudioCache.shared.deleteAll()
-            refresh()
-        }
-    }
-
-    var totalSizeText: String { ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file) }
-
-    func createdText(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.timeZone = .current
-        formatter.dateFormat = "M月d日"
-        return formatter.string(from: date)
     }
 
     private func formatDuration(_ seconds: Int) -> String {

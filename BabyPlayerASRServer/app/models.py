@@ -1,3 +1,9 @@
+"""BabyPlayer ASR/usage 与 AI Lyrics limited-repair API 数据模型。
+
+当前主要功能：校验腾讯时间证据、用量响应、AI v1 原始行和逐行文本修复建议。
+最近修改：2026-08-23 将 /v1/refine 收紧为 Version C 结构化 repair contract。
+"""
+
 from typing import Annotated
 
 from pydantic import BaseModel, Field, StringConstraints
@@ -41,38 +47,47 @@ class UsageResponse(BaseModel):
     next_reset_at: str
 
 
-class LyricsRefineSegment(BaseModel):
-    index: int = Field(ge=0, le=500)
-    text: str = Field(min_length=1, max_length=500)
+class LyricsAlignedWord(BaseModel):
+    text: str = Field(min_length=1, max_length=100)
     start_seconds: float = Field(ge=0, le=3600)
     end_seconds: float = Field(ge=0, le=3600)
 
 
-class LyricsRefineCandidate(BaseModel):
-    identifier: str = Field(min_length=3, max_length=256)
-    title: str = Field(min_length=1, max_length=256)
-    artist: str = Field(max_length=256)
-    source: str = Field(max_length=128)
-    lines: list[LyricText] = Field(min_length=1, max_length=300)
+class LyricsOriginalLine(BaseModel):
+    line_identifier: str = Field(min_length=3, max_length=128)
+    original_text: str = Field(min_length=1, max_length=500)
+    start_seconds: float = Field(ge=0, le=3600)
+    end_seconds: float = Field(ge=0, le=3600)
+    aligned_words: list[LyricsAlignedWord] = Field(default_factory=list, max_length=100)
+
+
+class LyricsMatchEvidence(BaseModel):
+    normalized_text_similarity: float = Field(ge=0, le=1)
+    ordered_token_similarity: float = Field(ge=0, le=1)
+    title_similarity: float = Field(ge=0, le=1)
+    asr_coverage: float = Field(ge=0, le=1)
+    temporal_order: float = Field(ge=0, le=1)
+    same_song_confidence: float = Field(ge=0, le=1)
 
 
 class LyricsRefineRequest(BaseModel):
     media_fingerprint: str = Field(min_length=8, max_length=128)
     transcript: str = Field(max_length=30_000)
-    segments: list[LyricsRefineSegment] = Field(min_length=2, max_length=500)
-    candidates: list[LyricsRefineCandidate] = Field(default_factory=list, max_length=4)
+    original_lines: list[LyricsOriginalLine] = Field(min_length=2, max_length=300)
+    evidence: LyricsMatchEvidence
 
 
-class RefinedLyricLine(BaseModel):
-    segment_index: int
-    start_seconds: float
-    end_seconds: float
-    text: str
+class LyricsTextRepair(BaseModel):
+    line_identifier: str = Field(min_length=3, max_length=128)
+    original_text: str = Field(min_length=1, max_length=500)
+    suggested_text: str = Field(min_length=1, max_length=500)
+    should_modify: bool
+    evidence: str = Field(min_length=1, max_length=500)
+    confidence: float = Field(ge=0, le=1)
 
 
 class LyricsRefineResponse(BaseModel):
     status: str
     model: str
-    confidence: float
-    selected_candidate_identifier: str | None = None
-    lines: list[RefinedLyricLine]
+    overall_confidence: float = Field(ge=0, le=1)
+    repairs: list[LyricsTextRepair]

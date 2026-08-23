@@ -4,6 +4,13 @@
 Jellyfin 完全解耦。它可以部署在同一台 VPS，但使用独立目录、Linux 用户、systemd
 进程、端口、SQLite 数据库、Bearer Token 和环境变量。
 
+## 当前开发状态
+
+当前为个人内测的最小闭环：只有一台 Apple TV 使用这台 VPS，不提供用户系统、登录、
+订阅、支付、家庭共享或多租户功能。接口和数据库仍保留独立 Bearer Token 边界，未来
+增加逐设备 Token 或配对码时，可以在不影响腾讯 ASR、DeepSeek 校正和本地歌词逻辑的
+前提下扩展。
+
 ```text
 /opt/babyplayer-asr                 独立程序与 .env
 /var/lib/babyplayer-asr             独立 SQLite 数据库
@@ -15,7 +22,7 @@ player.wisteriasoftware.uk          独立子域名
 同一 BabyPlayer 服务进程内有两个彼此独立的模块：
 
 - ASR 模块保护腾讯密钥、执行每月 18,000 秒硬上限，并缓存腾讯返回的转写文字和时间戳。
-- 歌词纠正模块调用 DeepSeek V4 Flash 的非思考模式，只纠正 ASR segment 文案。它不允许模型修改时间；响应时从腾讯 ASR 请求原数据重新附上时间边界。
+- 歌词修复模块调用 DeepSeek V4 Flash 非思考模式，输入是 AI v1 原始行、本地 deterministic alignment、ASR words 和 same-song 证据；输出只有逐行 `suggested_text`/evidence/confidence，不包含时间戳。
 
 服务不下载 Jellyfin 视频、不搜索歌词、不保存音频，也不持久化候选歌词或 DeepSeek 输出。
 
@@ -43,8 +50,7 @@ python -m pytest -q -p no:cacheprovider
 - `GET /v1/usage`：查看本月已用、预留、剩余秒数和下次重置时间。
 - `GET /v1/cache?media_fingerprint=...`：读取已有转写，缓存命中不消耗额度。
 - `POST /v1/analyze`：上传 M4A/AAC/MP3；BabyPlayer 实际固定使用 M4A。
-- `POST /v1/refine`：接收 ASR segments、最多 3 份网络候选纯文本和 1 份本地歌本，
-  返回以原 ASR 时间戳为边界的纠正文案。
+- `POST /v1/refine`：接收 `original_lines` 及其 `aligned_words`、ASR transcript 和集中计算的 evidence；返回 `line_identifier / original_text / suggested_text / should_modify / evidence / confidence`。响应 contract 不存在时间戳字段。
 
 所有 `/v1/*` 请求使用独立的 `Authorization: Bearer ...`。达到 5 小时后，新的分析返回
 HTTP 429、错误码 `MONTHLY_ASR_LIMIT_REACHED` 和北京时间的 `next_available_at`；已缓存
@@ -85,6 +91,17 @@ DeepSeek Key 只存在 VPS `.env`，Apple TV 继续只持有 BabyPlayer Bearer T
 ```bash
 sudo bash /opt/babyplayer-asr/scripts/configure-deepseek-key.sh
 ```
+
+如果忘记了之前生成的独立 BabyPlayer Token，可只轮换这一项，不触碰腾讯或 DeepSeek
+配置：
+
+```bash
+sudo bash /opt/babyplayer-asr/scripts/configure-babyplayer-token.sh
+```
+
+然后把同一把 Token 写入 Mac 本地、被 Git 忽略的
+`Config/BabyPlayerSecrets.xcconfig`；不要把腾讯 SecretId/SecretKey 或 DeepSeek Key
+写入 Apple TV 工程。
 
 腾讯云后付费仍应保持关闭。服务内 5 小时硬上限是第一道保护，腾讯控制台关闭后付费是
 第二道保护。

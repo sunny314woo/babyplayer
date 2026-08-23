@@ -2,10 +2,127 @@
 // SystemPlayerView.swift
 // 系统播放器桥接：队列、循环、自动下一首、限时播放和片头片尾跳过。
 // 最近修改：2026-08-22 增加当前视频的喜欢、不喜欢和屏蔽菜单。
+// 当前主要功能：管理 tvOS 播放、普通歌词、AI 歌词渐进结果和人工绑定优先级。
+// 最近修改：2026-08-23 为 Version C 增加即时 manual lock 与后台结果 generation 保护。
+// 最近修改：2026-08-23 在播放画面增加可持续可见的 AI 歌词分阶段进度卡。
+// 最近修改：2026-08-23 为单曲循环的可恢复 AI 失败增加不阻塞播放的封顶退避重试。
+// 最近修改：2026-08-23 让同 fingerprint 分段分析跨单曲循环复用，并按真实准备、识别、校准、优化阶段反馈。
 //
 
 import AVKit
+import Foundation
 import SwiftUI
+
+// 【MODIFIED】AI 进度必须在菜单关闭后仍然可见，而不是只写回下次打开的菜单标题。
+enum BabyPlayerAILyricsProgress: Equatable {
+    case preparingAudio(index: Int, total: Int)
+    case recognizing(index: Int, total: Int)
+    case aligning
+    case refining
+    case completed
+    case unmatched
+    case warning(String)
+    case failed(String)
+    case deferred(String)
+    case retrying(attempt: Int, delaySeconds: Int, reason: String)
+
+    /// 生成菜单中的简短状态；无额外输入，输出单行文案，不修改 UI 或 repository。
+    var menuTitle: String {
+        switch self {
+        case .preparingAudio(let index, let total):
+            return "正在准备 AI 音频（\(index)/\(total)）…"
+        case .recognizing(let index, let total):
+            return "正在进行语音识别（\(index)/\(total)）…"
+        case .aligning: return "正在校准歌词…"
+        case .refining: return "正在优化歌词…"
+        case .completed: return "AI 优化完成"
+        case .unmatched: return "未确认匹配，保留普通歌词"
+        case .warning(let message), .failed(let message), .deferred(let message):
+            return message
+        case .retrying(let attempt, let delaySeconds, _):
+            return "单曲循环：\(delaySeconds) 秒后第 \(attempt) 次重试"
+        }
+    }
+
+    /// 生成播放画面进度卡文案；无额外输入，输出多行里程碑，不修改 UI 或 repository。
+    var overlayText: String {
+        switch self {
+        case .preparingAudio(let index, let total):
+            return "AI 歌词\n● 正在准备 AI 音频（\(index)/\(total)）…\n○ 语音识别\n○ 歌词校准\n○ 歌词优化"
+        case .recognizing(let index, let total):
+            return "AI 歌词\n✓ AI 音频已准备（\(index)/\(total)）\n● 正在进行语音识别…\n○ 歌词校准\n○ 歌词优化"
+        case .aligning:
+            return "AI 歌词\n✓ 语音识别已经完成\n● 正在校准歌词…\n○ 歌词优化"
+        case .refining:
+            return "AI 歌词\n✓ 语音识别已经完成\n✓ 时间轴已重新完成对齐\n● 正在优化歌词…"
+        case .completed:
+            return "AI 歌词\n✓ 语音识别已经完成\n✓ 时间轴已重新完成对齐\n✓ 字幕内容已完成对齐"
+        case .unmatched:
+            return "AI 歌词\n✓ 语音识别已经完成\n⚠ 未确认为同一首歌\n普通歌词保持不变"
+        case .warning(let message):
+            return "AI 歌词\n✓ 语音识别已经完成\n✓ 时间轴已重新完成对齐\n⚠ \(message)"
+        case .failed(let message):
+            return "AI 歌词\n✕ \(message)"
+        case .deferred(let message):
+            return "AI 歌词\n○ \(message)"
+        case .retrying(let attempt, let delaySeconds, let reason):
+            return "AI 歌词\n⚠ \(reason)\n↻ 单曲循环已保持播放\n\(delaySeconds) 秒后第 \(attempt) 次自动重试"
+        }
+    }
+}
+
+// 【MODIFIED】用纯内存 generation 使人工点击在任何 await 之前立即使后台自动结果失效。
+final class LyricsAutomationGenerationGuard: @unchecked Sendable {
+    private let stateLock = NSLock()
+    private var storedGeneration = 0
+    private var storedManualLock = false
+
+    var generation: Int {
+        stateLock.withLock { storedGeneration }
+    }
+
+    var isManuallyLocked: Bool {
+        stateLock.withLock { storedManualLock }
+    }
+
+    /// 为新媒体重置保护；无输入，返回新 generation，会清除旧媒体的 manual lock 并修改内存状态。
+    @discardableResult
+    func resetForNewMedia() -> Int {
+        stateLock.withLock {
+            storedGeneration &+= 1
+            storedManualLock = false
+            return storedGeneration
+        }
+    }
+
+    /// 在用户开始选择时锁定；无输入，返回新 generation，会立即修改内存锁状态。
+    @discardableResult
+    func lockManually() -> Int {
+        stateLock.withLock {
+            storedGeneration &+= 1
+            storedManualLock = true
+            return storedGeneration
+        }
+    }
+
+    /// 判断自动工作结果是否仍可应用；输入为工作启动时 generation，输出为布尔值，不修改状态。
+    func permitsAutomaticResult(startedAt startedGeneration: Int) -> Bool {
+        stateLock.withLock {
+            !storedManualLock && storedGeneration == startedGeneration
+        }
+    }
+
+    /// 在同一把锁内检查 generation 并提交自动结果；输入为启动 generation 和同步操作，输出为可选操作结果，可修改 repository。
+    func performIfAutomaticResultIsPermitted<Result>(
+        startedAt startedGeneration: Int,
+        _ operation: () throws -> Result
+    ) rethrows -> Result? {
+        try stateLock.withLock {
+            guard !storedManualLock, storedGeneration == startedGeneration else { return nil }
+            return try operation()
+        }
+    }
+}
 
 struct SystemPlayerView: UIViewControllerRepresentable {
     let selection: SpikePlaybackSelection
@@ -63,20 +180,30 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var endObserver: NSObjectProtocol?
     private var timeObserver: Any?
     private var lyricsTask: Task<Void, Never>?
+    private var soundAnalysisTask: Task<Void, Never>?
     private var lyricsSaveTask: Task<Void, Never>?
     private var lyricsSelectionTask: Task<Void, Never>?
     private var lyricLines: [TimedLyricLine] = []
     private var lyricPlayback: LyricsPlayback?
     private var lyricCandidates: [LyricsCandidate] = []
+    private var plainTextReference: LyricsPlainTextReference?
     private var isSearchingLyrics = false
     private var isAnalyzingSound = false
     private var lyricsSearchMessage: String?
     private var soundAnalysisMessage: String?
+    private var shouldAnalyzeAfterSearch = false
     private var pendingLyricSelectionIdentifier: String?
+    private let lyricsAutomationGuard = LyricsAutomationGenerationGuard()
     private var currentLyricsMode: BabyPlayerLyricsMode = .off
     private var currentLyricIndex: Int?
     private var lyricsContainer: UIView?
     private var lyricsLabel: UILabel?
+    private var aiProgressContainer: UIView?
+    private var aiProgressLabel: UILabel?
+    private var soundAnalysisFailureCounts: [String: Int] = [:]
+    private var soundAnalysisRetryNotBefore: [String: Date] = [:]
+    private var preparedLyricsFingerprint: String?
+    private var soundAnalysisFingerprint: String?
     private var isAdvancing = false
     private var didExit = false
 
@@ -141,6 +268,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     func cleanUp() {
         lyricsTask?.cancel()
         lyricsTask = nil
+        soundAnalysisTask?.cancel()
+        soundAnalysisTask = nil
+        soundAnalysisFingerprint = nil
+        Task { await BabyPlayerASRCoordinator.shared.cancelAll() }
         lyricsSelectionTask?.cancel()
         lyricsSelectionTask = nil
         player?.pause()
@@ -167,6 +298,12 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var currentQueueItem: BabyPlayerQueueItem? {
         guard queueItems.indices.contains(currentIndex) else { return nil }
         return queueItems[currentIndex]
+    }
+
+    /// 判断当前播放媒体；输入为 media fingerprint，输出是否仍为同一声音来源，不修改状态。
+    // 【MODIFIED】循环重建 queue item 时使用稳定 fingerprint，而不是播放器实例生命周期。
+    private func isCurrentMedia(fingerprint: String) -> Bool {
+        currentQueueItem?.lyricsMedia.asrFingerprint == fingerprint
     }
 
     private func playCurrentItem() {
@@ -274,6 +411,17 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         guard !didExit else { return }
         didExit = true
         lyricsTask?.cancel()
+        soundAnalysisTask?.cancel()
+        let fingerprint = soundAnalysisFingerprint
+        soundAnalysisTask = nil
+        soundAnalysisFingerprint = nil
+        if let fingerprint {
+            Task {
+                await BabyPlayerASRCoordinator.shared.cancel(
+                    mediaFingerprint: fingerprint
+                )
+            }
+        }
         lyricsSelectionTask?.cancel()
         player?.pause()
         onExit?()
@@ -319,20 +467,84 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         ])
         lyricsContainer = container
         lyricsLabel = label
+
+        // 【MODIFIED】进度卡位于画面左上方，避免遮挡底部歌词和系统播放控件。
+        let progressContainer = UIView()
+        progressContainer.translatesAutoresizingMaskIntoConstraints = false
+        progressContainer.backgroundColor = UIColor.black.withAlphaComponent(0.68)
+        progressContainer.layer.cornerRadius = 16
+        progressContainer.layer.cornerCurve = .continuous
+        progressContainer.isUserInteractionEnabled = false
+        progressContainer.isHidden = true
+
+        let progressLabel = UILabel()
+        progressLabel.translatesAutoresizingMaskIntoConstraints = false
+        progressLabel.numberOfLines = 0
+        progressLabel.textAlignment = .left
+        progressLabel.textColor = .white
+        progressLabel.font = .systemFont(ofSize: 25, weight: .medium)
+        progressLabel.layer.shadowColor = UIColor.black.cgColor
+        progressLabel.layer.shadowOpacity = 0.7
+        progressLabel.layer.shadowRadius = 3
+
+        overlay.addSubview(progressContainer)
+        progressContainer.addSubview(progressLabel)
+        NSLayoutConstraint.activate([
+            progressContainer.leadingAnchor.constraint(equalTo: overlay.leadingAnchor, constant: 72),
+            progressContainer.topAnchor.constraint(equalTo: overlay.topAnchor, constant: 58),
+            progressContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 560),
+            progressLabel.leadingAnchor.constraint(equalTo: progressContainer.leadingAnchor, constant: 22),
+            progressLabel.trailingAnchor.constraint(equalTo: progressContainer.trailingAnchor, constant: -22),
+            progressLabel.topAnchor.constraint(equalTo: progressContainer.topAnchor, constant: 16),
+            progressLabel.bottomAnchor.constraint(equalTo: progressContainer.bottomAnchor, constant: -16)
+        ])
+        aiProgressContainer = progressContainer
+        aiProgressLabel = progressLabel
+    }
+
+    // 【MODIFIED】同步刷新菜单和播放画面，让遥控器点击后立即有可见反馈。
+    /// 显示 AI 歌词阶段；输入为进度状态，输出 Void，会更新菜单和播放画面，不修改 repository。
+    private func showAILyricsProgress(_ progress: BabyPlayerAILyricsProgress) {
+        soundAnalysisMessage = progress.menuTitle
+        aiProgressLabel?.text = progress.overlayText
+        aiProgressContainer?.isHidden = false
+        updateLyricsTransportMenu()
     }
 
     private func prepareLyrics(for item: BabyPlayerQueueItem, mode: BabyPlayerLyricsMode) {
+        let fingerprint = item.lyricsMedia.asrFingerprint
+        let isSameFingerprint = preparedLyricsFingerprint == fingerprint
         lyricsTask?.cancel()
-        lyricsSelectionTask?.cancel()
-        pendingLyricSelectionIdentifier = nil
+        if !isSameFingerprint {
+            let previousFingerprint = soundAnalysisFingerprint
+            soundAnalysisTask?.cancel()
+            soundAnalysisTask = nil
+            soundAnalysisFingerprint = nil
+            lyricsSelectionTask?.cancel()
+            pendingLyricSelectionIdentifier = nil
+            // 【MODIFIED】只有真正切歌才使旧 generation 失效；单曲循环保留 task 和 manual lock。
+            lyricsAutomationGuard.resetForNewMedia()
+            shouldAnalyzeAfterSearch = false
+            isAnalyzingSound = false
+            soundAnalysisMessage = nil
+            aiProgressLabel?.text = nil
+            aiProgressContainer?.isHidden = true
+            if let previousFingerprint {
+                Task {
+                    await BabyPlayerASRCoordinator.shared.cancel(
+                        mediaFingerprint: previousFingerprint
+                    )
+                }
+            }
+        }
+        preparedLyricsFingerprint = fingerprint
         currentLyricsMode = mode
         lyricLines = []
         lyricPlayback = nil
         lyricCandidates = []
+        plainTextReference = nil
         isSearchingLyrics = true
-        isAnalyzingSound = false
         lyricsSearchMessage = nil
-        soundAnalysisMessage = nil
         currentLyricIndex = nil
         lyricsLabel?.text = nil
         lyricsContainer?.isHidden = true
@@ -346,13 +558,15 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             let plainReference = await BabyLyricsRepository.shared.plainTextReference(
                 for: item.lyricsMedia
             )
+            guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
+            self.plainTextReference = plainReference
             var playback = storedPlayback
             var foundCandidates: [LyricsCandidate] = []
             do {
                 let candidates = try await BabyLyricsRepository.shared.searchCandidates(
                     for: item.lyricsMedia
                 )
-                guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
+                guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
                 foundCandidates = Array(candidates.prefix(3))
                 self.lyricCandidates = foundCandidates
                 playback = await BabyLyricsRepository.shared.resolvedLyrics(
@@ -360,16 +574,16 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                     candidates: candidates
                 )
             } catch {
-                guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
+                guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
                 self.lyricCandidates = []
                 self.lyricsSearchMessage = (error as? LocalizedError)?.errorDescription
                     ?? "在线歌词服务暂时不可用"
             }
 
-            guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
+            guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
             self.isSearchingLyrics = false
             self.lyricPlayback = playback
-            if mode != .off, let playback {
+            if self.currentLyricsMode != .off, let playback {
                 self.lyricLines = playback.lines
                 if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
                     self.updateLyrics(at: elapsed)
@@ -377,63 +591,219 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             }
             self.updateLyricsTransportMenu()
 
-            let canAutomaticallyAnalyze = mode != .off
-                && (playback == nil || playback?.selectionOrigin == .automatic)
+            let canAutomaticallyAnalyze = self.shouldAnalyzeAfterSearch
+                || (self.currentLyricsMode != .off
+                    && (playback == nil || playback?.selectionOrigin == .automatic))
+            self.shouldAnalyzeAfterSearch = false
             guard canAutomaticallyAnalyze else { return }
-            self.isAnalyzingSound = true
-            self.soundAnalysisMessage = "等待播放缓冲稳定…"
-            self.updateLyricsTransportMenu()
-            guard await self.waitForPlaybackBuffer(itemID: item.id) else {
-                guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
-                self.isAnalyzingSound = false
-                self.soundAnalysisMessage = "播放优先：本次暂缓声音分析"
-                self.updateLyricsTransportMenu()
-                return
-            }
-            self.soundAnalysisMessage = nil
-            do {
-                let outcome = try await BabyPlayerASRCoordinator.shared.analyze(
-                    item: item,
-                    candidates: foundCandidates,
-                    reference: plainReference
-                )
-                guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
-                self.lyricCandidates = Array(outcome.candidates.prefix(4))
-                self.soundAnalysisMessage = outcome.message
-                if let selected = outcome.selected,
-                   self.lyricPlayback?.selectionOrigin != .manual,
-                   let verified = try await BabyLyricsRepository.shared.applyAutomaticRecommendation(
-                       selected,
-                       autoOffsetSeconds: outcome.offsetSeconds,
-                       for: item.lyricsMedia
-                   ) {
-                    self.lyricPlayback = verified
-                    if mode != .off {
-                        self.lyricLines = verified.lines
-                        self.currentLyricIndex = nil
-                        if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
-                            self.updateLyrics(at: elapsed)
-                        }
-                    }
-                }
-            } catch {
-                guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
-                if case BabyPlayerASRError.notConfigured = error {
-                    self.soundAnalysisMessage = nil
-                } else {
-                    self.soundAnalysisMessage = (error as? LocalizedError)?.errorDescription
-                        ?? "声音歌词生成暂时不可用"
-                }
-            }
-            self.isAnalyzingSound = false
-            self.updateLyricsTransportMenu()
+            self.startSoundAnalysis(
+                for: item,
+                candidates: foundCandidates,
+                reference: plainReference,
+                waitForBuffer: true
+            )
         }
     }
 
+    private func startSoundAnalysis(
+        for item: BabyPlayerQueueItem,
+        candidates: [LyricsCandidate],
+        reference: LyricsPlainTextReference?,
+        waitForBuffer: Bool,
+        manuallyRequested: Bool = false
+    ) {
+        let fingerprint = item.lyricsMedia.asrFingerprint
+        guard isCurrentMedia(fingerprint: fingerprint) else { return }
+        if isAnalyzingSound, soundAnalysisFingerprint == fingerprint { return }
+        // 【MODIFIED】人工点击可立即开始新一轮；自动轮询则继承上次退避。
+        if manuallyRequested {
+            soundAnalysisFailureCounts[fingerprint] = 0
+            soundAnalysisRetryNotBefore[fingerprint] = nil
+        }
+        // 【MODIFIED】后台链路只能在启动 generation 仍有效时自动应用。
+        let automaticGeneration = lyricsAutomationGuard.generation
+        if let previousFingerprint = soundAnalysisFingerprint,
+           previousFingerprint != fingerprint {
+            soundAnalysisTask?.cancel()
+            Task {
+                await BabyPlayerASRCoordinator.shared.cancel(
+                    mediaFingerprint: previousFingerprint
+                )
+            }
+        }
+        soundAnalysisFingerprint = fingerprint
+        isAnalyzingSound = true
+        let plannedCount = max(1, BabyPlayerASRSegmentPolicy.segments(for: item.lyricsMedia).count)
+        // 【MODIFIED】点击后只显示真实的本地准备阶段，不再提前宣称已调用语音识别。
+        showAILyricsProgress(.preparingAudio(index: 1, total: plannedCount))
+
+        soundAnalysisTask = Task { [weak self] in
+            guard let self else { return }
+            // 【MODIFIED】单曲重播重建 player item 时会继承 not-before，不会重置为立即猛烈重试。
+            if let retryDate = self.soundAnalysisRetryNotBefore[fingerprint] {
+                let remaining = retryDate.timeIntervalSinceNow
+                if remaining > 0 {
+                    let attempt = self.soundAnalysisFailureCounts[fingerprint] ?? 1
+                    self.showAILyricsProgress(.retrying(
+                        attempt: attempt,
+                        delaySeconds: Int(remaining.rounded(.up)),
+                        reason: "上一次声音分析未完成"
+                    ))
+                    try? await Task.sleep(for: .seconds(remaining))
+                }
+            }
+            if waitForBuffer {
+                guard await self.waitForPlaybackBuffer(fingerprint: fingerprint) else {
+                    guard !Task.isCancelled,
+                          self.isCurrentMedia(fingerprint: fingerprint) else { return }
+                    self.isAnalyzingSound = false
+                    self.showAILyricsProgress(.deferred("播放优先：本次暂缓声音分析"))
+                    return
+                }
+            }
+            guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
+            while !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) {
+                do {
+                    let outcome = try await BabyPlayerASRCoordinator.shared.analyze(
+                        item: item,
+                        candidates: candidates,
+                        reference: reference,
+                        onStage: { [weak self] stage in
+                            guard let self,
+                                  !Task.isCancelled,
+                                  self.isCurrentMedia(fingerprint: fingerprint) else { return }
+                            self.showAILyricsProgress(self.visibleProgress(for: stage))
+                        },
+                        onAILyricsV1: { [weak self] v1Outcome in
+                            guard let self,
+                                  !Task.isCancelled,
+                                  self.isCurrentMedia(fingerprint: fingerprint) else { return }
+                            await self.receiveSoundAnalysisOutcome(
+                                v1Outcome,
+                                for: item,
+                                automaticGeneration: automaticGeneration,
+                                progress: .aligning
+                            )
+                        }
+                    )
+                    guard !Task.isCancelled,
+                          self.isCurrentMedia(fingerprint: fingerprint) else { return }
+                    self.soundAnalysisFailureCounts[fingerprint] = nil
+                    self.soundAnalysisRetryNotBefore[fingerprint] = nil
+                    let finalProgress: BabyPlayerAILyricsProgress
+                    if outcome.selected == nil {
+                        finalProgress = .unmatched
+                    } else if outcome.message == "AI 优化完成" {
+                        finalProgress = .completed
+                    } else {
+                        finalProgress = .warning(outcome.message)
+                    }
+                    await self.receiveSoundAnalysisOutcome(
+                        outcome,
+                        for: item,
+                        automaticGeneration: automaticGeneration,
+                        progress: finalProgress
+                    )
+                    break
+                } catch {
+                    guard !Task.isCancelled,
+                          self.isCurrentMedia(fingerprint: fingerprint) else { return }
+                    let message = (error as? LocalizedError)?.errorDescription
+                        ?? "声音歌词生成暂时不可用"
+                    let canRetry = self.activeRepeatMode == .repeatOne
+                        && BabyPlayerAIAnalysisRetryPolicy.shouldRetry(error)
+                    guard canRetry else {
+                        self.showAILyricsProgress(.failed(message))
+                        break
+                    }
+                    // 【MODIFIED】退避只 suspend 分析 Task，AVPlayer 持续播放不受影响。
+                    let failureCount = (self.soundAnalysisFailureCounts[fingerprint] ?? 0) + 1
+                    let delay = BabyPlayerAIAnalysisRetryPolicy.delay(
+                        afterFailureCount: failureCount
+                    )
+                    self.soundAnalysisFailureCounts[fingerprint] = failureCount
+                    self.soundAnalysisRetryNotBefore[fingerprint] = Date().addingTimeInterval(delay)
+                    self.showAILyricsProgress(.retrying(
+                        attempt: failureCount,
+                        delaySeconds: Int(delay),
+                        reason: message
+                    ))
+                    try? await Task.sleep(for: .seconds(delay))
+                }
+            }
+            if self.soundAnalysisFingerprint == fingerprint {
+                self.isAnalyzingSound = false
+                self.soundAnalysisTask = nil
+                self.soundAnalysisFingerprint = nil
+                self.updateLyricsTransportMenu()
+            }
+        }
+    }
+
+    /// 映射真实 ASR 阶段到现有轻量 UI 状态；输入为 coordinator stage，输出可见进度，不修改 UI/repository。
+    // 【MODIFIED】preparing/recognizing/aligning/refining 不再混用同一“匹配中”文案。
+    private func visibleProgress(
+        for stage: BabyPlayerASRProcessingStage
+    ) -> BabyPlayerAILyricsProgress {
+        switch stage {
+        case .preparingAudio(let index, let total):
+            return .preparingAudio(index: index, total: total)
+        case .recognizing(let index, let total):
+            return .recognizing(index: index, total: total)
+        case .aligning:
+            return .aligning
+        case .refining:
+            return .refining
+        }
+    }
+
+    // 【MODIFIED】AI v1/v2 共用一个接收点：始终保留候选，但只有强证据且 generation 未被 manual lock 作废时自动展示。
+    /// 接收渐进 AI outcome；输入为 outcome、媒体、启动 generation 和可见进度，输出 Void，会更新 UI 并可能通过 repository 自动绑定。
+    private func receiveSoundAnalysisOutcome(
+        _ outcome: BabyPlayerASRMatchOutcome,
+        for item: BabyPlayerQueueItem,
+        automaticGeneration: Int,
+        progress: BabyPlayerAILyricsProgress
+    ) async {
+        let fingerprint = item.lyricsMedia.asrFingerprint
+        guard isCurrentMedia(fingerprint: fingerprint) else { return }
+        lyricCandidates = Array(outcome.candidates.prefix(4))
+        showAILyricsProgress(progress)
+        guard let selected = outcome.selected,
+              outcome.shouldAutomaticallyApply,
+              lyricsAutomationGuard.permitsAutomaticResult(startedAt: automaticGeneration),
+              lyricPlayback?.selectionOrigin != .manual,
+              let verified = try? await BabyLyricsRepository.shared.applyAutomaticRecommendation(
+                  selected,
+                  autoOffsetSeconds: outcome.offsetSeconds,
+                  for: item.lyricsMedia,
+                  automationGuard: lyricsAutomationGuard,
+                  startedAtGeneration: automaticGeneration
+              ) else {
+            updateLyricsTransportMenu()
+            return
+        }
+        // 【MODIFIED】repository await 返回后再检查一次，禁止旧结果更新 UI。
+        guard lyricsAutomationGuard.permitsAutomaticResult(startedAt: automaticGeneration) else {
+            updateLyricsTransportMenu()
+            return
+        }
+        lyricPlayback = verified
+        if currentLyricsMode != .off {
+            lyricLines = verified.lines
+            currentLyricIndex = nil
+            if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
+                updateLyrics(at: elapsed)
+            }
+        }
+        updateLyricsTransportMenu()
+    }
+
     /// 避免远程 MP4 同时播放和导出时争抢局域网带宽；缓冲不稳就让本轮分析让路。
-    private func waitForPlaybackBuffer(itemID: String) async -> Bool {
+    private func waitForPlaybackBuffer(fingerprint: String) async -> Bool {
         for _ in 0..<20 {
-            guard !Task.isCancelled, currentQueueItem?.id == itemID else { return false }
+            guard !Task.isCancelled,
+                  isCurrentMedia(fingerprint: fingerprint) else { return false }
             if player?.currentItem?.isPlaybackLikelyToKeepUp == true { return true }
             try? await Task.sleep(for: .milliseconds(500))
         }
@@ -531,15 +901,15 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
         if isAnalyzingSound {
             let analyzing = UIAction(
-                title: "正在生成时间轴并校正文案…",
-                image: UIImage(systemName: "waveform.badge.magnifyingglass")
+                title: soundAnalysisMessage ?? "正在校准歌词…",
+                image: UIImage(systemName: "sparkles")
             ) { _ in }
             analyzing.attributes = .disabled
             children.append(analyzing)
         } else if let soundAnalysisMessage {
             let result = UIAction(
                 title: soundAnalysisMessage,
-                image: UIImage(systemName: "waveform")
+                image: UIImage(systemName: "sparkles")
             ) { _ in }
             result.attributes = .disabled
             children.append(result)
@@ -547,10 +917,20 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
         if let playback = lyricPlayback {
             let offset = playback.offsetSeconds
-            let statusTitle = playback.isConfirmed ? "已绑定" : "已选择·未确认"
+            let statusTitle: String
+            switch playback.selectionOrigin {
+            case .automatic:
+                statusTitle = "网络歌词兜底·待声音分析"
+            case .asr:
+                statusTitle = "AI 歌词·已绑定"
+            case .manual:
+                statusTitle = playback.isConfirmed ? "家长已绑定" : "已选择·未确认"
+            }
             let status = UIAction(
                 title: "\(statusTitle)  总计 \(formattedOffset(offset)) · 自动 \(formattedOffset(playback.autoOffsetSeconds)) · 手动 \(formattedOffset(playback.manualAdjustmentSeconds))",
-                image: UIImage(systemName: playback.isConfirmed ? "checkmark.circle.fill" : "questionmark.circle")
+                image: UIImage(systemName: playback.selectionOrigin == .asr || playback.isConfirmed
+                    ? "checkmark.circle.fill"
+                    : "questionmark.circle")
             ) { _ in }
             status.attributes = .disabled
 
@@ -598,12 +978,25 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             children.append(contentsOf: timingChildren)
         }
 
+        let soundAnalysis = UIAction(
+            title: isAnalyzingSound
+                ? "AI 歌词·处理中…"
+                : (soundAnalysisMessage == nil ? "AI 歌词" : "重新分析 AI 歌词"),
+            image: UIImage(systemName: "sparkles")
+        ) { [weak self] _ in
+            self?.requestSoundAnalysis()
+        }
+        if isAnalyzingSound {
+            soundAnalysis.attributes = .disabled
+        }
+
         transportBarCustomMenuItems = [
             UIMenu(
                 title: "字幕与歌词",
                 image: UIImage(systemName: "captions.bubble.fill"),
                 children: children
             ),
+            soundAnalysis,
             ratingMenu(),
             playbackModeMenu(),
             volumeMenu()
@@ -813,6 +1206,15 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 updateLyrics(at: elapsed)
             }
             updateLyricsTransportMenu()
+            if playback.selectionOrigin == .automatic,
+               let item = currentQueueItem {
+                startSoundAnalysis(
+                    for: item,
+                    candidates: lyricCandidates,
+                    reference: plainTextReference,
+                    waitForBuffer: true
+                )
+            }
             return
         }
         guard let item = currentQueueItem else {
@@ -820,6 +1222,33 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             return
         }
         prepareLyrics(for: item, mode: mode)
+    }
+
+    private func requestSoundAnalysis() {
+        guard let item = currentQueueItem else { return }
+        if currentLyricsMode == .off {
+            currentLyricsMode = .english
+            if let playback = lyricPlayback {
+                lyricLines = playback.lines
+                currentLyricIndex = nil
+                if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
+                    updateLyrics(at: elapsed)
+                }
+            }
+        }
+        guard !isAnalyzingSound else { return }
+        if isSearchingLyrics {
+            shouldAnalyzeAfterSearch = true
+            showAILyricsProgress(.deferred("歌词搜索完成后开始声音分析"))
+            return
+        }
+        startSoundAnalysis(
+            for: item,
+            candidates: lyricCandidates,
+            reference: plainTextReference,
+            waitForBuffer: true,
+            manuallyRequested: true
+        )
     }
 
     private func refreshLyricsCandidates() {
@@ -882,6 +1311,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
     private func selectLyricsCandidate(_ candidate: LyricsCandidate) {
         guard let media = currentQueueItem?.lyricsMedia else { return }
+        // 【MODIFIED】manual lock 必须在创建 Task/await repository 之前同步生效。
+        lyricsAutomationGuard.lockManually()
         currentLyricsMode = .english
         pendingLyricSelectionIdentifier = candidate.persistentIdentifier
         lyricsSelectionTask?.cancel()
@@ -912,6 +1343,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func adjustLyricsOffset(by delta: Double) {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
+        // 【MODIFIED】人工校时同样是明确的家长意图，必须立即阻止自动覆盖。
+        lyricsAutomationGuard.lockManually()
         playback.timingAdjustment.adjustManually(by: delta)
         applyManualTiming(playback, for: media)
     }
@@ -919,6 +1352,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func setLyricsOffset(_ offset: Double) {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
+        // 【MODIFIED】直接设置偏移也建立 manual lock。
+        lyricsAutomationGuard.lockManually()
         playback.offsetSeconds = offset
         applyManualTiming(playback, for: media)
     }
@@ -926,6 +1361,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func resetManualLyricsAdjustment() {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
+        // 【MODIFIED】重置人工增量仍属于家长手动操作。
+        lyricsAutomationGuard.lockManually()
         playback.timingAdjustment.resetManualAdjustment()
         applyManualTiming(playback, for: media)
     }
@@ -957,6 +1394,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func confirmCurrentLyrics() {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
+        // 【MODIFIED】确认按下的同步时刻即锁定，不等待持久化。
+        lyricsAutomationGuard.lockManually()
         playback.isConfirmed = true
         playback.selectionOrigin = .manual
         lyricPlayback = playback

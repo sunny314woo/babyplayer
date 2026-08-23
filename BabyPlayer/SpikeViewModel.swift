@@ -179,7 +179,7 @@ final class SpikeViewModel: ObservableObject {
     @Published var outroSkipSeconds = 0 {
         didSet { UserDefaults.standard.set(outroSkipSeconds, forKey: Self.outroSkipKey) }
     }
-    @Published var lyricsMode: BabyPlayerLyricsMode = .off {
+    @Published var lyricsMode: BabyPlayerLyricsMode = .english {
         didSet { UserDefaults.standard.set(lyricsMode.rawValue, forKey: Self.lyricsModeKey) }
     }
 

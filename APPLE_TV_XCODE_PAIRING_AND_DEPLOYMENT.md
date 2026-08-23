@@ -17,6 +17,11 @@
 | Apple TV VPN | 关闭 |
 | 已安装应用 | BabyPlayer，Bundle ID 为 `com.wufengyu.BabyPlayer` |
 
+当前工程是个人内测版本：暂不包含用户注册、登录、订阅、支付或多用户系统。Apple TV
+只访问个人 VPS 的 `player.wisteriasoftware.uk`；腾讯云和 DeepSeek 的真实密钥只在
+VPS 上，工程本地只配置独立的 BabyPlayer Bearer Token。未来如果公开分发，再增加
+逐设备配对 Token，不改变当前 ASR/歌词闭环。
+
 这里最重要的不是两台设备都必须使用 Wi-Fi，而是它们必须位于同一个可互相访问的局域网。本次实际成功的配置是两边都使用同一个 Wi-Fi。
 
 ## 2. 配对前检查

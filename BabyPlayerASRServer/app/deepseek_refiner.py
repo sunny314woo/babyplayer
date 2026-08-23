@@ -1,3 +1,9 @@
+"""DeepSeek 的 BabyPlayer AI Lyrics 有限文本修复客户端。
+
+当前主要功能：发送结构化原歌词/alignment/ASR 证据，并解码逐行 repair 建议。
+最近修改：2026-08-23 禁止模型重建整首歌或产生任何时间戳。
+"""
+
 import json
 from dataclasses import dataclass
 from typing import Callable
@@ -11,18 +17,20 @@ class DeepSeekRefinerError(Exception):
 
 @dataclass(frozen=True)
 class DeepSeekRefinement:
-    confidence: float
-    selected_candidate_identifier: str | None
-    lines: list[dict]
+    overall_confidence: float
+    repairs: list[dict]
 
 
-SYSTEM_PROMPT = """You correct children's song lyrics using two evidence sources.
-The ASR transcript is primary evidence and its segment order is immutable.
-Candidate lyrics are secondary reference data for spelling, missing words, and repeated phrases.
-Never add a verse or line that is not supported by the audio transcript.
-Return JSON only with confidence, selected_candidate_identifier, and lines.
-lines must contain exactly one object for every ASR segment: segment_index and corrected text.
-Do not return or modify timestamps."""
+SYSTEM_PROMPT = """You perform limited textual repair on an existing children's-song lyric timeline.
+The original_lines are the primary text and deterministic source of line identity/order.
+ASR transcript and aligned_words are noisy audio evidence, not final lyrics.
+Never add a verse, line, or wording unsupported by original_text or aligned ASR words.
+Do not rewrite a correct line. Prefer should_modify=false when evidence is weak.
+You may repair obvious recognition/source errors, capitalization, punctuation, contractions, and spelling.
+Return JSON only with overall_confidence and one repair for every original line.
+Each repair must contain line_identifier, original_text, suggested_text, should_modify,
+evidence, and confidence. Copy line_identifier and original_text exactly.
+Never return timestamps, timing suggestions, segment boundaries, or a replacement song."""
 
 
 class DeepSeekLyricsRefinerClient:
@@ -42,6 +50,7 @@ class DeepSeekLyricsRefinerClient:
         self.client_factory = client_factory
 
     def refine(self, evidence: dict) -> DeepSeekRefinement:
+        # 【MODIFIED】固定为非思考 JSON repair contract，不接受自由文本或时间轴输出。
         request_body = {
             "model": self.model,
             "messages": [
@@ -75,9 +84,8 @@ class DeepSeekLyricsRefinerClient:
             raise DeepSeekRefinerError("DeepSeek lyrics refinement failed") from exc
         try:
             return DeepSeekRefinement(
-                confidence=float(result.get("confidence", 0)),
-                selected_candidate_identifier=result.get("selected_candidate_identifier"),
-                lines=list(result.get("lines") or []),
+                overall_confidence=float(result.get("overall_confidence", 0)),
+                repairs=list(result.get("repairs") or []),
             )
         except (TypeError, ValueError) as exc:
             raise DeepSeekRefinerError("DeepSeek returned invalid refinement JSON") from exc

@@ -2,6 +2,22 @@
 
 更新时间：2026-08-23
 
+## 当前开发状态（个人内测）
+
+当前版本只服务这台个人 Apple TV 和这台个人 VPS，目标是先完成最小可用闭环：
+
+- Apple TV 从 Jellyfin MP4 提取并永久保留本地 M4A；
+- 独立域名 `player.wisteriasoftware.uk` 下的 VPS 负责腾讯 ASR、缓存、额度和
+  DeepSeek V4 Flash 受限逐行文本 repair；
+- 歌词搜索、候选比较、绑定、时间偏移和持久化都在 Apple TV 本地完成；
+- 当前不实现用户注册、登录、订阅、支付、家庭共享或多租户隔离；
+- 服务器仍保留独立 Bearer Token 边界，未来公开分发时可替换为逐设备配对 Token，
+  不需要重写 ASR/歌词模块。
+
+腾讯云 SecretId/SecretKey、DeepSeek API Key 只放 VPS；Apple TV 只需要调用
+`/v1` 接口的独立 BabyPlayer Bearer Token。当前服务健康检查已确认两个云端提供方
+均已配置，未把任何云端 Secret 放入工程或提交到 Git。
+
 ## 结论
 
 声音识别采用“Apple TV 本地分析 + 独立 VPS 腾讯 ASR 代理”。Jellyfin 只提供 MP4
@@ -22,7 +38,7 @@ BabyPlayer 独立 VPS（8011）
     ├── 独立 Bearer Token
     ├── 5 小时/月硬上限
     ├── ASR 模块：转写结果缓存
-    ├── 歌词纠正模块：临时调用 DeepSeek V4 Flash
+    ├── 歌词修复模块：只处理 AI v1 的结构化逐行 repair
     └── 临时上传关闭即删除
               │
               ▼
@@ -31,9 +47,10 @@ BabyPlayer 独立 VPS（8011）
               │
               ▼
 Apple TV
-    ├── 第一轮：以腾讯句/词时间戳建立时间轴
-    ├── 第二轮：ASR 文本为主，3 份网络文本 + 1 份歌本为辅纠正内容
-    ├── 时间边界由服务端从 ASR 原始数据重新附上，DeepSeek 无权修改
+    ├── T0：立即显示第 1 份普通歌词
+    ├── T1：同歌置信度 + 全局单调 alignment 生成 AI 校时歌词 v1
+    ├── T2：DeepSeek 只向同一 AI object 提交逐行文本建议
+    ├── 时间边界永远复制自本地 deterministic v1，DeepSeek 无权修改
     └── 手动选择永远优先且不会被自动结果覆盖
 ```
 
@@ -44,8 +61,7 @@ Apple TV
 3. 完整歌曲段存在 Application Support 下，不设自动淘汰上限，仅家长可删除。
 4. 单次 ASR 最长使用前 120 秒；较长曲目另保留识别前段，不截断完整本地音频。
 5. 把 M4A、媒体指纹、大小、提取时间、识别状态写入本地音频库清单。
-6. 先在本地做确定性文本比较/重新校时作为可离线回退，再把 ASR 文本和候选纯文本
-   临时发给同一 BabyPlayer 服务的歌词纠正模块。
+6. 本地集中计算 normalized text、ordered phrase、标题、coverage 和时间顺序证据；通过后用全局单调 alignment 立即生成 AI v1，再把 v1 原始行和对齐证据临时发给歌词 repair 模块。
 7. 家长的手动绑定与多次校时拥有最高优先级。
 
 Apple TV 原生导出 M4A，不额外引入 MP3 编码器。腾讯极速版支持 M4A/AAC，因此没有
@@ -63,24 +79,21 @@ Apple TV 原生导出 M4A，不额外引入 MP3 编码器。腾讯极速版支�
 本地音频库不设自动容量淘汰。它是后续“纯音频 + 同步歌词”的源资产，只有家长在
 设置中删除单曲或清空时才移除。删除 M4A 不删除最终歌词绑定或 VPS 的 ASR 转写缓存。
 
-## 两轮歌词生成
+## 渐进式 AI Lyrics 生成
 
-第一轮的腾讯 ASR 输出是时间真值来源：句子边界、词边界和初始文字。网络 LRC 的
-旧时间戳不可信，只取其文本；当词级覆盖足够时，在本地按 ASR 词时间重新对齐。
+页面先稳定绑定第 1 份普通歌词。腾讯 ASR 只提供句/词时间戳和噪声 transcript。本地的 `sameSongConfidence` 使用五类命名证据和集中阈值，不要求 ASR 逐字匹配。证据足够时，动态规划在整首歌上完成全局单调对齐，保留原歌词文本并产生 AI v1。
 
-第二轮 DeepSeek V4 Flash 使用非思考模式和 JSON 结构化输出：ASR 文本是主证据（70%），
-最多 3 份网络歌词和 1 份 `BabyLyricsCatalog.json` 纯文本歌本是辅助证据（30%）。
-模型只返回每个 ASR segment 的纠正文本；服务端验证行数、索引、长度和文本相似度，并从
-原 ASR segment 复制时间戳。模型返回的任何时间数据都不会被采信。
+DeepSeek V4 Flash 使用非思考 JSON contract，每行只能返回 identifier、原文、建议文本、是否修改、证据和置信度。服务端验证原文必须精确复制、修复长度受限、修改必须受原文或 aligned ASR words 支持。响应不包含时间戳；Apple TV 只把文本建议套回 AI v1 的原时间线，形成同 identity 的 v2。
 
-本地确定性回退把每个候选和可选歌本纯文本规范化为英文单词序列，计算：
+本地确定性同歌证据包括：
 
-- 单词覆盖率 30%；
-- 相邻双词/三词片段重合 50%；
-- 原有文件名、来源、版本、歌曲段时长评分 20%。
+- normalized text similarity；
+- ordered token/phrase similarity；
+- 标题/文件名 similarity；
+- ASR 对原歌词的 coverage；
+- sentence/word timestamps 的顺序合理性。
 
-声音分析未完成前稳定显示第 1 个候选作为即时兜底；第二轮成功后切换到声音时间轴。
-手动选择后记录 `manual` 来源，后续 ASR 和 DeepSeek 都不再自动覆盖。
+声音分析未完成前稳定显示第 1 个候选。用户点击任一候选时，内存 manual lock 和 generation 在任何 `await repository` 之前同步生效；后续 ASR/alignment/DeepSeek 可更新 AI candidate，但不再自动覆盖。
 
 每份歌词分别保存 `autoOffset + manualAdjustment = effectiveOffset`。提前/延后操作只累加
 `manualAdjustment`，自动重校时不覆盖人工调整。
@@ -110,8 +123,7 @@ tvOS 后台处理由系统择机调度且可中断。策略应为：只在当月
 
 ## 隐私与解耦
 
-- VPS 不持久化 M4A，不保存 Jellyfin URL、访问令牌或候选歌词。候选纯文本只存在于
-  `/v1/refine` 的请求内存中，返回后不写库。
+- VPS 不持久化 M4A，不保存 Jellyfin URL、访问令牌或歌词。AI v1 原始行与 alignment evidence 只存在于 `/v1/refine` 请求内存中，返回后不写库。
 - multipart 临时文件在请求 `finally` 中关闭，由系统删除；systemd 同时启用
   `PrivateTmp=true`。
 - 数据库只保存音频 SHA-256、不可逆媒体指纹、腾讯转写文字、时间戳和用量；

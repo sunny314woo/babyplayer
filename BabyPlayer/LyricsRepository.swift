@@ -1,6 +1,8 @@
 //
 // LyricsRepository.swift
 // BabyPlayer 歌词候选、本地绑定和时间偏移。
+// 当前主要功能：搜索与缓存候选、稳定默认绑定、每歌词独立校时及人工优先持久化。
+// 最近修改：2026-08-23 引入不依赖时间戳的 persistentIdentifier v2 和 v1 timing fallback。
 //
 
 import CryptoKit
@@ -117,6 +119,32 @@ struct LyricsCandidate: Codable, Identifiable, Sendable {
     let lines: [TimedLyricLine]
     let matchScore: Double
     let providerName: String?
+    /// AI v1/v2 共用的稳定源 identity；普通候选为 nil。
+    let identityAnchor: String?
+
+    // 【MODIFIED】显式 initializer 为 AI Lyrics 允许传入稳定 anchor，同时保持旧调用点无需改动。
+    /// 创建歌词候选；输入为来源元数据、文本时间线和可选 identity anchor，输出为可持久候选，不修改 repository/UI。
+    init(
+        id: Int,
+        trackName: String,
+        artistName: String,
+        albumName: String?,
+        duration: Double,
+        lines: [TimedLyricLine],
+        matchScore: Double,
+        providerName: String?,
+        identityAnchor: String? = nil
+    ) {
+        self.id = id
+        self.trackName = trackName
+        self.artistName = artistName
+        self.albumName = albumName
+        self.duration = duration
+        self.lines = lines
+        self.matchScore = matchScore
+        self.providerName = providerName
+        self.identityAnchor = identityAnchor
+    }
 
     var previewText: String {
         lines.prefix(2).map(\.text).joined(separator: "  ·  ")
@@ -126,19 +154,83 @@ struct LyricsCandidate: Codable, Identifiable, Sendable {
         Int(max(0, min(100, 100 - matchScore)).rounded())
     }
 
-    /// 候选 ID 之外再绑定歌词内容摘要，避免同一提供方修订歌词后误用旧校时。
+    /// 【MODIFIED】v2 绑定稳定来源/ID/规范文本，禁止 timestamp、offset 和展示型 provider 后缀参与。
     var persistentIdentifier: String {
-        LyricsIdentity.make(
+        LyricsIdentity.makeV2(
             candidateID: id,
             providerName: providerName,
             trackName: trackName,
             artistName: artistName,
-            lines: lines
+            lines: lines,
+            identityAnchor: identityAnchor
         )
     }
 }
 
 private enum LyricsIdentity {
+    // 【MODIFIED】v2 仅使用稳定来源和规范文本；AI anchor 让文本有限修复不改 identity。
+    /// 生成 v2 identity；输入为稳定来源、candidate ID、规范文本和可选 AI anchor，输出为摘要字符串，不修改状态。
+    static func makeV2(
+        candidateID: Int,
+        providerName: String?,
+        trackName: String,
+        artistName: String,
+        lines: [TimedLyricLine],
+        identityAnchor: String?
+    ) -> String {
+        let provider = stableProviderCategory(providerName)
+        let normalizedText = lines.map { normalizedIdentityText($0.text) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        let stableContent = identityAnchor ?? (provider == "ai" ? "ai-candidate" : normalizedText)
+        let raw = [
+            "babyplayer-lyrics-v2",
+            provider,
+            String(candidateID),
+            normalizedIdentityText(trackName),
+            normalizedIdentityText(artistName),
+            stableContent
+        ].joined(separator: "|")
+        let digest = SHA256.hash(data: Data(raw.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "v2:\(provider):\(candidateID):\(digest)"
+    }
+
+    /// 把展示 provider 折叠为稳定来源类别；输入为可选展示名，输出为小写类别，不修改状态。
+    private static func stableProviderCategory(_ providerName: String?) -> String {
+        let raw = providerName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+        let folded = raw.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        if folded.hasPrefix("ai ") || folded.hasPrefix("ai·") { return "ai" }
+        if folded.contains("本地歌本") { return "songbook" }
+        if folded.contains("lrclib") { return "lrclib" }
+        return folded.components(separatedBy: "·").first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+    }
+
+    /// 规范 identity 文本；输入为歌词/元数据，输出为去大小写、变音和标点的 token 序列，不修改状态。
+    private static func normalizedIdentityText(_ text: String) -> String {
+        text.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        .split { !$0.isLetter && !$0.isNumber }
+        .map(String.init)
+        .joined(separator: " ")
+    }
+
+    /// 从 v1/v2 persisted key 读取 candidate ID；输入为旧或新 identifier，输出为可选 Int，不修改状态。
+    static func candidateID(inPersistedIdentifier identifier: String) -> Int? {
+        let parts = identifier.split(separator: ":", omittingEmptySubsequences: false)
+        if parts.first == "v2", parts.count >= 4 { return Int(parts[2]) }
+        guard parts.count >= 3 else { return nil }
+        return Int(parts[parts.count - 2])
+    }
+
+    /// 保留 v1 算法仅供解码旧 binding 时推导 legacy key，新候选不再调用。
     static func make(
         candidateID: Int,
         providerName: String?,
@@ -408,7 +500,8 @@ actor BabyLyricsRepository {
             lines: candidate.lines,
             autoOffsetSeconds: media.songStartSeconds ?? 0,
             manualAdjustmentSeconds: 0,
-            isConfirmed: true,
+            // 网络歌词只是声音分析完成前的即时兜底，不应被视为最终绑定。
+            isConfirmed: false,
             selectionOrigin: .automatic,
             lyricIdentifier: candidate.persistentIdentifier,
             providerName: candidate.providerName
@@ -450,7 +543,9 @@ actor BabyLyricsRepository {
     func applyAutomaticRecommendation(
         _ candidate: LyricsCandidate,
         autoOffsetSeconds: Double?,
-        for media: LyricsMediaDescriptor
+        for media: LyricsMediaDescriptor,
+        automationGuard: LyricsAutomationGenerationGuard? = nil,
+        startedAtGeneration: Int? = nil
     ) throws -> LyricsPlayback? {
         if let existing = binding(for: media),
            (existing.selectionOrigin ?? .manual) == .manual {
@@ -459,6 +554,15 @@ actor BabyLyricsRepository {
         var playback = playback(for: candidate, media: media, selectionOrigin: .asr)
         if let autoOffsetSeconds {
             playback.autoOffsetSeconds = autoOffsetSeconds
+        }
+        // 【MODIFIED】自动 binding 的最终 gate 检查与写入在同一临界区内，manual click 不会与其交叉。
+        if let automationGuard, let startedAtGeneration {
+            return try automationGuard.performIfAutomaticResultIsPermitted(
+                startedAt: startedAtGeneration
+            ) {
+                _ = try confirm(playback, for: media)
+                return playback
+            }
         }
         _ = try confirm(playback, for: media)
         return playback
@@ -765,7 +869,8 @@ actor BabyLyricsRepository {
             lines: binding.lines,
             autoOffsetSeconds: adjustment.autoOffsetSeconds,
             manualAdjustmentSeconds: adjustment.manualAdjustmentSeconds,
-            isConfirmed: true,
+            // 旧的 automatic 绑定仍可被 ASR 自动替换；asr/manual 才是最终结果。
+            isConfirmed: (binding.selectionOrigin ?? .manual) != .automatic,
             // Bindings written before origin tracking are treated as manual so an
             // automatic analysis never overwrites a parent's earlier choice.
             selectionOrigin: binding.selectionOrigin ?? .manual,
@@ -781,6 +886,19 @@ actor BabyLyricsRepository {
     ) -> LyricsTimingAdjustment {
         if let stored = binding?.timingAdjustments?[identifier] {
             return stored
+        }
+        // 【MODIFIED】已有 v1 selected key 时先按当前 candidate ID 恢复，避免 retime 切到 v2 后丢人工增量。
+        if let binding,
+           binding.sourceCandidateID == candidateID,
+           let selectedIdentifier = binding.selectedLyricIdentifier,
+           let selectedAdjustment = binding.timingAdjustments?[selectedIdentifier] {
+            return selectedAdjustment
+        }
+        // 【MODIFIED】对多候选旧数据使用 key 中的 candidate ID 作最小可维护 fallback。
+        if let legacy = binding?.timingAdjustments?.first(where: {
+            LyricsIdentity.candidateID(inPersistedIdentifier: $0.key) == candidateID
+        })?.value {
+            return legacy
         }
         if let binding {
             let isSelectedIdentifier = binding.selectedLyricIdentifier == identifier
