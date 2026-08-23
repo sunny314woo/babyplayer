@@ -1,0 +1,66 @@
+# Temporary branch verification for frozen ASR lyrics Version B.
+# 【MODIFIED】No production credentials are injected; tests use fake providers only.
+name: BabyPlayer Branch Verification
+
+on:
+  push:
+    branches:
+      - fix/asr-lyrics-deterministic-vb
+
+jobs:
+  server-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: BabyPlayerASRServer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install server dependencies
+        run: pip install -r requirements.txt
+      - name: Run all ASR server tests
+        run: python -m pytest -q -p no:cacheprovider
+
+  tvos-builds:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Xcode project
+        run: |
+          xcodebuild -version
+          xcodebuild -project BabyPlayer.xcodeproj -list
+      - name: Build tvOS Simulator SDK
+        run: |
+          xcodebuild \
+            -project BabyPlayer.xcodeproj \
+            -scheme BabyPlayer \
+            -configuration Debug \
+            -sdk appletvsimulator \
+            -destination 'generic/platform=tvOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Build tvOS device SDK
+        run: |
+          xcodebuild \
+            -project BabyPlayer.xcodeproj \
+            -scheme BabyPlayer \
+            -configuration Debug \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Run BabyPlayer unit tests
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(item["udid"] for runtime,items in d.items() if "tvOS" in runtime for item in items if item.get("isAvailable")))')
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcodebuild \
+            -project BabyPlayer.xcodeproj \
+            -scheme BabyPlayer \
+            -configuration Debug \
+            -destination "id=$UDID" \
+            CODE_SIGNING_ALLOWED=NO \
+            test
