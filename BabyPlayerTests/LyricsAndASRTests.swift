@@ -1,7 +1,15 @@
+//
+// LyricsAndASRTests.swift
+// BabyPlayer 歌词绑定、ASR 本地匹配、累计校时、纯文本歌本和额度策略回归测试。
+// 主要功能：验证默认/人工优先级、持久化、单调时间对齐、稳定 identity、歌本和额度预检。
+// 最近修改：2026-08-23 【MODIFIED】增加不明确保持当前歌词、重复副歌和稳定 identity 测试。
+//
+
 import XCTest
 @testable import BabyPlayer
 
 final class LyricsAndASRTests: XCTestCase {
+    /// 默认首次绑定必须稳定选择第 1 份，并在重新创建 Repository 后仍存在。
     func testFirstCandidateIsDefaultAndPersists() async throws {
         let storage = try makeStorage()
         defer { try? FileManager.default.removeItem(at: storage) }
@@ -19,6 +27,7 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(stored?.candidateID, first.id)
     }
 
+    /// 人工选择第二/第三份后，Repository 层必须拒绝任何后续 ASR 自动覆盖。
     func testManualBindingCannotBeOverwrittenByASRRecommendation() async throws {
         let storage = try makeStorage()
         defer { try? FileManager.default.removeItem(at: storage) }
@@ -42,6 +51,7 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(stored?.selectionOrigin, .manual)
     }
 
+    /// 多次提前/延后必须累计；不同歌词拥有独立调整，并且重启后恢复。
     func testManualOffsetsAccumulatePerLyricAndSurviveReload() async throws {
         let storage = try makeStorage()
         defer { try? FileManager.default.removeItem(at: storage) }
@@ -73,6 +83,7 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(firstAfterReload.offsetSeconds, 3.4, accuracy: 0.0001)
     }
 
+    /// 明显领先且句级数据足够时，可用确定性算法估计整体偏移。
     func testMatcherSelectsClearlyLeadingLyricsAndEstimatesOffset() {
         let correct = LyricsCandidate(
             id: 1,
@@ -112,6 +123,7 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(outcome.offsetSeconds ?? 0, 5.5, accuracy: 0.0001)
     }
 
+    /// 纯文本歌本可利用腾讯单词时间戳生成临时时间轴。
     func testPlainTextSongbookCanGenerateTimedCandidate() {
         let words = [
             makeWord("clap", at: 0), makeWord("your", at: 0.4), makeWord("hands", at: 0.8),
@@ -144,7 +156,38 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(outcome.offsetSeconds ?? 0, 7, accuracy: 0.0001)
     }
 
-    func testNetworkTextIsRetimedFromASRAndIgnoresUntrustedLRCTimes() {
+    /// 【MODIFIED】真实 Bundle 相同的数据格式能按 SSS 文件名线索找到纯文本歌本。
+    func testBundledSuperSimpleSongbookParticipatesInMatching() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let catalog = Data(#"{"tracks":[{"id":-1001,"trackID":"sss-twinkle","title":"Twinkle Twinkle Little Star","aliases":["Twinkle Twinkle"],"artist":"Super Simple Songs","source":"Super Simple Songs","plainLyrics":"twinkle twinkle little star\nhow I wonder what you are"}]}"#.utf8)
+        let repository = BabyLyricsRepository(
+            cachesDirectory: storage.appendingPathComponent("Caches", isDirectory: true),
+            applicationSupportDirectory: storage.appendingPathComponent("Support", isDirectory: true),
+            bundledCatalogData: catalog
+        )
+        let media = LyricsMediaDescriptor(
+            id: "sss-media",
+            title: "01 Twinkle Twinkle Little Star [SSS].mp4",
+            searchTitle: "Twinkle Twinkle Little Star",
+            artistName: nil,
+            sourceHint: "Super Simple Songs",
+            versionHint: nil,
+            durationSeconds: 40,
+            songStartSeconds: 0,
+            songEndSeconds: 40,
+            mediaSourceID: "sss-source"
+        )
+
+        let reference = await repository.plainTextReference(for: media)
+
+        XCTAssertEqual(reference?.id, -1001)
+        XCTAssertEqual(reference?.artist, "Super Simple Songs")
+        XCTAssertTrue(reference?.plainLyrics.contains("twinkle twinkle") == true)
+    }
+
+    /// 网络 LRC 时间戳不可信时，文本可被腾讯单词时间戳重新校时。
+    func testNetworkTextIsRetimedFromASRAndKeepsStableIdentity() {
         let candidate = LyricsCandidate(
             id: 9,
             trackName: "Retimed",
@@ -179,20 +222,13 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(outcome.selected?.id, candidate.id)
         XCTAssertEqual(outcome.selected?.lines.map(\.time), [1, 4])
         XCTAssertEqual(outcome.offsetSeconds ?? 0, 6, accuracy: 0.0001)
-        XCTAssertTrue(outcome.selected?.providerName?.contains("声音重校时") == true)
+        XCTAssertEqual(outcome.selected?.persistentIdentifier, candidate.persistentIdentifier)
     }
 
-    func testProductionMatcherNeverFallsBackToUntrustedOnlineTimeline() {
-        let candidate = LyricsCandidate(
-            id: 11,
-            trackName: "Broken Timeline",
-            artistName: "Kids",
-            albumName: nil,
-            duration: 1_000,
-            lines: [TimedLyricLine(time: 999, text: "hello world again")],
-            matchScore: 0,
-            providerName: "LRCLIB"
-        )
+    /// 【MODIFIED】候选接近时绝不能自动换成 ASR 原始字幕或任一候选；应保持当前默认第一份。
+    func testAmbiguousMatcherDoesNotAutoSelectAnything() {
+        let first = makeCandidate(id: 11, title: "First", words: "hello world again")
+        let second = makeCandidate(id: 12, title: "Second", words: "hello world again")
         let analysis = makeAnalysis(segments: [
             makeSegment("hello world again", at: 0),
             makeSegment("hello world again", at: 0.2),
@@ -201,16 +237,57 @@ final class LyricsAndASRTests: XCTestCase {
 
         let outcome = BabyPlayerLyricsSoundMatcher.match(
             analysis: analysis,
-            candidates: [candidate],
+            candidates: [first, second],
             reference: nil,
             sampleStartSeconds: 3
         )
 
-        XCTAssertNotEqual(outcome.selected?.id, candidate.id)
-        XCTAssertEqual(outcome.selected?.providerName, "腾讯 ASR·声音时间轴")
-        XCTAssertEqual(outcome.offsetSeconds ?? 0, 3, accuracy: 0.0001)
+        XCTAssertNil(outcome.selected)
+        XCTAssertNil(outcome.offsetSeconds)
+        XCTAssertTrue(outcome.message.contains("已保留当前歌词"))
     }
 
+    /// 【MODIFIED】重复歌词必须沿 ASR 时间单调向后匹配，不能把第二次副歌吸回第一次出现的位置。
+    func testRepeatedChorusUsesMonotonicGlobalAlignment() {
+        let candidate = LyricsCandidate(
+            id: 21,
+            trackName: "Repeated Chorus",
+            artistName: "Kids",
+            albumName: nil,
+            duration: 100,
+            lines: [
+                TimedLyricLine(time: 50, text: "clap your hands"),
+                TimedLyricLine(time: 51, text: "stomp your feet"),
+                TimedLyricLine(time: 52, text: "clap your hands"),
+                TimedLyricLine(time: 53, text: "stomp your feet")
+            ],
+            matchScore: 0,
+            providerName: "LRCLIB"
+        )
+        let words = [
+            makeWord("clap", at: 0), makeWord("your", at: 0.2), makeWord("hands", at: 0.4),
+            makeWord("stomp", at: 2), makeWord("your", at: 2.2), makeWord("feet", at: 2.4),
+            makeWord("clap", at: 4), makeWord("your", at: 4.2), makeWord("hands", at: 4.4),
+            makeWord("stomp", at: 6), makeWord("your", at: 6.2), makeWord("feet", at: 6.4)
+        ]
+        let segment = BabyPlayerASRSegment(
+            text: "clap your hands stomp your feet clap your hands stomp your feet",
+            startSeconds: 0,
+            endSeconds: 7,
+            words: words
+        )
+
+        let outcome = BabyPlayerLyricsSoundMatcher.match(
+            analysis: makeAnalysis(segments: [segment]),
+            candidates: [candidate],
+            reference: nil,
+            sampleStartSeconds: 0
+        )
+
+        XCTAssertEqual(outcome.selected?.lines.map(\.time), [0, 2, 4, 6])
+    }
+
+    /// 完整本地歌曲缓存不应被 120 秒 ASR 识别窗口截断。
     func testCompleteAudioIsKeptWhileRecognitionWindowRemainsBounded() {
         let media = LyricsMediaDescriptor(
             id: "long-song",
@@ -229,6 +306,7 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(BabyPlayerAudioCache.recognitionDuration(for: media), 120, accuracy: 0.0001)
     }
 
+    /// 客户端额度预检必须在上传前拒绝超出剩余额度的识别请求。
     func testQuotaPreflightRejectsBeforeUpload() {
         let usage = BabyPlayerASRUsage(
             month: "2026-08",
@@ -247,6 +325,7 @@ final class LyricsAndASRTests: XCTestCase {
         }
     }
 
+    /// 创建隔离 Repository；输入临时根目录，输出不会影响真实 App 数据的测试实例。
     private func makeRepository(_ root: URL) -> BabyLyricsRepository {
         BabyLyricsRepository(
             cachesDirectory: root.appendingPathComponent("Caches", isDirectory: true),
@@ -255,6 +334,7 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
+    /// 创建单测临时目录；副作用仅限系统临时目录。
     private func makeStorage() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("BabyPlayerTests-\(UUID().uuidString)", isDirectory: true)
@@ -262,6 +342,7 @@ final class LyricsAndASRTests: XCTestCase {
         return url
     }
 
+    /// 创建标准媒体描述，便于绑定/偏移测试复用。
     private func makeMedia(songStart: Double = 0) -> LyricsMediaDescriptor {
         LyricsMediaDescriptor(
             id: "media-1",
@@ -277,6 +358,7 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
+    /// 创建单行测试歌词候选；无外部副作用。
     private func makeCandidate(id: Int, title: String, words: String) -> LyricsCandidate {
         LyricsCandidate(
             id: id,
@@ -290,6 +372,7 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
+    /// 创建不带 word 细节的句级 ASR 段。
     private func makeSegment(_ text: String, at start: Double) -> BabyPlayerASRSegment {
         BabyPlayerASRSegment(
             text: text,
@@ -299,10 +382,12 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
+    /// 创建单词级 ASR 时间戳。
     private func makeWord(_ text: String, at start: Double) -> BabyPlayerASRWord {
         BabyPlayerASRWord(text: text, startSeconds: start, endSeconds: start + 0.3)
     }
 
+    /// 创建完整 ASR 分析测试对象；不会调用真实腾讯服务。
     private func makeAnalysis(segments: [BabyPlayerASRSegment]) -> BabyPlayerASRAnalysis {
         BabyPlayerASRAnalysis(
             status: "completed",
