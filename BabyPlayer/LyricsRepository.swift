@@ -1,6 +1,8 @@
 //
 // LyricsRepository.swift
 // BabyPlayer 歌词候选、本地绑定和时间偏移。
+// 主要功能：歌词标题解析、候选搜索、默认/人工绑定、每份歌词独立校时与持久化、本地纯文本歌本读取。
+// 最近修改：2026-08-23 【MODIFIED】稳定歌词 identity，迁移旧校时键并保证 ASR 重校时不丢人工调整。
 //
 
 import CryptoKit
@@ -126,7 +128,7 @@ struct LyricsCandidate: Codable, Identifiable, Sendable {
         Int(max(0, min(100, 100 - matchScore)).rounded())
     }
 
-    /// 候选 ID 之外再绑定歌词内容摘要，避免同一提供方修订歌词后误用旧校时。
+    /// 【MODIFIED】歌词身份只由来源、候选 ID 和规范化文本决定；ASR 改时间轴不会生成“另一份歌词”。
     var persistentIdentifier: String {
         LyricsIdentity.make(
             candidateID: id,
@@ -139,6 +141,7 @@ struct LyricsCandidate: Codable, Identifiable, Sendable {
 }
 
 private enum LyricsIdentity {
+    /// 【MODIFIED】生成稳定歌词 identity；输入时间轴仅取文本，不把时间戳写入摘要。
     static func make(
         candidateID: Int,
         providerName: String?,
@@ -146,20 +149,31 @@ private enum LyricsIdentity {
         artistName: String,
         lines: [TimedLyricLine]
     ) -> String {
-        let content = lines.map { "\(String(format: "%.3f", $0.time))|\($0.text)" }
+        let content = lines.map { normalizedText($0.text) }
             .joined(separator: "\n")
         let raw = [
-            "babyplayer-lyrics-v1",
-            providerName ?? "unknown",
+            "babyplayer-lyrics-v2",
+            normalizedText(providerName ?? "unknown"),
             String(candidateID),
-            trackName,
-            artistName,
+            normalizedText(trackName),
+            normalizedText(artistName),
             content
         ].joined(separator: "|")
         let digest = SHA256.hash(data: Data(raw.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
         return "\(providerName ?? "lyrics"):\(candidateID):\(digest)"
+    }
+
+    /// 【MODIFIED】统一大小写、变音和标点，避免只因展示格式变化导致歌词 identity 改变。
+    private static func normalizedText(_ text: String) -> String {
+        text.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        .split { !$0.isLetter && !$0.isNumber }
+        .map(String.init)
+        .joined(separator: " ")
     }
 }
 
@@ -773,6 +787,7 @@ actor BabyLyricsRepository {
         )
     }
 
+    /// 【MODIFIED】按稳定 identity、当前选中旧 identity、旧 candidate-ID key 的顺序恢复每份歌词自己的校时。
     private func timingAdjustment(
         identifier: String,
         candidateID: Int,
@@ -783,20 +798,31 @@ actor BabyLyricsRepository {
             return stored
         }
         if let binding {
-            let isSelectedIdentifier = binding.selectedLyricIdentifier == identifier
-            let isLegacySelectedCandidate = binding.selectedLyricIdentifier == nil
-                && binding.sourceCandidateID == candidateID
-            if isSelectedIdentifier || isLegacySelectedCandidate {
+            if binding.sourceCandidateID == candidateID {
+                if let selectedIdentifier = binding.selectedLyricIdentifier,
+                   let selected = binding.timingAdjustments?[selectedIdentifier] {
+                    return selected
+                }
                 return LyricsTimingAdjustment(
                     autoOffsetSeconds: 0,
                     manualAdjustmentSeconds: binding.offsetSeconds
                 )
+            }
+            if let migrated = binding.timingAdjustments?.first(where: { entry in
+                legacyIdentifier(entry.key, matchesCandidateID: candidateID)
+            })?.value {
+                return migrated
             }
         }
         return LyricsTimingAdjustment(
             autoOffsetSeconds: defaultAutoOffset,
             manualAdjustmentSeconds: 0
         )
+    }
+
+    /// 【MODIFIED】识别 v1/v2 的 `provider:candidateID:digest` 键，用于无损迁移旧的逐歌词校时记录。
+    private func legacyIdentifier(_ identifier: String, matchesCandidateID candidateID: Int) -> Bool {
+        identifier.contains(":\(candidateID):")
     }
 
     private func existingLyricIdentifier(_ binding: LyricsBinding) -> String {
