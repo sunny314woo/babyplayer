@@ -6,6 +6,9 @@ on:
   push:
     branches:
       - fix/asr-lyrics-deterministic-vb
+  pull_request:
+    branches:
+      - main
 
 jobs:
   server-tests:
