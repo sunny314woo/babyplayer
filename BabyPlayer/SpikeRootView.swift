@@ -409,7 +409,10 @@ private struct MediaCard: View {
 private struct ParentSettingsView: View {
     @ObservedObject var model: SpikeViewModel
     let close: () -> Void
+    @StateObject private var audioCache = BabyPlayerAudioCacheViewModel()
     @State private var confirmClear = false
+    @State private var confirmClearAudio = false
+    @State private var showAudioCache = false
 
     var body: some View {
         ZStack {
@@ -438,6 +441,37 @@ private struct ParentSettingsView: View {
                             SettingsActionRow(title: "重新配对", value: "Quick Connect")
                         }
                         SettingsLyricsModeMenu(selection: $model.lyricsMode)
+                        SettingsInfoRow(title: "本月声音分析", value: audioCache.usageText)
+                        Button {
+                            showAudioCache.toggle()
+                            audioCache.refresh()
+                        } label: {
+                            SettingsActionRow(
+                                title: "本地歌曲音频库",
+                                value: "\(audioCache.entries.count) 首 · \(audioCache.totalSizeText)"
+                            )
+                        }
+                        if showAudioCache {
+                            if audioCache.entries.isEmpty {
+                                SettingsInfoRow(title: "缓存曲目", value: "暂无")
+                            } else {
+                                ForEach(audioCache.entries) { entry in
+                                    Button(role: .destructive) {
+                                        audioCache.delete(entry)
+                                    } label: {
+                                        SettingsActionRow(
+                                            title: entry.title,
+                                            value: "\(Int(entry.durationSeconds.rounded())) 秒 · \(ByteCountFormatter.string(fromByteCount: entry.storedByteCount, countStyle: .file)) · \(audioCache.createdText(entry.createdAt)) · \(entry.matchedLyricsTitle ?? entry.analysisStatus) · 删除"
+                                        )
+                                    }
+                                }
+                                Button(role: .destructive) {
+                                    confirmClearAudio = true
+                                } label: {
+                                    SettingsActionRow(title: "清空本地歌曲音库", value: audioCache.totalSizeText)
+                                }
+                            }
+                        }
                         blockedRatingsSection
                         SettingsIntegerMenu(
                             title: "定时关闭",
@@ -475,6 +509,7 @@ private struct ParentSettingsView: View {
             .padding(.vertical, 10)
         }
         .onExitCommand(perform: close)
+        .task { audioCache.refresh() }
         .alert("清除 Jellyfin 配对？", isPresented: $confirmClear) {
             Button("取消", role: .cancel) { }
             Button("清除", role: .destructive) {
@@ -483,6 +518,14 @@ private struct ParentSettingsView: View {
             }
         } message: {
             Text("下次打开 BabyPlayer 需要重新输入配对码。")
+        }
+        .alert("清空本地歌曲音库？", isPresented: $confirmClearAudio) {
+            Button("取消", role: .cancel) { }
+            Button("清空", role: .destructive) {
+                audioCache.deleteAll()
+            }
+        } message: {
+            Text("会删除 Apple TV 上保留的完整歌曲 M4A，以后的纯音频播放也将无法复用；不删除歌词绑定和 VPS 转写缓存。")
         }
     }
 

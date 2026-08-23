@@ -7,7 +7,7 @@ BabyPlayer 是一个给 Apple TV 使用的儿童音乐视频播放器。它从�
 ```text
 电脑：运行 Jellyfin，保存和管理视频
 Apple TV：安装 BabyPlayer，浏览和播放视频
-互联网：BabyPlayer 从 LRCLIB 搜索英文同步歌词
+互联网：BabyPlayer 从 LRCLIB 搜索英文同步歌词；可选通过独立 ASR 服务做声音核验
 ```
 
 Jellyfin 不需要、也不能作为服务器安装在 Apple TV 上。平时播放时，电脑和 Jellyfin 需要保持开机运行。
@@ -106,7 +106,7 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
 3. 这里可以：
 
    - 打开或关闭字幕；
-   - 查看当前视频最接近的歌词候选，最多 3 个；
+   - 查看当前视频最接近的同步歌词候选，最多 3 个，并可额外使用 1 份本地歌本纯文本；
    - 根据匹配分、歌词时长差和歌词片段选择正确版本；
    - 选择“重新搜索歌词”刷新在线结果；
    - 使用“提前/延后 0.1 秒或 0.5 秒”校准时间。
@@ -114,11 +114,38 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
 
 首次搜索会默认绑定排名第 1 的歌词。点选第 2 或第 3 个候选后，会立即替换当前 Jellyfin 视频的绑定，并保存在这台 Apple TV。下次播放直接使用已选歌词，不会被重新搜索覆盖。
 
-时间调整不限次数。每次提前、延后或重新对齐都会覆盖保存最新偏移，下次播放继续使用。
+时间调整不限次数。每次提前或延后都在当前人工调整上累加；自动偏移和
+人工调整分开保存。每份歌词都有自己的调整值，切换和重启后会恢复。
 
-如果没有找到带时间轴的歌词，BabyPlayer 会明确显示“没有找到”，不会给普通文本伪造时间轴。目前不使用 AI；先用歌名、来源/版本、演唱者和歌曲段时长评分，默认绑定第 1 个，家长可随时切换候选纠错。
+未配置声音分析时，BabyPlayer 仍使用歌名、来源/版本、演唱者和歌曲段时长排序，
+并稳定默认绑定第 1 个。配置后使用两轮生成：第一轮腾讯 ASR 产生句/词时间戳和
+初稿；第二轮 DeepSeek V4 Flash 以 ASR 为主证据，以最多 3 份网络歌词和 1 份本地
+纯文本歌本为次证据纠正文案。第二轮不能修改时间戳；服务端会验证并重新附上腾讯
+时间边界。任一环失败都回退到已有的本地确定性结果，家长的手动选择永远不会被自动结果
+覆盖。
 
 注意：删除 BabyPlayer App 会同时删除 Apple TV 上保存的歌词绑定与缓存；从 Xcode 覆盖安装通常会保留。
+
+### 可选声音分析
+
+声音分析服务与 EnglishFlow、翻译、TTS 和 Jellyfin 完全独立；实现与部署说明见
+[`BabyPlayerASRServer/README.md`](BabyPlayerASRServer/README.md)，详细边界见
+[`BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md`](BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md)。
+
+本地 Token 不直接写入 `Info.plist`。复制
+`Config/BabyPlayerSecrets.xcconfig.example` 为 `Config/BabyPlayerSecrets.xcconfig`，只在后者中填入
+BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VPS 的
+`/opt/babyplayer-asr/.env`，不进入 Apple TV 安装包。
+
+- Apple TV 把完整歌曲段 M4A 保存到 Application Support 下的本地音频库，不会自动淘汰；
+  较长曲目可另有一份最长 120 秒的 ASR 识别前段。这份完整 M4A 可供后续“纯音频 +
+  同步歌词”功能直接复用。
+- VPS 不保存音频、Jellyfin URL 或歌词。ASR 模块只缓存不可逆指纹、转写文字与时间戳；
+  DeepSeek 模块只在请求内存中临时处理候选文本，不写入数据库。
+- 服务端硬限制每个北京时间自然月 18,000 秒（5 小时）。达到上限后提示下月 1 日
+  00:00 再次使用；已有缓存仍可继续匹配。
+- 家长设置可查看每首本地歌曲音频、识别状态、总占用、本月剩余时间，并可逐首或全部删除。
+- 腾讯云后付费应保持关闭。
 
 ### 内置 Super Simple Songs 曲目库
 
@@ -136,6 +163,7 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
       "source": "Super Simple Songs",
       "version": "Official",
       "duration": 120.0,
+      "plainLyrics": "First line\nSecond line",
       "syncedLyrics": "[00:05.20]First line\\n[00:09.80]Second line"
     }
   ]
@@ -144,6 +172,8 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
 
 - 内置曲目 `id` 使用负数，避免与 LRCLIB ID 冲突。
 - `syncedLyrics` 可为 `null`；此时该条目只提供标准歌名、别名和艺术家线索，歌词仍从 LRCLIB 搜索。
+- `plainLyrics` 可保存已获授权的纯文本歌本。它不占用 3 个在线同步候选名额；声音分析
+  可用它核验曲目，并在词级时间戳覆盖率足够时在 Apple TV 本地自动校时。
 - 只应打包自己有权使用和分发的歌词文件。
 
 ## 五、其他播放控制
@@ -174,7 +204,8 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
 
 ### 某首歌没有歌词或歌词不正确
 
-在该视频的播放页打开“字幕与歌词”，先看最多 3 个候选；不合适时选择“重新搜索歌词”。选对后会永久绑定。若 3 个都不正确，目前先保持无歌词，后续再增加自定义关键词搜索或 AI 修复。
+在该视频的播放页打开“字幕与歌词”，先看最多 3 个同步候选和可选本地歌本；不合适时
+选择“重新搜索歌词”。声音核验置信度不足时不会自动切换，家长选对后会永久绑定。
 
 ## 当前要求
 

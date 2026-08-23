@@ -1,0 +1,22 @@
+[Unit]
+Description=BabyPlayer Independent ASR Service
+After=network.target
+
+[Service]
+Type=simple
+User=babyplayer-asr
+Group=babyplayer-asr
+WorkingDirectory=/opt/babyplayer-asr
+EnvironmentFile=/opt/babyplayer-asr/.env
+Environment="PATH=/opt/babyplayer-asr/.venv/bin"
+ExecStart=/opt/babyplayer-asr/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8011
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/babyplayer-asr
+
+[Install]
+WantedBy=multi-user.target

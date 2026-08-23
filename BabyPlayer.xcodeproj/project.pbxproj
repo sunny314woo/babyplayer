@@ -16,7 +16,20 @@
 		A10000000000000000000009 /* MediaCoverLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* MediaCoverLoader.swift */; };
 		A1000000000000000000000A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* Assets.xcassets */; };
 		A1000000000000000000000B /* BabyLyricsCatalog.json in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* BabyLyricsCatalog.json */; };
+		A1000000000000000000000C /* BabyPlayerASR.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000C /* BabyPlayerASR.swift */; };
+		A1000000000000000000000D /* BabyPlayerLyricsRefiner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000F /* BabyPlayerLyricsRefiner.swift */; };
+		B10000000000000000000001 /* LyricsAndASRTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* LyricsAndASRTests.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		B80000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A80000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A50000000000000000000001;
+			remoteInfo = BabyPlayer;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		A20000000000000000000001 /* BabyPlayerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BabyPlayerApp.swift; sourceTree = "<group>"; };
@@ -30,10 +43,23 @@
 		A20000000000000000000009 /* MediaCoverLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaCoverLoader.swift; sourceTree = "<group>"; };
 		A2000000000000000000000A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A2000000000000000000000B /* BabyLyricsCatalog.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = BabyLyricsCatalog.json; sourceTree = "<group>"; };
+		A2000000000000000000000C /* BabyPlayerASR.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BabyPlayerASR.swift; sourceTree = "<group>"; };
+		A2000000000000000000000D /* BabyPlayer.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = BabyPlayer.xcconfig; sourceTree = "<group>"; };
+		A2000000000000000000000E /* BabyPlayerSecrets.xcconfig.example */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = BabyPlayerSecrets.xcconfig.example; sourceTree = "<group>"; };
+		A2000000000000000000000F /* BabyPlayerLyricsRefiner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BabyPlayerLyricsRefiner.swift; sourceTree = "<group>"; };
+		B20000000000000000000001 /* LyricsAndASRTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsAndASRTests.swift; sourceTree = "<group>"; };
+		B20000000000000000000002 /* BabyPlayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BabyPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		A30000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B30000000000000000000001 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -47,6 +73,8 @@
 			isa = PBXGroup;
 			children = (
 				A40000000000000000000002 /* BabyPlayer */,
+				B40000000000000000000001 /* BabyPlayerTests */,
+				A40000000000000000000004 /* Config */,
 				A40000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -61,6 +89,8 @@
 				A20000000000000000000005 /* SystemPlayerView.swift */,
 				A20000000000000000000008 /* LyricsRepository.swift */,
 				A20000000000000000000009 /* MediaCoverLoader.swift */,
+				A2000000000000000000000C /* BabyPlayerASR.swift */,
+				A2000000000000000000000F /* BabyPlayerLyricsRefiner.swift */,
 				A2000000000000000000000A /* Assets.xcassets */,
 				A2000000000000000000000B /* BabyLyricsCatalog.json */,
 				A20000000000000000000006 /* Info.plist */,
@@ -72,8 +102,26 @@
 			isa = PBXGroup;
 			children = (
 				A20000000000000000000007 /* BabyPlayer.app */,
+				B20000000000000000000002 /* BabyPlayerTests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		A40000000000000000000004 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				A2000000000000000000000D /* BabyPlayer.xcconfig */,
+				A2000000000000000000000E /* BabyPlayerSecrets.xcconfig.example */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+		B40000000000000000000001 /* BabyPlayerTests */ = {
+			isa = PBXGroup;
+			children = (
+				B20000000000000000000001 /* LyricsAndASRTests.swift */,
+			);
+			path = BabyPlayerTests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -96,6 +144,23 @@
 			productReference = A20000000000000000000007 /* BabyPlayer.app */;
 			productType = "com.apple.product-type.application";
 		};
+		B50000000000000000000001 /* BabyPlayerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B60000000000000000000001 /* Build configuration list for PBXNativeTarget "BabyPlayerTests" */;
+			buildPhases = (
+				B70000000000000000000001 /* Sources */,
+				B30000000000000000000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B80000000000000000000002 /* PBXTargetDependency */,
+			);
+			name = BabyPlayerTests;
+			productName = BabyPlayerTests;
+			productReference = B20000000000000000000002 /* BabyPlayerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -108,6 +173,10 @@
 				TargetAttributes = {
 					A50000000000000000000001 = {
 						CreatedOnToolsVersion = 26.3;
+					};
+					B50000000000000000000001 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = A50000000000000000000001;
 					};
 				};
 			};
@@ -125,6 +194,7 @@
 			projectRoot = "";
 			targets = (
 				A50000000000000000000001 /* BabyPlayer */,
+				B50000000000000000000001 /* BabyPlayerTests */,
 			);
 		};
 /* End PBXProject section */
@@ -153,10 +223,28 @@
 				A10000000000000000000005 /* SystemPlayerView.swift in Sources */,
 				A10000000000000000000008 /* LyricsRepository.swift in Sources */,
 				A10000000000000000000009 /* MediaCoverLoader.swift in Sources */,
+				A1000000000000000000000C /* BabyPlayerASR.swift in Sources */,
+				A1000000000000000000000D /* BabyPlayerLyricsRefiner.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B70000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000000000000000000001 /* LyricsAndASRTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B80000000000000000000002 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A50000000000000000000001 /* BabyPlayer */;
+			targetProxy = B80000000000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		A90000000000000000000001 /* Debug */ = {
@@ -204,6 +292,7 @@
 		};
 		A90000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = A2000000000000000000000D /* BabyPlayer.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -228,6 +317,7 @@
 		};
 		A90000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = A2000000000000000000000D /* BabyPlayer.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -250,6 +340,42 @@
 			};
 			name = Release;
 		};
+		B90000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = RD2D85V483;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wufengyu.BabyPlayerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BabyPlayer.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/BabyPlayer";
+				TVOS_DEPLOYMENT_TARGET = 18.0;
+			};
+			name = Debug;
+		};
+		B90000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = RD2D85V483;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wufengyu.BabyPlayerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BabyPlayer.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/BabyPlayer";
+				TVOS_DEPLOYMENT_TARGET = 18.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -267,6 +393,15 @@
 			buildConfigurations = (
 				A90000000000000000000003 /* Debug */,
 				A90000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B60000000000000000000001 /* Build configuration list for PBXNativeTarget "BabyPlayerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B90000000000000000000001 /* Debug */,
+				B90000000000000000000002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

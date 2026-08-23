@@ -64,11 +64,15 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var timeObserver: Any?
     private var lyricsTask: Task<Void, Never>?
     private var lyricsSaveTask: Task<Void, Never>?
+    private var lyricsSelectionTask: Task<Void, Never>?
     private var lyricLines: [TimedLyricLine] = []
     private var lyricPlayback: LyricsPlayback?
     private var lyricCandidates: [LyricsCandidate] = []
     private var isSearchingLyrics = false
+    private var isAnalyzingSound = false
     private var lyricsSearchMessage: String?
+    private var soundAnalysisMessage: String?
+    private var pendingLyricSelectionIdentifier: String?
     private var currentLyricsMode: BabyPlayerLyricsMode = .off
     private var currentLyricIndex: Int?
     private var lyricsContainer: UIView?
@@ -137,6 +141,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     func cleanUp() {
         lyricsTask?.cancel()
         lyricsTask = nil
+        lyricsSelectionTask?.cancel()
+        lyricsSelectionTask = nil
         player?.pause()
         if let timeObserver, let player {
             player.removeTimeObserver(timeObserver)
@@ -268,6 +274,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         guard !didExit else { return }
         didExit = true
         lyricsTask?.cancel()
+        lyricsSelectionTask?.cancel()
         player?.pause()
         onExit?()
     }
@@ -316,12 +323,16 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
     private func prepareLyrics(for item: BabyPlayerQueueItem, mode: BabyPlayerLyricsMode) {
         lyricsTask?.cancel()
+        lyricsSelectionTask?.cancel()
+        pendingLyricSelectionIdentifier = nil
         currentLyricsMode = mode
         lyricLines = []
         lyricPlayback = nil
         lyricCandidates = []
         isSearchingLyrics = true
+        isAnalyzingSound = false
         lyricsSearchMessage = nil
+        soundAnalysisMessage = nil
         currentLyricIndex = nil
         lyricsLabel?.text = nil
         lyricsContainer?.isHidden = true
@@ -332,13 +343,18 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             let storedPlayback = await BabyLyricsRepository.shared.storedLyrics(
                 for: item.lyricsMedia
             )
+            let plainReference = await BabyLyricsRepository.shared.plainTextReference(
+                for: item.lyricsMedia
+            )
             var playback = storedPlayback
+            var foundCandidates: [LyricsCandidate] = []
             do {
                 let candidates = try await BabyLyricsRepository.shared.searchCandidates(
                     for: item.lyricsMedia
                 )
                 guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
-                self.lyricCandidates = Array(candidates.prefix(3))
+                foundCandidates = Array(candidates.prefix(3))
+                self.lyricCandidates = foundCandidates
                 playback = await BabyLyricsRepository.shared.resolvedLyrics(
                     for: item.lyricsMedia,
                     candidates: candidates
@@ -360,7 +376,68 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 }
             }
             self.updateLyricsTransportMenu()
+
+            let canAutomaticallyAnalyze = mode != .off
+                && (playback == nil || playback?.selectionOrigin == .automatic)
+            guard canAutomaticallyAnalyze else { return }
+            self.isAnalyzingSound = true
+            self.soundAnalysisMessage = "等待播放缓冲稳定…"
+            self.updateLyricsTransportMenu()
+            guard await self.waitForPlaybackBuffer(itemID: item.id) else {
+                guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
+                self.isAnalyzingSound = false
+                self.soundAnalysisMessage = "播放优先：本次暂缓声音分析"
+                self.updateLyricsTransportMenu()
+                return
+            }
+            self.soundAnalysisMessage = nil
+            do {
+                let outcome = try await BabyPlayerASRCoordinator.shared.analyze(
+                    item: item,
+                    candidates: foundCandidates,
+                    reference: plainReference
+                )
+                guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
+                self.lyricCandidates = Array(outcome.candidates.prefix(4))
+                self.soundAnalysisMessage = outcome.message
+                if let selected = outcome.selected,
+                   self.lyricPlayback?.selectionOrigin != .manual,
+                   let verified = try await BabyLyricsRepository.shared.applyAutomaticRecommendation(
+                       selected,
+                       autoOffsetSeconds: outcome.offsetSeconds,
+                       for: item.lyricsMedia
+                   ) {
+                    self.lyricPlayback = verified
+                    if mode != .off {
+                        self.lyricLines = verified.lines
+                        self.currentLyricIndex = nil
+                        if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
+                            self.updateLyrics(at: elapsed)
+                        }
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
+                if case BabyPlayerASRError.notConfigured = error {
+                    self.soundAnalysisMessage = nil
+                } else {
+                    self.soundAnalysisMessage = (error as? LocalizedError)?.errorDescription
+                        ?? "声音歌词生成暂时不可用"
+                }
+            }
+            self.isAnalyzingSound = false
+            self.updateLyricsTransportMenu()
         }
+    }
+
+    /// 避免远程 MP4 同时播放和导出时争抢局域网带宽；缓冲不稳就让本轮分析让路。
+    private func waitForPlaybackBuffer(itemID: String) async -> Bool {
+        for _ in 0..<20 {
+            guard !Task.isCancelled, currentQueueItem?.id == itemID else { return false }
+            if player?.currentItem?.isPlaybackLikelyToKeepUp == true { return true }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        return false
     }
 
     private func updateLyrics(at elapsed: Double) {
@@ -417,7 +494,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
 
         let candidatesTitle = UIAction(
-            title: "当前视频的歌词（最多 3 个）",
+            title: "声音时间轴优先 · 3 份网络歌词 + 可选歌本兜底",
             image: UIImage(systemName: "list.number")
         ) { _ in }
         candidatesTitle.attributes = .disabled
@@ -452,11 +529,27 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         if isSearchingLyrics { refresh.attributes = .disabled }
         children.append(refresh)
 
+        if isAnalyzingSound {
+            let analyzing = UIAction(
+                title: "正在生成时间轴并校正文案…",
+                image: UIImage(systemName: "waveform.badge.magnifyingglass")
+            ) { _ in }
+            analyzing.attributes = .disabled
+            children.append(analyzing)
+        } else if let soundAnalysisMessage {
+            let result = UIAction(
+                title: soundAnalysisMessage,
+                image: UIImage(systemName: "waveform")
+            ) { _ in }
+            result.attributes = .disabled
+            children.append(result)
+        }
+
         if let playback = lyricPlayback {
             let offset = playback.offsetSeconds
             let statusTitle = playback.isConfirmed ? "已绑定" : "已选择·未确认"
             let status = UIAction(
-                title: "\(statusTitle)  \(formattedOffset(offset))",
+                title: "\(statusTitle)  总计 \(formattedOffset(offset)) · 自动 \(formattedOffset(playback.autoOffsetSeconds)) · 手动 \(formattedOffset(playback.manualAdjustmentSeconds))",
                 image: UIImage(systemName: playback.isConfirmed ? "checkmark.circle.fill" : "questionmark.circle")
             ) { _ in }
             status.attributes = .disabled
@@ -474,7 +567,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 self?.adjustLyricsOffset(by: 0.5)
             }
             let reset = UIAction(title: "恢复原时间", image: UIImage(systemName: "arrow.counterclockwise")) { [weak self] _ in
-                self?.setLyricsOffset(0)
+                self?.resetManualLyricsAdjustment()
             }
             let alignFirstLine = UIAction(
                 title: "把第一句对齐到当前位置",
@@ -790,38 +883,60 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func selectLyricsCandidate(_ candidate: LyricsCandidate) {
         guard let media = currentQueueItem?.lyricsMedia else { return }
         currentLyricsMode = .english
-        let playback = LyricsPlayback(
-            candidateID: candidate.id,
-            trackName: candidate.trackName,
-            artistName: candidate.artistName,
-            sourceDuration: candidate.duration,
-            lines: candidate.lines,
-            offsetSeconds: lyricPlayback?.offsetSeconds ?? media.songStartSeconds ?? 0,
-            isConfirmed: true
-        )
-        lyricPlayback = playback
-        lyricLines = candidate.lines
-        currentLyricIndex = nil
-        lyricsSearchMessage = nil
-        if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
-            updateLyrics(at: elapsed)
+        pendingLyricSelectionIdentifier = candidate.persistentIdentifier
+        lyricsSelectionTask?.cancel()
+        let pendingSave = lyricsSaveTask
+        lyricsSelectionTask = Task { [weak self] in
+            await pendingSave?.value
+            guard let self, !Task.isCancelled else { return }
+            let playback = await BabyLyricsRepository.shared.playback(
+                for: candidate,
+                media: media,
+                selectionOrigin: .manual
+            )
+            guard !Task.isCancelled,
+                  self.currentQueueItem?.lyricsMedia.id == media.id,
+                  self.pendingLyricSelectionIdentifier == candidate.persistentIdentifier else { return }
+            self.lyricPlayback = playback
+            self.lyricLines = candidate.lines
+            self.currentLyricIndex = nil
+            self.lyricsSearchMessage = nil
+            if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
+                self.updateLyrics(at: elapsed)
+            }
+            self.updateLyricsTransportMenu()
+            self.persistLyricsPlayback(playback, for: media)
         }
-        updateLyricsTransportMenu()
-        persistLyricsPlayback(playback, for: media)
     }
 
     private func adjustLyricsOffset(by delta: Double) {
-        setLyricsOffset((lyricPlayback?.offsetSeconds ?? 0) + delta)
+        guard var playback = lyricPlayback,
+              let media = currentQueueItem?.lyricsMedia else { return }
+        playback.timingAdjustment.adjustManually(by: delta)
+        applyManualTiming(playback, for: media)
     }
 
     private func setLyricsOffset(_ offset: Double) {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
-        playback.offsetSeconds = min(
-            LyricsPlayback.maximumOffsetSeconds,
-            max(-LyricsPlayback.maximumOffsetSeconds, offset)
-        )
+        playback.offsetSeconds = offset
+        applyManualTiming(playback, for: media)
+    }
+
+    private func resetManualLyricsAdjustment() {
+        guard var playback = lyricPlayback,
+              let media = currentQueueItem?.lyricsMedia else { return }
+        playback.timingAdjustment.resetManualAdjustment()
+        applyManualTiming(playback, for: media)
+    }
+
+    private func applyManualTiming(
+        _ playbackToApply: LyricsPlayback,
+        for media: LyricsMediaDescriptor
+    ) {
+        var playback = playbackToApply
         playback.isConfirmed = true
+        playback.selectionOrigin = .manual
         lyricPlayback = playback
         currentLyricIndex = nil
         if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
@@ -843,6 +958,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
         playback.isConfirmed = true
+        playback.selectionOrigin = .manual
         lyricPlayback = playback
         updateLyricsTransportMenu()
         persistLyricsPlayback(playback, for: media)

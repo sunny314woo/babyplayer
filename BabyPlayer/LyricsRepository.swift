@@ -3,6 +3,7 @@
 // BabyPlayer 歌词候选、本地绑定和时间偏移。
 //
 
+import CryptoKit
 import Foundation
 
 struct LyricsMediaDescriptor: Codable, Identifiable, Sendable {
@@ -124,6 +125,67 @@ struct LyricsCandidate: Codable, Identifiable, Sendable {
     var matchPercentage: Int {
         Int(max(0, min(100, 100 - matchScore)).rounded())
     }
+
+    /// 候选 ID 之外再绑定歌词内容摘要，避免同一提供方修订歌词后误用旧校时。
+    var persistentIdentifier: String {
+        LyricsIdentity.make(
+            candidateID: id,
+            providerName: providerName,
+            trackName: trackName,
+            artistName: artistName,
+            lines: lines
+        )
+    }
+}
+
+private enum LyricsIdentity {
+    static func make(
+        candidateID: Int,
+        providerName: String?,
+        trackName: String,
+        artistName: String,
+        lines: [TimedLyricLine]
+    ) -> String {
+        let content = lines.map { "\(String(format: "%.3f", $0.time))|\($0.text)" }
+            .joined(separator: "\n")
+        let raw = [
+            "babyplayer-lyrics-v1",
+            providerName ?? "unknown",
+            String(candidateID),
+            trackName,
+            artistName,
+            content
+        ].joined(separator: "|")
+        let digest = SHA256.hash(data: Data(raw.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "\(providerName ?? "lyrics"):\(candidateID):\(digest)"
+    }
+}
+
+struct LyricsTimingAdjustment: Codable, Equatable, Sendable {
+    var autoOffsetSeconds: Double
+    var manualAdjustmentSeconds: Double
+
+    var effectiveOffsetSeconds: Double {
+        Self.clamp(autoOffsetSeconds + manualAdjustmentSeconds)
+    }
+
+    mutating func adjustManually(by delta: Double) {
+        setEffectiveOffset(effectiveOffsetSeconds + delta)
+    }
+
+    mutating func setEffectiveOffset(_ value: Double) {
+        manualAdjustmentSeconds = Self.clamp(value) - autoOffsetSeconds
+    }
+
+    mutating func resetManualAdjustment() {
+        manualAdjustmentSeconds = 0
+    }
+
+    private static func clamp(_ value: Double) -> Double {
+        min(LyricsPlayback.maximumOffsetSeconds, max(-LyricsPlayback.maximumOffsetSeconds, value))
+    }
 }
 
 struct LyricsBinding: Codable, Identifiable, Sendable {
@@ -138,9 +200,19 @@ struct LyricsBinding: Codable, Identifiable, Sendable {
     let sourceArtistName: String
     let sourceDuration: Double
     let lines: [TimedLyricLine]
+    /// 兼容 0.4 及更早版本；新版本的真实状态保存在 timingAdjustments。
     var offsetSeconds: Double
+    let selectionOrigin: LyricsSelectionOrigin?
+    let selectedLyricIdentifier: String?
+    var timingAdjustments: [String: LyricsTimingAdjustment]?
     let confirmedAt: Date
     var updatedAt: Date
+}
+
+enum LyricsSelectionOrigin: String, Codable, Equatable, Sendable {
+    case automatic
+    case asr
+    case manual
 }
 
 struct LyricsPlayback: Sendable {
@@ -151,8 +223,93 @@ struct LyricsPlayback: Sendable {
     let artistName: String
     let sourceDuration: Double
     let lines: [TimedLyricLine]
-    var offsetSeconds: Double
+    let lyricIdentifier: String
+    var timingAdjustment: LyricsTimingAdjustment
     var isConfirmed: Bool
+    var selectionOrigin: LyricsSelectionOrigin
+
+    var autoOffsetSeconds: Double {
+        get { timingAdjustment.autoOffsetSeconds }
+        set { timingAdjustment.autoOffsetSeconds = newValue }
+    }
+
+    var manualAdjustmentSeconds: Double {
+        get { timingAdjustment.manualAdjustmentSeconds }
+        set { timingAdjustment.manualAdjustmentSeconds = newValue }
+    }
+
+    var offsetSeconds: Double {
+        get { timingAdjustment.effectiveOffsetSeconds }
+        set { timingAdjustment.setEffectiveOffset(newValue) }
+    }
+
+    init(
+        candidateID: Int,
+        trackName: String,
+        artistName: String,
+        sourceDuration: Double,
+        lines: [TimedLyricLine],
+        autoOffsetSeconds: Double,
+        manualAdjustmentSeconds: Double,
+        isConfirmed: Bool,
+        selectionOrigin: LyricsSelectionOrigin,
+        lyricIdentifier: String? = nil,
+        providerName: String? = nil
+    ) {
+        self.candidateID = candidateID
+        self.trackName = trackName
+        self.artistName = artistName
+        self.sourceDuration = sourceDuration
+        self.lines = lines
+        self.lyricIdentifier = lyricIdentifier ?? LyricsIdentity.make(
+            candidateID: candidateID,
+            providerName: providerName,
+            trackName: trackName,
+            artistName: artistName,
+            lines: lines
+        )
+        timingAdjustment = LyricsTimingAdjustment(
+            autoOffsetSeconds: autoOffsetSeconds,
+            manualAdjustmentSeconds: manualAdjustmentSeconds
+        )
+        self.isConfirmed = isConfirmed
+        self.selectionOrigin = selectionOrigin
+    }
+
+    /// 保留旧调用点的构造语义：传入的总偏移作为自动基线，人工增量从 0 开始。
+    init(
+        candidateID: Int,
+        trackName: String,
+        artistName: String,
+        sourceDuration: Double,
+        lines: [TimedLyricLine],
+        offsetSeconds: Double,
+        isConfirmed: Bool,
+        selectionOrigin: LyricsSelectionOrigin,
+        lyricIdentifier: String? = nil,
+        providerName: String? = nil
+    ) {
+        self.init(
+            candidateID: candidateID,
+            trackName: trackName,
+            artistName: artistName,
+            sourceDuration: sourceDuration,
+            lines: lines,
+            autoOffsetSeconds: offsetSeconds,
+            manualAdjustmentSeconds: 0,
+            isConfirmed: isConfirmed,
+            selectionOrigin: selectionOrigin,
+            lyricIdentifier: lyricIdentifier,
+            providerName: providerName
+        )
+    }
+}
+
+struct LyricsPlainTextReference: Sendable {
+    let id: Int
+    let title: String
+    let artist: String
+    let plainLyrics: String
 }
 
 enum BabyLyricsError: LocalizedError {
@@ -193,6 +350,7 @@ private struct BundledLyricsTrack: Decodable {
     let source: String?
     let version: String?
     let duration: Double?
+    let plainLyrics: String?
     let syncedLyrics: String?
 }
 
@@ -201,9 +359,22 @@ actor BabyLyricsRepository {
     static let shared = BabyLyricsRepository()
 
     private let fileManager = FileManager.default
+    private let cachesDirectory: URL?
+    private let applicationSupportDirectory: URL?
+    private let bundledCatalogData: Data?
     private var candidateMemoryCache: [String: [LyricsCandidate]] = [:]
     private var bindingMemoryCache: [String: LyricsBinding?] = [:]
     private var bundledCatalogCache: [BundledLyricsTrack]?
+
+    init(
+        cachesDirectory: URL? = nil,
+        applicationSupportDirectory: URL? = nil,
+        bundledCatalogData: Data? = nil
+    ) {
+        self.cachesDirectory = cachesDirectory
+        self.applicationSupportDirectory = applicationSupportDirectory
+        self.bundledCatalogData = bundledCatalogData
+    }
 
     func resolvedLyrics(for media: LyricsMediaDescriptor) async throws -> LyricsPlayback? {
         if let binding = binding(for: media) {
@@ -235,11 +406,75 @@ actor BabyLyricsRepository {
             artistName: candidate.artistName,
             sourceDuration: candidate.duration,
             lines: candidate.lines,
-            offsetSeconds: media.songStartSeconds ?? 0,
-            isConfirmed: true
+            autoOffsetSeconds: media.songStartSeconds ?? 0,
+            manualAdjustmentSeconds: 0,
+            isConfirmed: true,
+            selectionOrigin: .automatic,
+            lyricIdentifier: candidate.persistentIdentifier,
+            providerName: candidate.providerName
         )
         _ = try? confirm(playback, for: media)
         return playback
+    }
+
+    /// 恢复该候选自己的校时；没有历史记录时从歌曲段起点建立独立基线。
+    func playback(
+        for candidate: LyricsCandidate,
+        media: LyricsMediaDescriptor,
+        selectionOrigin: LyricsSelectionOrigin
+    ) -> LyricsPlayback {
+        let identifier = candidate.persistentIdentifier
+        let adjustment = timingAdjustment(
+            identifier: identifier,
+            candidateID: candidate.id,
+            binding: binding(for: media),
+            defaultAutoOffset: media.songStartSeconds ?? 0
+        )
+        return LyricsPlayback(
+            candidateID: candidate.id,
+            trackName: candidate.trackName,
+            artistName: candidate.artistName,
+            sourceDuration: candidate.duration,
+            lines: candidate.lines,
+            autoOffsetSeconds: adjustment.autoOffsetSeconds,
+            manualAdjustmentSeconds: adjustment.manualAdjustmentSeconds,
+            isConfirmed: true,
+            selectionOrigin: selectionOrigin,
+            lyricIdentifier: identifier,
+            providerName: candidate.providerName
+        )
+    }
+
+    /// Repository 层强制人工优先，避免未来新 UI 绕过播放器里的保护判断。
+    @discardableResult
+    func applyAutomaticRecommendation(
+        _ candidate: LyricsCandidate,
+        autoOffsetSeconds: Double?,
+        for media: LyricsMediaDescriptor
+    ) throws -> LyricsPlayback? {
+        if let existing = binding(for: media),
+           (existing.selectionOrigin ?? .manual) == .manual {
+            return nil
+        }
+        var playback = playback(for: candidate, media: media, selectionOrigin: .asr)
+        if let autoOffsetSeconds {
+            playback.autoOffsetSeconds = autoOffsetSeconds
+        }
+        _ = try confirm(playback, for: media)
+        return playback
+    }
+
+    func plainTextReference(for media: LyricsMediaDescriptor) -> LyricsPlainTextReference? {
+        bundledCatalogMatches(for: media).compactMap { track in
+            guard let lyrics = track.plainLyrics?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !lyrics.isEmpty else { return nil }
+            return LyricsPlainTextReference(
+                id: track.id,
+                title: track.title,
+                artist: track.artist,
+                plainLyrics: lyrics
+            )
+        }.first
     }
 
     func searchCandidates(
@@ -349,7 +584,7 @@ actor BabyLyricsRepository {
                     if $0.matchScore == $1.matchScore { return $0.id < $1.id }
                     return $0.matchScore < $1.matchScore
                 }
-                .prefix(12)
+                .prefix(3)
         )
         guard !uniqueCandidates.isEmpty else { throw BabyLyricsError.noSyncedLyrics }
         candidateMemoryCache[key] = uniqueCandidates
@@ -403,6 +638,9 @@ actor BabyLyricsRepository {
                 sourceDuration: fallback.sourceDuration,
                 lines: fallback.lines,
                 offsetSeconds: fallback.offsetSeconds,
+                selectionOrigin: fallback.selectionOrigin,
+                selectedLyricIdentifier: fallback.selectedLyricIdentifier,
+                timingAdjustments: fallback.timingAdjustments,
                 confirmedAt: fallback.confirmedAt,
                 updatedAt: Date()
             )
@@ -423,28 +661,23 @@ actor BabyLyricsRepository {
 
     @discardableResult
     func confirm(_ candidate: LyricsCandidate, for media: LyricsMediaDescriptor) throws -> LyricsBinding {
-        let binding = LyricsBinding(
-            mediaID: media.id,
-            mediaFingerprint: mediaFingerprint(for: media),
-            mediaSourceID: media.mediaSourceID,
-            mediaTitle: media.title,
-            sourceCandidateID: candidate.id,
-            sourceTrackName: candidate.trackName,
-            sourceArtistName: candidate.artistName,
-            sourceDuration: candidate.duration,
-            lines: candidate.lines,
-            offsetSeconds: 0,
-            confirmedAt: Date(),
-            updatedAt: Date()
-        )
-        try saveBindingToDisk(binding)
-        bindingMemoryCache[media.id] = binding
-        return binding
+        let playback = playback(for: candidate, media: media, selectionOrigin: .manual)
+        return try confirm(playback, for: media)
     }
 
     @discardableResult
     func confirm(_ playback: LyricsPlayback, for media: LyricsMediaDescriptor) throws -> LyricsBinding {
         let existing = binding(for: media)
+        var timings = existing?.timingAdjustments ?? [:]
+        if let existing,
+           timings[existingLyricIdentifier(existing)] == nil {
+            timings[existingLyricIdentifier(existing)] = LyricsTimingAdjustment(
+                // 旧绑定无法可靠区分自动与人工部分；把总值视为人工值可确保迁移后不被覆盖。
+                autoOffsetSeconds: 0,
+                manualAdjustmentSeconds: existing.offsetSeconds
+            )
+        }
+        timings[playback.lyricIdentifier] = playback.timingAdjustment
         let binding = LyricsBinding(
             mediaID: media.id,
             mediaFingerprint: mediaFingerprint(for: media),
@@ -456,6 +689,9 @@ actor BabyLyricsRepository {
             sourceDuration: playback.sourceDuration,
             lines: playback.lines,
             offsetSeconds: playback.offsetSeconds,
+            selectionOrigin: playback.selectionOrigin,
+            selectedLyricIdentifier: playback.lyricIdentifier,
+            timingAdjustments: timings,
             confirmedAt: existing?.confirmedAt ?? Date(),
             updatedAt: Date()
         )
@@ -470,10 +706,18 @@ actor BabyLyricsRepository {
         offsetSeconds: Double
     ) throws -> LyricsBinding? {
         guard var binding = binding(for: media) else { return nil }
-        binding.offsetSeconds = min(
-            LyricsPlayback.maximumOffsetSeconds,
-            max(-LyricsPlayback.maximumOffsetSeconds, offsetSeconds)
+        let identifier = existingLyricIdentifier(binding)
+        var adjustment = timingAdjustment(
+            identifier: identifier,
+            candidateID: binding.sourceCandidateID,
+            binding: binding,
+            defaultAutoOffset: 0
         )
+        adjustment.setEffectiveOffset(offsetSeconds)
+        var timings = binding.timingAdjustments ?? [:]
+        timings[identifier] = adjustment
+        binding.timingAdjustments = timings
+        binding.offsetSeconds = adjustment.effectiveOffsetSeconds
         binding.updatedAt = Date()
         try saveBindingToDisk(binding)
         bindingMemoryCache[media.id] = binding
@@ -506,14 +750,62 @@ actor BabyLyricsRepository {
     }
 
     private func playback(from binding: LyricsBinding) -> LyricsPlayback {
-        LyricsPlayback(
+        let identifier = existingLyricIdentifier(binding)
+        let adjustment = timingAdjustment(
+            identifier: identifier,
+            candidateID: binding.sourceCandidateID,
+            binding: binding,
+            defaultAutoOffset: 0
+        )
+        return LyricsPlayback(
             candidateID: binding.sourceCandidateID,
             trackName: binding.sourceTrackName,
             artistName: binding.sourceArtistName,
             sourceDuration: binding.sourceDuration,
             lines: binding.lines,
-            offsetSeconds: binding.offsetSeconds,
-            isConfirmed: true
+            autoOffsetSeconds: adjustment.autoOffsetSeconds,
+            manualAdjustmentSeconds: adjustment.manualAdjustmentSeconds,
+            isConfirmed: true,
+            // Bindings written before origin tracking are treated as manual so an
+            // automatic analysis never overwrites a parent's earlier choice.
+            selectionOrigin: binding.selectionOrigin ?? .manual,
+            lyricIdentifier: identifier
+        )
+    }
+
+    private func timingAdjustment(
+        identifier: String,
+        candidateID: Int,
+        binding: LyricsBinding?,
+        defaultAutoOffset: Double
+    ) -> LyricsTimingAdjustment {
+        if let stored = binding?.timingAdjustments?[identifier] {
+            return stored
+        }
+        if let binding {
+            let isSelectedIdentifier = binding.selectedLyricIdentifier == identifier
+            let isLegacySelectedCandidate = binding.selectedLyricIdentifier == nil
+                && binding.sourceCandidateID == candidateID
+            if isSelectedIdentifier || isLegacySelectedCandidate {
+                return LyricsTimingAdjustment(
+                    autoOffsetSeconds: 0,
+                    manualAdjustmentSeconds: binding.offsetSeconds
+                )
+            }
+        }
+        return LyricsTimingAdjustment(
+            autoOffsetSeconds: defaultAutoOffset,
+            manualAdjustmentSeconds: 0
+        )
+    }
+
+    private func existingLyricIdentifier(_ binding: LyricsBinding) -> String {
+        binding.selectedLyricIdentifier ?? LyricsIdentity.make(
+            candidateID: binding.sourceCandidateID,
+            providerName: nil,
+            trackName: binding.sourceTrackName,
+            artistName: binding.sourceArtistName,
+            lines: binding.lines
         )
     }
 
@@ -613,8 +905,15 @@ actor BabyLyricsRepository {
 
     private func bundledCatalog() -> [BundledLyricsTrack] {
         if let bundledCatalogCache { return bundledCatalogCache }
-        guard let url = Bundle.main.url(forResource: "BabyLyricsCatalog", withExtension: "json"),
-              let data = try? Data(contentsOf: url),
+        let data: Data?
+        if let bundledCatalogData {
+            data = bundledCatalogData
+        } else if let url = Bundle.main.url(forResource: "BabyLyricsCatalog", withExtension: "json") {
+            data = try? Data(contentsOf: url)
+        } else {
+            data = nil
+        }
+        guard let data,
               let catalog = try? JSONDecoder().decode(BundledLyricsCatalog.self, from: data) else {
             bundledCatalogCache = []
             return []
@@ -699,7 +998,9 @@ actor BabyLyricsRepository {
     }
 
     private func candidatesRoot() throws -> URL {
-        let root = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let base = cachesDirectory
+            ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let root = base
             .appendingPathComponent("BabyPlayerLyrics", isDirectory: true)
             .appendingPathComponent("Candidates-v2", isDirectory: true)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
@@ -707,7 +1008,9 @@ actor BabyLyricsRepository {
     }
 
     private func bindingsRoot(createDirectory: Bool = true) throws -> URL {
-        let root = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let base = applicationSupportDirectory
+            ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let root = base
             .appendingPathComponent("BabyPlayerLyrics", isDirectory: true)
             .appendingPathComponent("Bindings", isDirectory: true)
         if createDirectory {

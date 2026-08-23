@@ -8,3 +8,6 @@ DerivedData/
 .build/
 build/
 *.ipa
+
+# Local-only tvOS build secret. The committed example contains placeholders only.
+Config/BabyPlayerSecrets.xcconfig
