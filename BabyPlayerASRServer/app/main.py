@@ -1,3 +1,15 @@
+"""
+BabyPlayerASRServer/app/main.py
+
+用途：提供 BabyPlayer 独立的腾讯 ASR HTTP API。
+主要功能：
+1. 健康检查与月度额度查询。
+2. 按媒体指纹查询 ASR 缓存。
+3. 接收临时 M4A/AAC/MP3 上传并调用腾讯 ASR。
+4. 统一处理鉴权、额度、限流、临时文件关闭和错误响应。
+最近修改：2026-08-23 【MODIFIED】按冻结版本 B 移除 /v1/refine 与全部 LLM 运行时依赖。
+"""
+
 import hashlib
 import hmac
 from datetime import datetime, timezone
@@ -12,24 +24,18 @@ from app.database import (
     RateLimitReachedError,
     next_reset_at,
 )
-from app.deepseek_refiner import DeepSeekLyricsRefinerClient, DeepSeekRefinerError
-from app.lyrics_refiner import LyricsRefinementValidationError, LyricsRefinerService
-from app.models import (
-    AsrAnalysisResponse,
-    LyricsRefineRequest,
-    LyricsRefineResponse,
-    UsageResponse,
-)
+from app.models import AsrAnalysisResponse, UsageResponse
 from app.service import AsrService, AudioValidationError, ServerBusyError
 from app.tencent_asr import TencentAsrError, TencentFlashAsrClient
 
 
+# 【MODIFIED】应用工厂仅装配 BabyPlayer 独立 ASR；不再创建或暴露任何歌词 LLM 服务。
 def create_app(
     config: Settings = settings,
     repository: AsrRepository | None = None,
     provider_client=None,
-    refiner_client=None,
 ) -> FastAPI:
+    """创建独立 FastAPI 应用；输入为配置/可选测试替身，输出为 ASR-only 应用实例。"""
     database = repository or AsrRepository(config.database_path)
     database.initialize()
     provider = provider_client or TencentFlashAsrClient(
@@ -41,21 +47,16 @@ def create_app(
         timeout_seconds=config.timeout_seconds,
     )
     service = AsrService(database, provider, config)
-    refiner_provider = refiner_client or DeepSeekLyricsRefinerClient(
-        api_key=config.deepseek_api_key,
-        endpoint=config.deepseek_endpoint,
-        model=config.deepseek_model,
-        timeout_seconds=config.timeout_seconds,
-    )
-    refiner_service = LyricsRefinerService(refiner_provider, config.deepseek_model)
     application = FastAPI(
         title="BabyPlayer ASR Service",
-        version="1.0.0",
+        version="1.1.0",
         docs_url="/docs" if config.product_env != "production" else None,
         redoc_url=None,
     )
 
+    # 【MODIFIED】只验证 BabyPlayer 自己的 Bearer Token，绝不复用 account-server 鉴权。
     def require_babyplayer_token(authorization: str | None = Header(default=None)) -> str:
+        """验证独立 Bearer Token，并返回不可逆 subject hash；失败直接返回 HTTP 错误。"""
         if not config.auth_enabled:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -72,15 +73,16 @@ def create_app(
 
     @application.get("/health")
     def health() -> dict:
+        """返回无 Secret 的服务健康状态和固定月度上限。"""
         return {
             "status": "ok",
             "provider_configured": config.provider_enabled,
-            "lyrics_refiner_configured": config.lyrics_refiner_enabled,
             "monthly_limit_seconds": config.monthly_limit_seconds,
         }
 
     @application.get("/v1/usage", response_model=UsageResponse)
     def usage(subject_hash: str = Depends(require_babyplayer_token)) -> dict:
+        """返回当前北京时间自然月的已用、预留、剩余秒数和下次重置时间。"""
         del subject_hash
         now = datetime.now(timezone.utc)
         current = database.usage(config.monthly_limit_seconds, now)
@@ -98,6 +100,7 @@ def create_app(
         media_fingerprint: str,
         subject_hash: str = Depends(require_babyplayer_token),
     ) -> dict:
+        """按不可逆媒体指纹查询既有 ASR 结果；命中时不消耗腾讯额度。"""
         now = datetime.now(timezone.utc)
         cached = service.lookup(
             subject_hash=subject_hash,
@@ -120,10 +123,10 @@ def create_app(
         audio: UploadFile = File(...),
         subject_hash: str = Depends(require_babyplayer_token),
     ) -> dict:
+        """识别一次临时音频上传；服务端最终执行缓存、原子额度和并发硬限制。"""
         now = datetime.now(timezone.utc)
         try:
-            # Starlette may spool multipart data into a private temporary file.
-            # Reading a bounded amount and closing in finally guarantees its deletion.
+            # Starlette 可能把 multipart 暂存到 PrivateTmp；有界读取后 finally 关闭即可删除。
             audio_bytes = audio.file.read(config.max_audio_bytes + 1)
             if not config.provider_enabled:
                 raise HTTPException(
@@ -181,30 +184,6 @@ def create_app(
             )
         finally:
             audio.file.close()
-
-    @application.post("/v1/refine", response_model=LyricsRefineResponse)
-    def refine_lyrics(
-        request: LyricsRefineRequest,
-        subject_hash: str = Depends(require_babyplayer_token),
-    ) -> dict:
-        del subject_hash
-        if not config.lyrics_refiner_enabled:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "DEEPSEEK_NOT_CONFIGURED"},
-            )
-        try:
-            return refiner_service.refine(request)
-        except LyricsRefinementValidationError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={"code": "INVALID_LYRICS_REFINEMENT", "message": str(exc)},
-            )
-        except DeepSeekRefinerError:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={"code": "DEEPSEEK_UNAVAILABLE", "message": "AI 文案校正暂时不可用"},
-            )
 
     return application
 
