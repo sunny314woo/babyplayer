@@ -1,7 +1,8 @@
 //
 // SystemPlayerView.swift
-// 系统播放器桥接：队列、循环、自动下一首、限时播放和片头片尾跳过。
-// 最近修改：2026-08-22 增加当前视频的喜欢、不喜欢和屏蔽菜单。
+// 系统播放器桥接：队列、循环、自动下一首、限时播放、片头片尾跳过、歌词与声音分析控制。
+// 主要功能：AVPlayer 播放控制、歌词覆盖层、3 份候选选择、腾讯 ASR 本地匹配入口、累计校时和本地评分。
+// 最近修改：2026-08-23 【MODIFIED】增加显式声音分析/重试入口，并在人工操作瞬间锁定绑定优先级。
 //
 
 import AVKit
@@ -65,6 +66,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var lyricsTask: Task<Void, Never>?
     private var lyricsSaveTask: Task<Void, Never>?
     private var lyricsSelectionTask: Task<Void, Never>?
+    /// 【MODIFIED】声音分析与歌词搜索分离，搜索完成后仍可独立取消/重试 ASR。
+    private var soundAnalysisTask: Task<Void, Never>?
     private var lyricLines: [TimedLyricLine] = []
     private var lyricPlayback: LyricsPlayback?
     private var lyricCandidates: [LyricsCandidate] = []
@@ -73,6 +76,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var lyricsSearchMessage: String?
     private var soundAnalysisMessage: String?
     private var pendingLyricSelectionIdentifier: String?
+    /// 【MODIFIED】用户按下人工选择/校时的同步瞬间即锁定，避免 ASR 返回与落盘之间的竞态。
+    private var manualLyricsSelectionPending = false
     private var currentLyricsMode: BabyPlayerLyricsMode = .off
     private var currentLyricIndex: Int?
     private var lyricsContainer: UIView?
@@ -138,11 +143,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         playCurrentItem()
     }
 
+    /// 释放播放器、歌词任务和 ASR 任务；不删除任何本地绑定或音频缓存。
     func cleanUp() {
         lyricsTask?.cancel()
         lyricsTask = nil
         lyricsSelectionTask?.cancel()
         lyricsSelectionTask = nil
+        soundAnalysisTask?.cancel()
+        soundAnalysisTask = nil
         player?.pause()
         if let timeObserver, let player {
             player.removeTimeObserver(timeObserver)
@@ -275,6 +283,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         didExit = true
         lyricsTask?.cancel()
         lyricsSelectionTask?.cancel()
+        soundAnalysisTask?.cancel()
         player?.pause()
         onExit?()
     }
@@ -321,10 +330,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         lyricsLabel = label
     }
 
+    /// 【MODIFIED】加载默认第一份/历史绑定；自动 ASR 与搜索任务分离，便于用户随后显式重试。
     private func prepareLyrics(for item: BabyPlayerQueueItem, mode: BabyPlayerLyricsMode) {
         lyricsTask?.cancel()
         lyricsSelectionTask?.cancel()
+        soundAnalysisTask?.cancel()
+        soundAnalysisTask = nil
         pendingLyricSelectionIdentifier = nil
+        manualLyricsSelectionPending = false
         currentLyricsMode = mode
         lyricLines = []
         lyricPlayback = nil
@@ -379,36 +392,65 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
             let canAutomaticallyAnalyze = mode != .off
                 && (playback == nil || playback?.selectionOrigin == .automatic)
+                && (!foundCandidates.isEmpty || plainReference != nil)
             guard canAutomaticallyAnalyze else { return }
-            self.isAnalyzingSound = true
-            self.soundAnalysisMessage = "等待播放缓冲稳定…"
-            self.updateLyricsTransportMenu()
-            guard await self.waitForPlaybackBuffer(itemID: item.id) else {
+            self.startSoundAnalysis(
+                for: item,
+                candidates: foundCandidates,
+                reference: plainReference,
+                waitForPlaybackBuffer: true
+            )
+        }
+    }
+
+    /// 【MODIFIED】启动一次 ASR；输入为当前媒体/候选/可选歌本，输出通过 UI 状态和安全自动绑定体现。
+    private func startSoundAnalysis(
+        for item: BabyPlayerQueueItem,
+        candidates: [LyricsCandidate],
+        reference: LyricsPlainTextReference?,
+        waitForPlaybackBuffer: Bool
+    ) {
+        soundAnalysisTask?.cancel()
+        isAnalyzingSound = true
+        soundAnalysisMessage = waitForPlaybackBuffer ? "等待播放缓冲稳定…" : "正在识别声音并匹配歌词…"
+        updateLyricsTransportMenu()
+
+        soundAnalysisTask = Task { [weak self] in
+            guard let self else { return }
+            if waitForPlaybackBuffer,
+               !(await self.waitForPlaybackBuffer(itemID: item.id)) {
                 guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
                 self.isAnalyzingSound = false
-                self.soundAnalysisMessage = "播放优先：本次暂缓声音分析"
+                self.soundAnalysisMessage = "播放优先：自动分析已暂缓，可手动选择“声音分析歌词”重试"
                 self.updateLyricsTransportMenu()
                 return
             }
-            self.soundAnalysisMessage = nil
+
+            self.soundAnalysisMessage = "正在识别声音并匹配歌词…"
+            self.updateLyricsTransportMenu()
             do {
                 let outcome = try await BabyPlayerASRCoordinator.shared.analyze(
                     item: item,
-                    candidates: foundCandidates,
-                    reference: plainReference
+                    candidates: candidates,
+                    reference: reference
                 )
                 guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
                 self.lyricCandidates = Array(outcome.candidates.prefix(4))
-                self.soundAnalysisMessage = outcome.message
-                if let selected = outcome.selected,
-                   self.lyricPlayback?.selectionOrigin != .manual,
+                let manualProtected = self.manualLyricsSelectionPending
+                    || self.lyricPlayback?.selectionOrigin == .manual
+                self.soundAnalysisMessage = manualProtected && outcome.selected != nil
+                    ? "\(outcome.message) · 已保留人工绑定"
+                    : outcome.message
+
+                if !manualProtected,
+                   let selected = outcome.selected,
                    let verified = try await BabyLyricsRepository.shared.applyAutomaticRecommendation(
                        selected,
                        autoOffsetSeconds: outcome.offsetSeconds,
                        for: item.lyricsMedia
                    ) {
                     self.lyricPlayback = verified
-                    if mode != .off {
+                    if self.currentLyricsMode != .off {
                         self.lyricLines = verified.lines
                         self.currentLyricIndex = nil
                         if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
@@ -419,10 +461,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             } catch {
                 guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
                 if case BabyPlayerASRError.notConfigured = error {
-                    self.soundAnalysisMessage = nil
+                    self.soundAnalysisMessage = "声音分析服务尚未配置"
                 } else {
                     self.soundAnalysisMessage = (error as? LocalizedError)?.errorDescription
-                        ?? "声音歌词生成暂时不可用"
+                        ?? "声音分析暂时不可用"
                 }
             }
             self.isAnalyzingSound = false
@@ -430,7 +472,30 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
     }
 
-    /// 避免远程 MP4 同时播放和导出时争抢局域网带宽；缓冲不稳就让本轮分析让路。
+    /// 【MODIFIED】家长显式触发/重试声音分析；不会等待自动缓冲门，也不会绕过人工绑定保护。
+    private func analyzeCurrentSoundManually() {
+        guard !isAnalyzingSound, let item = currentQueueItem else { return }
+        let candidates = lyricCandidates
+        soundAnalysisTask?.cancel()
+        isAnalyzingSound = true
+        soundAnalysisMessage = "正在准备声音分析…"
+        updateLyricsTransportMenu()
+
+        soundAnalysisTask = Task { [weak self] in
+            guard let self else { return }
+            let reference = await BabyLyricsRepository.shared.plainTextReference(for: item.lyricsMedia)
+            guard !Task.isCancelled, self.currentQueueItem?.id == item.id else { return }
+            self.isAnalyzingSound = false
+            self.startSoundAnalysis(
+                for: item,
+                candidates: candidates,
+                reference: reference,
+                waitForPlaybackBuffer: false
+            )
+        }
+    }
+
+    /// 避免远程 MP4 同时播放和导出时争抢局域网带宽；缓冲不稳就让自动分析让路。
     private func waitForPlaybackBuffer(itemID: String) async -> Bool {
         for _ in 0..<20 {
             guard !Task.isCancelled, currentQueueItem?.id == itemID else { return false }
@@ -454,6 +519,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         lyricsContainer?.isHidden = false
     }
 
+    /// 【MODIFIED】构建单层 tvOS 菜单；显式暴露声音分析、重试、候选选择和累计校时状态。
     private func updateLyricsTransportMenu() {
         let isVisible = currentLyricsMode != .off
         let visibility = UIAction(
@@ -494,7 +560,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
 
         let candidatesTitle = UIAction(
-            title: "声音时间轴优先 · 3 份网络歌词 + 可选歌本兜底",
+            title: "最多 3 份时间轴歌词 + 可选本地纯文本歌本",
             image: UIImage(systemName: "list.number")
         ) { _ in }
         candidatesTitle.attributes = .disabled
@@ -529,9 +595,19 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         if isSearchingLyrics { refresh.attributes = .disabled }
         children.append(refresh)
 
+        // 【MODIFIED】播放页明确提供 ASR 入口；自动分析失败后用户无需退出播放器即可重试。
+        let analyzeSound = UIAction(
+            title: soundAnalysisMessage == nil ? "声音分析歌词" : "重新进行声音分析",
+            image: UIImage(systemName: "waveform.badge.magnifyingglass")
+        ) { [weak self] _ in
+            self?.analyzeCurrentSoundManually()
+        }
+        if isAnalyzingSound { analyzeSound.attributes = .disabled }
+        children.append(analyzeSound)
+
         if isAnalyzingSound {
             let analyzing = UIAction(
-                title: "正在生成时间轴并校正文案…",
+                title: soundAnalysisMessage ?? "正在识别声音并匹配歌词…",
                 image: UIImage(systemName: "waveform.badge.magnifyingglass")
             ) { _ in }
             analyzing.attributes = .disabled
@@ -880,8 +956,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         return "\(provider)匹配 \(candidate.matchPercentage) 分 · \(durationText) · \(differenceText) · \(preview)"
     }
 
+    /// 【MODIFIED】人工选择在异步读取/落盘之前立即设置硬锁；ASR 从这一刻起不能覆盖。
     private func selectLyricsCandidate(_ candidate: LyricsCandidate) {
         guard let media = currentQueueItem?.lyricsMedia else { return }
+        manualLyricsSelectionPending = true
         currentLyricsMode = .english
         pendingLyricSelectionIdentifier = candidate.persistentIdentifier
         lyricsSelectionTask?.cancel()
@@ -898,7 +976,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                   self.currentQueueItem?.lyricsMedia.id == media.id,
                   self.pendingLyricSelectionIdentifier == candidate.persistentIdentifier else { return }
             self.lyricPlayback = playback
-            self.lyricLines = candidate.lines
+            self.lyricLines = playback.lines
             self.currentLyricIndex = nil
             self.lyricsSearchMessage = nil
             if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
@@ -909,9 +987,11 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
     }
 
+    /// 【MODIFIED】每次提前/延后都在当前 manualAdjustment 上累加，并同步锁定人工优先级。
     private func adjustLyricsOffset(by delta: Double) {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
+        manualLyricsSelectionPending = true
         playback.timingAdjustment.adjustManually(by: delta)
         applyManualTiming(playback, for: media)
     }
@@ -919,6 +999,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func setLyricsOffset(_ offset: Double) {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
+        manualLyricsSelectionPending = true
         playback.offsetSeconds = offset
         applyManualTiming(playback, for: media)
     }
@@ -926,6 +1007,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func resetManualLyricsAdjustment() {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
+        manualLyricsSelectionPending = true
         playback.timingAdjustment.resetManualAdjustment()
         applyManualTiming(playback, for: media)
     }
@@ -935,6 +1017,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         for media: LyricsMediaDescriptor
     ) {
         var playback = playbackToApply
+        manualLyricsSelectionPending = true
         playback.isConfirmed = true
         playback.selectionOrigin = .manual
         lyricPlayback = playback
@@ -957,6 +1040,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func confirmCurrentLyrics() {
         guard var playback = lyricPlayback,
               let media = currentQueueItem?.lyricsMedia else { return }
+        manualLyricsSelectionPending = true
         playback.isConfirmed = true
         playback.selectionOrigin = .manual
         lyricPlayback = playback
