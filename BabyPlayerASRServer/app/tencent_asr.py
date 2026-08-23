@@ -1,12 +1,16 @@
 import base64
 import hashlib
 import hmac
+import logging
 import time
 from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import urlencode, urlparse
 
 import httpx
+
+
+logger = logging.getLogger("babyplayer.tencent_asr")
 
 
 class TencentAsrError(Exception):
@@ -77,10 +81,32 @@ class TencentFlashAsrClient:
                 )
             response.raise_for_status()
             payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            response_preview = exc.response.text[:500].replace("\n", " ")
+            logger.error(
+                "Tencent Flash ASR HTTP failure status=%s body=%s",
+                exc.response.status_code,
+                response_preview,
+            )
+            raise TencentAsrError("Tencent ASR HTTP request failed") from exc
         except (httpx.HTTPError, TypeError, ValueError) as exc:
+            logger.error(
+                "Tencent Flash ASR transport/JSON failure type=%s",
+                type(exc).__name__,
+            )
             raise TencentAsrError("Tencent ASR request failed") from exc
         if payload.get("code") != 0:
-            raise TencentAsrError(str(payload.get("message") or "Tencent ASR rejected audio"))
+            code = payload.get("code")
+            message = str(payload.get("message") or "Tencent ASR rejected audio")
+            request_id = str(payload.get("request_id") or "")
+            # No audio, transcript, authorization signature, AppID or secret is logged.
+            logger.error(
+                "Tencent Flash ASR rejected request code=%s message=%s request_id=%s",
+                code,
+                message[:300],
+                request_id[:100],
+            )
+            raise TencentAsrError(message)
 
         results = payload.get("flash_result") or []
         first = results[0] if results else {}
@@ -90,19 +116,34 @@ class TencentFlashAsrClient:
             text = str(sentence.get("text") or "").strip()
             if not text:
                 continue
+            sentence_start = milliseconds(sentence.get("start_time"))
+            sentence_end = milliseconds(sentence.get("end_time"))
+            raw_words = sentence.get("word_list") or []
+            word_offset = relative_word_offset(
+                raw_words,
+                sentence_start=sentence_start,
+                sentence_end=sentence_end,
+            )
+            if word_offset > 0:
+                logger.info(
+                    "Tencent Flash ASR normalized sentence-relative word times "
+                    "sentence_start=%s word_count=%s",
+                    sentence_start,
+                    len(raw_words),
+                )
             words = []
-            for word in sentence.get("word_list") or []:
+            for word in raw_words:
                 word_text = str(word.get("word") or "").strip()
                 if word_text:
                     words.append({
                         "text": word_text,
-                        "start_seconds": milliseconds(word.get("start_time")),
-                        "end_seconds": milliseconds(word.get("end_time")),
+                        "start_seconds": milliseconds(word.get("start_time")) + word_offset,
+                        "end_seconds": milliseconds(word.get("end_time")) + word_offset,
                     })
             segments.append({
                 "text": text,
-                "start_seconds": milliseconds(sentence.get("start_time")),
-                "end_seconds": milliseconds(sentence.get("end_time")),
+                "start_seconds": sentence_start,
+                "end_seconds": sentence_end,
                 "words": words,
             })
         return Recognition(
@@ -118,3 +159,28 @@ def milliseconds(value) -> float:
         return max(0.0, float(value) / 1000.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def relative_word_offset(
+    words: list[dict], *, sentence_start: float, sentence_end: float
+) -> float:
+    """Choose absolute or sentence-relative Tencent word times without moving ambiguous data."""
+    if sentence_start <= 0 or sentence_end <= sentence_start or not words:
+        return 0.0
+    tolerance = 0.5
+    raw_ranges = [
+        (milliseconds(word.get("start_time")), milliseconds(word.get("end_time")))
+        for word in words
+    ]
+
+    def fit_count(offset: float) -> int:
+        return sum(
+            1
+            for start, end in raw_ranges
+            if start + offset >= sentence_start - tolerance
+            and end + offset <= sentence_end + tolerance
+        )
+
+    absolute_fit = fit_count(0.0)
+    relative_fit = fit_count(sentence_start)
+    return sentence_start if relative_fit > absolute_fit else 0.0

@@ -13,6 +13,16 @@ import AVKit
 import Foundation
 import SwiftUI
 
+enum BabyPlayerLyricTimeline {
+    static func visibleLineIndex(at elapsed: Double, lines: [TimedLyricLine]) -> Int? {
+        guard let index = lines.lastIndex(where: { $0.time <= elapsed }) else { return nil }
+        if let endTime = lines[index].endTime, elapsed > endTime {
+            return nil
+        }
+        return index
+    }
+}
+
 // 【MODIFIED】AI 进度必须在菜单关闭后仍然可见，而不是只写回下次打开的菜单标题。
 enum BabyPlayerAILyricsProgress: Equatable {
     case preparingAudio(index: Int, total: Int)
@@ -633,7 +643,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
         soundAnalysisFingerprint = fingerprint
         isAnalyzingSound = true
-        let plannedCount = max(1, BabyPlayerASRSegmentPolicy.segments(for: item.lyricsMedia).count)
+        // 【MODIFIED】当前 MVP 只准备并上传一份临时整首音频；分片计划暂不进入生产链路。
+        let plannedCount = 1
         // 【MODIFIED】点击后只显示真实的本地准备阶段，不再提前宣称已调用语音识别。
         showAILyricsProgress(.preparingAudio(index: 1, total: plannedCount))
 
@@ -813,7 +824,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func updateLyrics(at elapsed: Double) {
         guard elapsed.isFinite, !lyricLines.isEmpty else { return }
         let adjustedElapsed = elapsed - (lyricPlayback?.offsetSeconds ?? 0)
-        let index = lyricLines.lastIndex { $0.time <= adjustedElapsed }
+        let index = BabyPlayerLyricTimeline.visibleLineIndex(
+            at: adjustedElapsed,
+            lines: lyricLines
+        )
         guard index != currentLyricIndex else { return }
         currentLyricIndex = index
         guard let index else {

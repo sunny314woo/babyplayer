@@ -2,7 +2,12 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.database import AsrRepository, MonthlyLimitReachedError, next_reset_at
+from app.database import (
+    AnalysisInProgressError,
+    AsrRepository,
+    MonthlyLimitReachedError,
+    next_reset_at,
+)
 
 
 NOW = datetime(2026, 8, 23, 8, 0, tzinfo=timezone.utc)
@@ -14,12 +19,12 @@ def repository(tmp_path):
     return result
 
 
-def claim(target, operation_id="operation-0001", reserve=120):
+def claim(target, operation_id="operation-0001", reserve=120, audio_sha="a" * 64):
     target.claim(
         operation_id=operation_id,
         subject_hash="subject",
         fingerprint_hash="f" * 64,
-        audio_sha256="a" * 64,
+        audio_sha256=audio_sha,
         reserve_seconds=reserve,
         monthly_limit=18000,
         requests_per_minute=10,
@@ -32,7 +37,7 @@ def test_monthly_limit_counts_used_and_reserved_seconds(tmp_path) -> None:
     claim(target, reserve=17900)
 
     with pytest.raises(MonthlyLimitReachedError):
-        claim(target, operation_id="operation-0002", reserve=101)
+        claim(target, operation_id="operation-0002", reserve=101, audio_sha="b" * 64)
 
 
 def test_completion_releases_reservation_and_stores_transcript_cache(tmp_path) -> None:
@@ -65,6 +70,18 @@ def test_failed_request_releases_all_reserved_time(tmp_path) -> None:
     usage = target.usage(18000, NOW)
     assert usage.used_seconds == 0
     assert usage.reserved_seconds == 0
+
+
+def test_same_audio_cannot_be_claimed_twice_while_analysis_is_in_progress(tmp_path) -> None:
+    target = repository(tmp_path)
+    claim(target)
+
+    with pytest.raises(AnalysisInProgressError):
+        claim(target, operation_id="operation-0002")
+
+    usage = target.usage(18000, NOW)
+    assert usage.used_seconds == 0
+    assert usage.reserved_seconds == 120
 
 
 def test_next_reset_is_first_day_in_beijing_time() -> None:

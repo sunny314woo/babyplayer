@@ -53,6 +53,10 @@ class LyricsAlignedWord(BaseModel):
     end_seconds: float = Field(ge=0, le=3600)
 
 
+class LyricsIndexedWord(LyricsAlignedWord):
+    word_index: int = Field(ge=0, le=20_000)
+
+
 class LyricsOriginalLine(BaseModel):
     line_identifier: str = Field(min_length=3, max_length=128)
     original_text: str = Field(min_length=1, max_length=500)
@@ -74,6 +78,7 @@ class LyricsRefineRequest(BaseModel):
     media_fingerprint: str = Field(min_length=8, max_length=128)
     transcript: str = Field(max_length=30_000)
     original_lines: list[LyricsOriginalLine] = Field(min_length=2, max_length=300)
+    asr_words: list[LyricsIndexedWord] = Field(min_length=3, max_length=5_000)
     evidence: LyricsMatchEvidence
 
 
@@ -84,6 +89,11 @@ class LyricsTextRepair(BaseModel):
     should_modify: bool
     evidence: str = Field(min_length=1, max_length=500)
     confidence: float = Field(ge=0, le=1)
+    should_display: bool
+    start_word_index: int | None = Field(default=None, ge=0, le=20_000)
+    end_word_index: int | None = Field(default=None, ge=0, le=20_000)
+    start_seconds: float | None = Field(default=None, ge=0, le=3600)
+    end_seconds: float | None = Field(default=None, ge=0, le=3600)
 
 
 class LyricsRefineResponse(BaseModel):

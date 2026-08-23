@@ -76,6 +76,19 @@ class AsrService:
             requests_per_minute=self.config.requests_per_minute,
             now=now,
         )
+        # A matching operation may have completed between the first cache lookup and
+        # this atomic claim. Re-check after claiming so this request never calls the
+        # provider for audio that has just become cacheable.
+        identical_after_claim = self.repository.alias_cached_audio(
+            subject_hash=subject_hash,
+            fingerprint_hash=fingerprint_hash,
+            audio_sha256=audio_sha256,
+            version=self.config.analysis_version,
+            now=now,
+        )
+        if identical_after_claim:
+            self.repository.release(operation_id, now)
+            return self._response(identical_after_claim, cache_hit=True, now=now)
         acquired = self._semaphore.acquire(timeout=self.config.timeout_seconds)
         if not acquired:
             self.repository.release(operation_id, now)

@@ -21,15 +21,16 @@ class DeepSeekRefinement:
     repairs: list[dict]
 
 
-SYSTEM_PROMPT = """You perform limited textual repair on an existing children's-song lyric timeline.
-The original_lines are the primary text and deterministic source of line identity/order.
-ASR transcript and aligned_words are noisy audio evidence, not final lyrics.
-Never add a verse, line, or wording unsupported by original_text or aligned ASR words.
-Do not rewrite a correct line. Prefer should_modify=false when evidence is weak.
-You may repair obvious recognition/source errors, capitalization, punctuation, contractions, and spelling.
+SYSTEM_PROMPT = """You align existing children's-song lyric lines to indexed ASR words and perform limited text repair.
+original_lines are the complete candidate lyrics and define stable line identity/order.
+asr_words are the only timing evidence. Each displayed line must map to one contiguous inclusive
+start_word_index/end_word_index range from asr_words. Ranges must be monotonic and non-overlapping.
+Set should_display=false with null indices when a lyric line has no reliable ASR evidence; this creates
+a blank subtitle interval instead of showing unsupported text. Never invent a lyric or timestamp.
+Do not rewrite a correct line. Repair only wording supported by original_text or the selected ASR words.
 Return JSON only with overall_confidence and one repair for every original line.
-Each repair must contain line_identifier, original_text, suggested_text, should_modify,
-evidence, and confidence. Copy line_identifier and original_text exactly.
+Each repair must contain line_identifier, original_text, suggested_text, should_modify, should_display,
+start_word_index, end_word_index, evidence, and confidence. Copy line_identifier and original_text exactly.
 Never return timestamps, timing suggestions, segment boundaries, or a replacement song."""
 
 

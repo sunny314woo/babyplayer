@@ -31,18 +31,22 @@ class FakeRefiner:
                 "original_text": "Twinkle twinkle little star",
                 "suggested_text": "Twinkle, twinkle, little star",
                 "should_modify": True,
+                "should_display": True,
+                "start_word_index": 0,
+                "end_word_index": 2,
                 "evidence": "Original lyric and aligned ASR words agree",
                 "confidence": 0.91,
-                "start_seconds": 999,
             },
             {
                 "line_identifier": "line-1",
                 "original_text": "How I wonder what you are",
                 "suggested_text": "How I wonder what you are",
                 "should_modify": False,
+                "should_display": True,
+                "start_word_index": 3,
+                "end_word_index": 6,
                 "evidence": "No repair needed",
                 "confidence": 0.95,
-                "start_seconds": 999,
             },
         ]
 
@@ -84,6 +88,15 @@ def request_payload():
                 ],
             },
         ],
+        "asr_words": [
+            {"word_index": 0, "text": "twinkle", "start_seconds": 0.4, "end_seconds": 0.8},
+            {"word_index": 1, "text": "little", "start_seconds": 1.0, "end_seconds": 1.3},
+            {"word_index": 2, "text": "star", "start_seconds": 1.5, "end_seconds": 1.9},
+            {"word_index": 3, "text": "how", "start_seconds": 2.2, "end_seconds": 2.5},
+            {"word_index": 4, "text": "wonder", "start_seconds": 2.8, "end_seconds": 3.2},
+            {"word_index": 5, "text": "you", "start_seconds": 3.4, "end_seconds": 3.6},
+            {"word_index": 6, "text": "are", "start_seconds": 3.7, "end_seconds": 4.0},
+        ],
         "evidence": {
             "normalized_text_similarity": 0.82,
             "ordered_token_similarity": 0.88,
@@ -119,7 +132,10 @@ def test_refiner_endpoint_preserves_asr_timestamps(tmp_path) -> None:
     assert refiner.calls == 1
     assert "repairs" in response.json()
     assert all("suggested_text" in repair for repair in response.json()["repairs"])
-    assert all("start_seconds" not in repair for repair in response.json()["repairs"])
+    assert response.json()["repairs"][0]["start_seconds"] == 0.4
+    assert response.json()["repairs"][0]["end_seconds"] == 1.9
+    assert response.json()["repairs"][1]["start_seconds"] == 2.2
+    assert response.json()["repairs"][1]["end_seconds"] == 4.0
     assert response.json()["repairs"][1]["suggested_text"] == "How I wonder what you are"
 
 
@@ -132,6 +148,9 @@ def test_audio_evidence_outweighs_unrelated_candidate() -> None:
             "original_text": "Twinkle twinkle little star",
             "suggested_text": "drive the car",
             "should_modify": True,
+            "should_display": True,
+            "start_word_index": 0,
+            "end_word_index": 2,
             "evidence": "unsupported",
             "confidence": 0.99,
         },
@@ -140,6 +159,9 @@ def test_audio_evidence_outweighs_unrelated_candidate() -> None:
             "original_text": "How I wonder what you are",
             "suggested_text": "rob the bank",
             "should_modify": True,
+            "should_display": True,
+            "start_word_index": 3,
+            "end_word_index": 6,
             "evidence": "unsupported",
             "confidence": 0.99,
         },
@@ -147,6 +169,42 @@ def test_audio_evidence_outweighs_unrelated_candidate() -> None:
 
     with pytest.raises(LyricsRefinementValidationError):
         LyricsRefinerService(refiner, "deepseek-v4-flash").refine(request)
+
+
+def test_refiner_omits_line_without_asr_evidence() -> None:
+    request = LyricsRefineRequest.model_validate(request_payload())
+    refiner = FakeRefiner(repairs=[
+        {
+            "line_identifier": "line-0",
+            "original_text": "Twinkle twinkle little star",
+            "suggested_text": "Twinkle twinkle little star",
+            "should_modify": False,
+            "should_display": True,
+            "start_word_index": 0,
+            "end_word_index": 2,
+            "evidence": "ASR words support the line",
+            "confidence": 0.9,
+        },
+        {
+            "line_identifier": "line-1",
+            "original_text": "How I wonder what you are",
+            "suggested_text": "How I wonder what you are",
+            "should_modify": False,
+            "should_display": False,
+            "start_word_index": None,
+            "end_word_index": None,
+            "evidence": "No reliable ASR words",
+            "confidence": 0.7,
+        },
+    ])
+
+    result = LyricsRefinerService(refiner, "deepseek-v4-flash").refine(request)
+
+    assert result["repairs"][0]["start_seconds"] == 0.4
+    assert result["repairs"][0]["end_seconds"] == 1.9
+    assert result["repairs"][1]["should_display"] is False
+    assert result["repairs"][1]["start_seconds"] is None
+    assert result["repairs"][1]["end_seconds"] is None
 
 
 def test_deepseek_flash_request_uses_json_and_non_thinking_mode() -> None:
@@ -164,6 +222,9 @@ def test_deepseek_flash_request_uses_json_and_non_thinking_mode() -> None:
                         "original_text": "hello world",
                         "suggested_text": "Hello, world!",
                         "should_modify": True,
+                        "should_display": True,
+                        "start_word_index": 0,
+                        "end_word_index": 1,
                         "evidence": "punctuation repair",
                         "confidence": 0.9,
                     },
@@ -185,5 +246,6 @@ def test_deepseek_flash_request_uses_json_and_non_thinking_mode() -> None:
     assert captured["payload"]["thinking"] == {"type": "disabled"}
     assert captured["payload"]["response_format"] == {"type": "json_object"}
     assert "Never return timestamps" in captured["payload"]["messages"][0]["content"]
+    assert "start_word_index" in captured["payload"]["messages"][0]["content"]
     assert result.overall_confidence == 0.9
     assert result.repairs[0]["line_identifier"] == "line-0"

@@ -19,6 +19,10 @@ class OperationAlreadyUsedError(Exception):
     pass
 
 
+class AnalysisInProgressError(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class Usage:
     month: str
@@ -72,7 +76,10 @@ CREATE TABLE IF NOT EXISTS asr_analysis_cache (
   PRIMARY KEY (subject_hash, media_fingerprint_hash, analysis_version)
 );
 CREATE INDEX IF NOT EXISTS idx_asr_cache_audio_sha
-  ON asr_analysis_cache(subject_hash, audio_sha256);
+ON asr_analysis_cache(subject_hash, audio_sha256);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asr_one_claimed_audio
+ON asr_operations(subject_hash, audio_sha256)
+WHERE status='CLAIMED';
 """
 
 
@@ -184,6 +191,12 @@ class AsrRepository:
                 "SELECT 1 FROM asr_operations WHERE operation_id=?", (operation_id,)
             ).fetchone():
                 raise OperationAlreadyUsedError()
+            if connection.execute(
+                """SELECT 1 FROM asr_operations
+                   WHERE subject_hash=? AND audio_sha256=? AND status='CLAIMED'""",
+                (subject_hash, audio_sha256),
+            ).fetchone():
+                raise AnalysisInProgressError()
             connection.execute(
                 """INSERT OR IGNORE INTO asr_rate_windows
                    (subject_hash, window_started_at, request_count, updated_at)

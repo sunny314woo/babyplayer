@@ -108,6 +108,13 @@ struct LyricsTitleMetadata: Equatable, Sendable {
 struct TimedLyricLine: Codable, Sendable {
     let time: Double
     let text: String
+    let endTime: Double?
+
+    init(time: Double, text: String, endTime: Double? = nil) {
+        self.time = time
+        self.text = text
+        self.endTime = endTime
+    }
 }
 
 struct LyricsCandidate: Codable, Identifiable, Sendable {

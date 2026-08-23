@@ -31,21 +31,29 @@ class LyricsRefinerService:
         self.model = model
 
     def refine(self, request: LyricsRefineRequest) -> dict:
-        # 【MODIFIED】只解析逐行文本 repair 字段，任何模型返回的时间字段都不进入响应。
+        # The model selects indexed ASR word ranges; only the server converts them to seconds.
         evidence = request.model_dump()
         # The media fingerprint is useful for client correlation, not model evidence.
         evidence.pop("media_fingerprint", None)
         refinement = self.client.refine(evidence)
         original_by_id = {line.line_identifier: line for line in request.original_lines}
+        asr_by_index = {word.word_index: word for word in request.asr_words}
+        if len(asr_by_index) != len(request.asr_words):
+            raise LyricsRefinementValidationError("ASR word indices must be unique")
         repairs_by_id: dict[str, dict] = {}
         for repair in refinement.repairs:
             try:
-                if not isinstance(repair["should_modify"], bool):
-                    raise TypeError("should_modify must be boolean")
+                if not isinstance(repair["should_modify"], bool) or not isinstance(
+                    repair["should_display"], bool
+                ):
+                    raise TypeError("repair flags must be boolean")
                 line_identifier = str(repair["line_identifier"])
                 original_text = str(repair["original_text"])
                 suggested_text = str(repair["suggested_text"]).strip()
                 should_modify = repair["should_modify"]
+                should_display = repair["should_display"]
+                start_word_index = repair.get("start_word_index")
+                end_word_index = repair.get("end_word_index")
                 repair_evidence = str(repair["evidence"]).strip()
                 confidence = float(repair["confidence"])
             except (KeyError, TypeError, ValueError) as exc:
@@ -57,25 +65,64 @@ class LyricsRefinerService:
                 raise LyricsRefinementValidationError("Original lyric text was not copied exactly")
             if not suggested_text or not repair_evidence or not 0.0 <= confidence <= 1.0:
                 raise LyricsRefinementValidationError("Invalid repair evidence")
-            if should_modify:
-                self._validate_modified_text(
-                    original_line=original_line,
-                    suggested_text=suggested_text,
-                    confidence=confidence,
-                )
-            else:
-                suggested_text = original_line.original_text
             repairs_by_id[line_identifier] = {
                 "line_identifier": line_identifier,
                 "original_text": original_line.original_text,
                 "suggested_text": suggested_text,
                 "should_modify": should_modify,
+                "should_display": should_display,
+                "start_word_index": start_word_index,
+                "end_word_index": end_word_index,
                 "evidence": repair_evidence,
                 "confidence": confidence,
             }
 
         if set(repairs_by_id) != set(original_by_id):
             raise LyricsRefinementValidationError("Every original lyric line must be preserved")
+        previous_end_word_index = -1
+        for original_line in request.original_lines:
+            repair = repairs_by_id[original_line.line_identifier]
+            if not repair["should_display"]:
+                repair["suggested_text"] = original_line.original_text
+                repair["should_modify"] = False
+                repair["start_word_index"] = None
+                repair["end_word_index"] = None
+                repair["start_seconds"] = None
+                repair["end_seconds"] = None
+                continue
+            start_word_index = repair["start_word_index"]
+            end_word_index = repair["end_word_index"]
+            if not isinstance(start_word_index, int) or not isinstance(end_word_index, int):
+                raise LyricsRefinementValidationError("Displayed line requires ASR word indices")
+            if (
+                start_word_index <= previous_end_word_index
+                or end_word_index < start_word_index
+                or end_word_index - start_word_index >= 100
+            ):
+                raise LyricsRefinementValidationError("ASR word ranges must be monotonic")
+            try:
+                mapped_words = [
+                    asr_by_index[index]
+                    for index in range(start_word_index, end_word_index + 1)
+                ]
+            except KeyError as exc:
+                raise LyricsRefinementValidationError("ASR word index is out of range") from exc
+            start_seconds = mapped_words[0].start_seconds
+            end_seconds = mapped_words[-1].end_seconds
+            if end_seconds < start_seconds:
+                raise LyricsRefinementValidationError("ASR word range has invalid timing")
+            if repair["should_modify"]:
+                self._validate_modified_text(
+                    original_line=original_line,
+                    suggested_text=repair["suggested_text"],
+                    confidence=repair["confidence"],
+                    aligned_asr_text=" ".join(word.text for word in mapped_words),
+                )
+            else:
+                repair["suggested_text"] = original_line.original_text
+            repair["start_seconds"] = start_seconds
+            repair["end_seconds"] = end_seconds
+            previous_end_word_index = end_word_index
         if not 0.0 <= refinement.overall_confidence <= 1.0:
             raise LyricsRefinementValidationError("Invalid overall confidence")
 
@@ -87,7 +134,10 @@ class LyricsRefinerService:
         }
 
     # 【MODIFIED】只有同时受原文或对齐 ASR words 支持的小范围修复才能通过。
-    def _validate_modified_text(self, *, original_line, suggested_text: str, confidence: float) -> None:
+    def _validate_modified_text(
+        self, *, original_line, suggested_text: str, confidence: float,
+        aligned_asr_text: str,
+    ) -> None:
         """验证一行修复；输入为原行、建议文本和置信度，输出为 None/异常，不修改数据库或请求状态。"""
         if confidence < RepairValidationPolicy.minimum_modification_confidence:
             raise LyricsRefinementValidationError("Modification confidence is too low")
@@ -98,7 +148,6 @@ class LyricsRefinerService:
         if len(suggested_text) > maximum_length:
             raise LyricsRefinementValidationError("Repair added unsupported content")
         original_similarity = similarity(original_line.original_text, suggested_text)
-        aligned_asr_text = " ".join(word.text for word in original_line.aligned_words)
         asr_similarity = similarity(aligned_asr_text, suggested_text) if aligned_asr_text else 0
         combined_support = (
             original_similarity * RepairValidationPolicy.original_text_weight

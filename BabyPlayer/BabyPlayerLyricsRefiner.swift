@@ -52,6 +52,20 @@ private struct LyricsRefinerRequest: Encodable {
         }
     }
 
+    struct IndexedWord: Encodable {
+        let wordIndex: Int
+        let text: String
+        let startSeconds: Double
+        let endSeconds: Double
+
+        enum CodingKeys: String, CodingKey {
+            case text
+            case wordIndex = "word_index"
+            case startSeconds = "start_seconds"
+            case endSeconds = "end_seconds"
+        }
+    }
+
     struct Evidence: Encodable {
         let normalizedTextSimilarity: Double
         let orderedTokenSimilarity: Double
@@ -73,12 +87,14 @@ private struct LyricsRefinerRequest: Encodable {
     let mediaFingerprint: String
     let transcript: String
     let originalLines: [OriginalLine]
+    let asrWords: [IndexedWord]
     let evidence: Evidence
 
     enum CodingKeys: String, CodingKey {
         case transcript, evidence
         case mediaFingerprint = "media_fingerprint"
         case originalLines = "original_lines"
+        case asrWords = "asr_words"
     }
 }
 
@@ -88,6 +104,11 @@ private struct LyricsRefinerResponse: Decodable {
         let originalText: String
         let suggestedText: String
         let shouldModify: Bool
+        let shouldDisplay: Bool
+        let startWordIndex: Int?
+        let endWordIndex: Int?
+        let startSeconds: Double?
+        let endSeconds: Double?
         let evidence: String
         let confidence: Double
 
@@ -97,6 +118,11 @@ private struct LyricsRefinerResponse: Decodable {
             case originalText = "original_text"
             case suggestedText = "suggested_text"
             case shouldModify = "should_modify"
+            case shouldDisplay = "should_display"
+            case startWordIndex = "start_word_index"
+            case endWordIndex = "end_word_index"
+            case startSeconds = "start_seconds"
+            case endSeconds = "end_seconds"
         }
     }
 
@@ -117,6 +143,37 @@ struct BabyPlayerLyricsTextRepair: Sendable {
     let suggestedText: String
     let shouldModify: Bool
     let confidence: Double
+    let shouldDisplay: Bool
+    let startSeconds: Double?
+    let endSeconds: Double?
+
+    init(
+        lineIdentifier: String,
+        originalText: String,
+        suggestedText: String,
+        shouldModify: Bool,
+        confidence: Double,
+        shouldDisplay: Bool = true,
+        startSeconds: Double? = nil,
+        endSeconds: Double? = nil
+    ) {
+        self.lineIdentifier = lineIdentifier
+        self.originalText = originalText
+        self.suggestedText = suggestedText
+        self.shouldModify = shouldModify
+        self.confidence = confidence
+        self.shouldDisplay = shouldDisplay
+        self.startSeconds = startSeconds
+        self.endSeconds = endSeconds
+    }
+}
+
+enum BabyPlayerLyricsRefinerEvidencePolicy {
+    static let maximumAlignedWordsPerLine = 100
+
+    static func boundedWords(_ words: [BabyPlayerASRWord]) -> [BabyPlayerASRWord] {
+        Array(words.prefix(maximumAlignedWordsPerLine))
+    }
 }
 
 // 【MODIFIED】单一纯函数应用文本建议，时间和 identity 始终从 AI v1 复制。
@@ -133,16 +190,23 @@ enum BabyPlayerLyricsRepairApplier {
         for repair in repairs where repairsByID[repair.lineIdentifier] == nil {
             repairsByID[repair.lineIdentifier] = repair
         }
-        let lines = aiLyricsV1.lines.enumerated().map { index, line in
+        let lines = aiLyricsV1.lines.enumerated().compactMap { index, line in
             let identifier = "line-\(index)"
             guard let repair = repairsByID[identifier],
-                  repair.originalText == line.text,
-                  repair.shouldModify,
-                  repair.confidence >= minimumRepairConfidence,
-                  !repair.suggestedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                  repair.originalText == line.text else {
                 return line
             }
-            return TimedLyricLine(time: line.time, text: repair.suggestedText)
+            guard repair.shouldDisplay else { return nil }
+            let start = repair.startSeconds ?? line.time
+            let end = repair.endSeconds ?? line.endTime
+            let canModify = repair.shouldModify
+                && repair.confidence >= minimumRepairConfidence
+                && !repair.suggestedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return TimedLyricLine(
+                time: start,
+                text: canModify ? repair.suggestedText : line.text,
+                endTime: end
+            )
         }
         return LyricsCandidate(
             id: aiLyricsV1.id,
@@ -197,6 +261,14 @@ struct BabyPlayerLyricsRefinerClient {
                 ? analysis.segments.map(\.text).joined(separator: " ")
                 : analysis.transcript,
             originalLines: requestLines(aiLyricsV1: aiLyricsV1, analysis: analysis),
+            asrWords: analysis.segments.flatMap(\.words).enumerated().map {
+                .init(
+                    wordIndex: $0.offset,
+                    text: $0.element.text,
+                    startSeconds: $0.element.startSeconds,
+                    endSeconds: $0.element.endSeconds
+                )
+            },
             evidence: .init(
                 normalizedTextSimilarity: resolvedEvidence.normalizedTextSimilarity,
                 orderedTokenSimilarity: resolvedEvidence.orderedTokenSimilarity,
@@ -207,6 +279,7 @@ struct BabyPlayerLyricsRefinerClient {
             )
         )
         guard requestBody.originalLines.count >= 2 else { throw BabyPlayerASRError.invalidResponse }
+        guard requestBody.asrWords.count >= 3 else { throw BabyPlayerASRError.invalidResponse }
 
         var request = URLRequest(url: configuration.baseURL.appendingPathComponent("refine"))
         request.httpMethod = "POST"
@@ -234,14 +307,21 @@ struct BabyPlayerLyricsRefinerClient {
                 originalText: $0.originalText,
                 suggestedText: $0.suggestedText,
                 shouldModify: $0.shouldModify,
-                confidence: $0.confidence
+                confidence: $0.confidence,
+                shouldDisplay: $0.shouldDisplay,
+                startSeconds: $0.startSeconds,
+                endSeconds: $0.endSeconds
             )
         }
-        return BabyPlayerLyricsRepairApplier.applying(
+        let result = BabyPlayerLyricsRepairApplier.applying(
             repairs,
             to: aiLyricsV1,
             overallConfidence: refined.overallConfidence
         )
+        guard result.lines.count >= 2 else {
+            throw BabyPlayerASRError.server("AI 对齐后的有效字幕不足")
+        }
+        return result
     }
 
     /// 把 AI v1 行与对应 ASR words 组成证据；输入为 AI v1 和 analysis，输出为结构化原始行，不修改状态。
@@ -251,19 +331,21 @@ struct BabyPlayerLyricsRefinerClient {
     ) -> [LyricsRefinerRequest.OriginalLine] {
         let words = analysis.segments.flatMap(\.words)
         return aiLyricsV1.lines.enumerated().map { index, line in
-            let end = aiLyricsV1.lines.indices.contains(index + 1)
+            let fallbackEnd = aiLyricsV1.lines.indices.contains(index + 1)
                 ? aiLyricsV1.lines[index + 1].time
                 : max(analysis.audioDurationSeconds, line.time)
+            let end = max(line.time, line.endTime ?? fallbackEnd)
             let relevantWords = words.filter {
                 $0.startSeconds >= line.time - RepairPolicy.alignmentBoundaryToleranceSeconds
                     && $0.startSeconds < end + RepairPolicy.alignmentBoundaryToleranceSeconds
             }
+            let boundedWords = BabyPlayerLyricsRefinerEvidencePolicy.boundedWords(relevantWords)
             return .init(
                 lineIdentifier: "line-\(index)",
                 originalText: line.text,
                 startSeconds: line.time,
                 endSeconds: end,
-                alignedWords: relevantWords.map {
+                alignedWords: boundedWords.map {
                     .init(
                         text: $0.text,
                         startSeconds: $0.startSeconds,

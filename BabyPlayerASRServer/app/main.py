@@ -1,11 +1,15 @@
 import hashlib
 import hmac
+import logging
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 
 from app.config import Settings, settings
 from app.database import (
+    AnalysisInProgressError,
     AsrRepository,
     MonthlyLimitReachedError,
     OperationAlreadyUsedError,
@@ -22,6 +26,9 @@ from app.models import (
 )
 from app.service import AsrService, AudioValidationError, ServerBusyError
 from app.tencent_asr import TencentAsrError, TencentFlashAsrClient
+
+
+logger = logging.getLogger("babyplayer.api")
 
 
 def create_app(
@@ -54,6 +61,26 @@ def create_app(
         docs_url="/docs" if config.product_env != "production" else None,
         redoc_url=None,
     )
+
+    @application.exception_handler(RequestValidationError)
+    async def log_request_validation_failure(
+        request: Request, exc: RequestValidationError
+    ):
+        # Log only schema locations/types/messages. Input values may contain lyrics or ASR text.
+        safe_errors = [
+            {
+                "loc": list(error.get("loc") or []),
+                "type": error.get("type"),
+                "msg": error.get("msg"),
+            }
+            for error in exc.errors()
+        ]
+        logger.error(
+            "Request validation failed path=%s errors=%s",
+            request.url.path,
+            safe_errors,
+        )
+        return await request_validation_exception_handler(request, exc)
 
     def require_babyplayer_token(authorization: str | None = Header(default=None)) -> str:
         if not config.auth_enabled:
@@ -164,6 +191,14 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "ASR_OPERATION_ALREADY_USED"},
             )
+        except AnalysisInProgressError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "ASR_ANALYSIS_IN_PROGRESS",
+                    "message": "同一音频正在识别，请稍后读取缓存",
+                },
+            )
         except AudioValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -196,6 +231,7 @@ def create_app(
         try:
             return refiner_service.refine(request)
         except LyricsRefinementValidationError as exc:
+            logger.error("Lyrics refinement rejected reason=%s", str(exc))
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={"code": "INVALID_LYRICS_REFINEMENT", "message": str(exc)},

@@ -215,6 +215,13 @@ struct BabyPlayerASRClient {
         self.session = session
     }
 
+    /// 为本地 mock 测试注入服务地址；输入为 base URL、非生产 token 和 URLSession，输出 client，不访问网络。
+    // 【MODIFIED】真实 App 仍只使用 Bundle 配置；测试可证明 multipart `/analyze` 已具备发送条件。
+    init(baseURL: URL, apiToken: String, session: URLSession) {
+        configuration = BabyPlayerASRConfiguration(baseURL: baseURL, apiToken: apiToken)
+        self.session = session
+    }
+
     func cachedAnalysis(mediaFingerprint: String) async throws -> BabyPlayerASRAnalysis {
         var components = URLComponents(
             url: configuration.baseURL.appendingPathComponent("cache"),
@@ -342,17 +349,7 @@ enum BabyPlayerASRSegmentPolicy {
 
     /// 计算歌曲在源媒体中的安全窗口；输入为媒体描述，输出起点与歌曲时长，不修改状态。
     static func songWindow(for media: LyricsMediaDescriptor) -> BabyPlayerAudioExportWindow? {
-        let totalDuration = media.durationSeconds ?? 0
-        guard totalDuration >= minimumUsableDurationSeconds else { return nil }
-        let requestedStart = max(0, media.songStartSeconds ?? 0)
-        let safeStart = requestedStart <= totalDuration - minimumUsableDurationSeconds
-            ? requestedStart
-            : 0
-        let requestedEnd = min(totalDuration, media.songEndSeconds ?? totalDuration)
-        let safeEnd = requestedEnd > safeStart ? requestedEnd : totalDuration
-        let duration = safeEnd - safeStart
-        guard duration >= minimumUsableDurationSeconds else { return nil }
-        return BabyPlayerAudioExportWindow(startSeconds: safeStart, durationSeconds: duration)
+        BabyPlayerTemporaryASRAudioPolicy.songWindow(for: media)
     }
 
     /// 为媒体建立歌曲相对分段；输入为媒体描述，输出按 index 排序的临时 segment，不修改状态。
@@ -382,6 +379,25 @@ enum BabyPlayerASRSegmentPolicy {
             index += 1
         }
         return result
+    }
+}
+
+// 【MODIFIED】MVP 只生成一个短命的整首 M4A；此策略不分片、不 overlap，也不建立音频库。
+enum BabyPlayerTemporaryASRAudioPolicy {
+    /// 计算整首 ASR 音频窗口；输入为 Jellyfin 媒体描述，输出安全的片头后/片尾前范围，不修改状态。
+    static func songWindow(for media: LyricsMediaDescriptor) -> BabyPlayerAudioExportWindow? {
+        let totalDuration = media.durationSeconds ?? 0
+        guard totalDuration >= BabyPlayerAudioExportPolicy.minimumUsableDuration else { return nil }
+        let requestedStart = max(0, media.songStartSeconds ?? 0)
+        let safeStart = requestedStart
+            <= totalDuration - BabyPlayerAudioExportPolicy.minimumUsableDuration
+            ? requestedStart
+            : 0
+        let requestedEnd = min(totalDuration, media.songEndSeconds ?? totalDuration)
+        let safeEnd = requestedEnd > safeStart ? requestedEnd : totalDuration
+        let duration = safeEnd - safeStart
+        guard duration >= BabyPlayerAudioExportPolicy.minimumUsableDuration else { return nil }
+        return BabyPlayerAudioExportWindow(startSeconds: safeStart, durationSeconds: duration)
     }
 }
 
@@ -514,6 +530,22 @@ actor BabyPlayerASRAudioSegmentPreparer {
     static let shared = BabyPlayerASRAudioSegmentPreparer()
     private let fileManager = FileManager.default
 
+    /// 生成单个临时整首 M4A；输入为当前 Jellyfin 队列媒体，输出临时音频元数据，不分片、不持久化。
+    // 【MODIFIED】MVP 复用已验证的导出器，但只提交一个覆盖整首歌曲窗口的工作单元。
+    func prepareCompleteSong(item: BabyPlayerQueueItem) async throws -> BabyPlayerPreparedASRSegment {
+        guard let window = BabyPlayerTemporaryASRAudioPolicy.songWindow(for: item.lyricsMedia) else {
+            throw BabyPlayerASRError.audioExportFailed
+        }
+        return try await prepare(
+            item: item,
+            segment: BabyPlayerASRAudioSegment(
+                index: 0,
+                startSeconds: 0,
+                durationSeconds: window.durationSeconds
+            )
+        )
+    }
+
     /// 生成一个临时 M4A segment；输入为队列媒体和分段，输出临时文件元数据，会修改临时目录但不修改 repository/UI。
     func prepare(
         item: BabyPlayerQueueItem,
@@ -547,15 +579,50 @@ actor BabyPlayerASRAudioSegmentPreparer {
                 )
             } catch {
                 try Task.checkCancellation()
-                babyPlayerASRLogger.info(
-                    "Segment fallback path start index=\(segment.index, privacy: .public) mode=audio-composition"
+                let directError = error as NSError
+                babyPlayerASRLogger.error(
+                    "Direct AVAsset extraction failed index=\(segment.index, privacy: .public) domain=\(directError.domain, privacy: .public) code=\(directError.code, privacy: .public)"
                 )
-                try await exportThroughAudioComposition(
-                    asset: asset,
-                    sourceStartSeconds: sourceStart,
-                    durationSeconds: segment.durationSeconds,
-                    to: destination
-                )
+                if item.url.isFileURL {
+                    babyPlayerASRLogger.info(
+                        "Temporary audio fallback start index=\(segment.index, privacy: .public) mode=local-audio-composition"
+                    )
+                    try await exportThroughAudioComposition(
+                        asset: asset,
+                        sourceStartSeconds: sourceStart,
+                        durationSeconds: segment.durationSeconds,
+                        to: destination
+                    )
+                } else {
+                    // Jellyfin 的远程 fragmented MP4 在 tvOS 上可能无法被 exporter 随机读取；只在失败后下载短命源文件。
+                    babyPlayerASRLogger.info(
+                        "Temporary audio fallback start index=\(segment.index, privacy: .public) mode=ephemeral-source-download"
+                    )
+                    let downloadedMedia = try await downloadRemoteMediaForExtraction(
+                        from: item.url
+                    )
+                    defer { try? fileManager.removeItem(at: downloadedMedia) }
+                    try Task.checkCancellation()
+                    let localAsset = AVURLAsset(url: downloadedMedia)
+                    do {
+                        try await export(
+                            asset: localAsset,
+                            sourceStartSeconds: sourceStart,
+                            durationSeconds: segment.durationSeconds,
+                            to: destination
+                        )
+                    } catch {
+                        babyPlayerASRLogger.info(
+                            "Temporary audio fallback start index=\(segment.index, privacy: .public) mode=downloaded-audio-composition"
+                        )
+                        try await exportThroughAudioComposition(
+                            asset: localAsset,
+                            sourceStartSeconds: sourceStart,
+                            durationSeconds: segment.durationSeconds,
+                            to: destination
+                        )
+                    }
+                }
             }
             try Task.checkCancellation()
             let attributes = try fileManager.attributesOfItem(atPath: destination.path)
@@ -589,6 +656,40 @@ actor BabyPlayerASRAudioSegmentPreparer {
     /// 删除已上传的临时 segment；输入为 prepared segment，无输出，会修改临时目录。
     func remove(_ prepared: BabyPlayerPreparedASRSegment) {
         try? fileManager.removeItem(at: prepared.fileURL)
+    }
+
+    /// 下载仅供本次整首音频提取的源媒体；输入为已认证 Jellyfin URL，输出临时 URL，会在导出结束前删除。
+    private func downloadRemoteMediaForExtraction(from sourceURL: URL) async throws -> URL {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 90
+        configuration.timeoutIntervalForResource = 600
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        do {
+            let (temporaryURL, response) = try await session.download(from: sourceURL)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  fileManager.fileExists(atPath: temporaryURL.path) else {
+                throw BabyPlayerASRError.audioExportFailed
+            }
+            try Task.checkCancellation()
+            let fileExtension = sourceURL.pathExtension.isEmpty ? "mp4" : sourceURL.pathExtension
+            let stableURL = fileManager.temporaryDirectory
+                .appendingPathComponent("BabyPlayer-ASR-Source-\(UUID().uuidString)")
+                .appendingPathExtension(fileExtension)
+            try fileManager.moveItem(at: temporaryURL, to: stableURL)
+            babyPlayerASRLogger.info("Ephemeral Jellyfin source download completed")
+            return stableURL
+        } catch is CancellationError {
+            babyPlayerASRLogger.notice("Ephemeral Jellyfin source download cancelled")
+            throw CancellationError()
+        } catch {
+            let nsError = error as NSError
+            babyPlayerASRLogger.error(
+                "Ephemeral Jellyfin source download failed domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)"
+            )
+            throw BabyPlayerASRError.audioExportFailed
+        }
     }
 
     /// 直接从可访问媒体导出指定时间段；输入为 AVAsset、源时间范围和目标 URL，无输出，会创建临时 M4A。
@@ -1109,6 +1210,7 @@ typealias BabyPlayerASRStageHandler = @MainActor @Sendable (
 
 actor BabyPlayerASRCoordinator {
     static let shared = BabyPlayerASRCoordinator()
+    // 保留 STEP 1 已存在的 registry 类型与测试供以后优化；MVP 生产分析不复用跨循环任务。
     private let taskRegistry = BabyPlayerASRTaskRegistry()
 
     func analyze(
@@ -1119,16 +1221,15 @@ actor BabyPlayerASRCoordinator {
         onAILyricsV1: BabyPlayerAILyricsProgressHandler? = nil
     ) async throws -> BabyPlayerASRMatchOutcome {
         let fingerprint = item.lyricsMedia.asrFingerprint
-        return try await taskRegistry.value(for: fingerprint) {
-            try await Self.performAnalysis(
-                item: item,
-                candidates: candidates,
-                reference: reference,
-                fingerprint: fingerprint,
-                onStage: onStage,
-                onAILyricsV1: onAILyricsV1
-            )
-        }
+        // 【MODIFIED】MVP 每次只执行当前调用者拥有的一次整首分析，不使用复杂的跨循环共享任务。
+        return try await Self.performAnalysis(
+            item: item,
+            candidates: candidates,
+            reference: reference,
+            fingerprint: fingerprint,
+            onStage: onStage,
+            onAILyricsV1: onAILyricsV1
+        )
     }
 
     /// 取消指定媒体分析；输入为 fingerprint，无输出，会终止临时提取/上传并清理 registry。
@@ -1150,88 +1251,50 @@ actor BabyPlayerASRCoordinator {
         onAILyricsV1: BabyPlayerAILyricsProgressHandler?
     ) async throws -> BabyPlayerASRMatchOutcome {
         let client = try BabyPlayerASRClient()
-        let plannedSegments = BabyPlayerASRSegmentPolicy.segments(for: item.lyricsMedia)
-        guard !plannedSegments.isEmpty else { throw BabyPlayerASRError.audioExportFailed }
-        var segmentResults: [BabyPlayerASRSegmentResult] = []
-        for segment in plannedSegments {
+        guard let songWindow = BabyPlayerTemporaryASRAudioPolicy.songWindow(
+            for: item.lyricsMedia
+        ) else { throw BabyPlayerASRError.audioExportFailed }
+        let analysis: BabyPlayerASRAnalysis
+        do {
+            // 这是原有的整首结果缓存查询，不是 segment cache。
+            analysis = try await client.cachedAnalysis(mediaFingerprint: fingerprint)
+        } catch BabyPlayerASRError.cacheMiss {
             try Task.checkCancellation()
-            babyPlayerASRLogger.info(
-                "Next segment start index=\(segment.index, privacy: .public) total=\(plannedSegments.count, privacy: .public) start=\(segment.startSeconds, privacy: .public) duration=\(segment.durationSeconds, privacy: .public)"
+            let usage = try await client.usage()
+            try BabyPlayerASRQuotaPolicy.validate(
+                usage,
+                requestedSeconds: songWindow.durationSeconds
             )
-            let segmentFingerprint = segment.fingerprint(mediaFingerprint: fingerprint)
-            let segmentAnalysis: BabyPlayerASRAnalysis
+            await onStage?(.preparingAudio(index: 1, total: 1))
+            babyPlayerASRLogger.info(
+                "Temporary whole-song audio preparation start duration=\(songWindow.durationSeconds, privacy: .public)"
+            )
+            let prepared = try await BabyPlayerASRAudioSegmentPreparer.shared
+                .prepareCompleteSong(item: item)
             do {
-                segmentAnalysis = try await client.cachedAnalysis(
-                    mediaFingerprint: segmentFingerprint
+                try Task.checkCancellation()
+                await onStage?(.recognizing(index: 1, total: 1))
+                babyPlayerASRLogger.info(
+                    "Upload /v1/analyze start mode=whole-song duration=\(prepared.generatedDurationSeconds, privacy: .public) fileSize=\(prepared.fileSize, privacy: .public)"
                 )
-            } catch BabyPlayerASRError.cacheMiss {
-                let usage = try await client.usage()
-                try BabyPlayerASRQuotaPolicy.validate(
-                    usage,
-                    requestedSeconds: segment.durationSeconds
+                analysis = try await client.analyze(
+                    sampleURL: prepared.fileURL,
+                    durationSeconds: min(
+                        songWindow.durationSeconds,
+                        prepared.generatedDurationSeconds
+                    ),
+                    mediaFingerprint: fingerprint
                 )
-                await onStage?(.preparingAudio(
-                    index: segment.index + 1,
-                    total: plannedSegments.count
-                ))
-                let prepared = try await BabyPlayerASRAudioSegmentPreparer.shared.prepare(
-                    item: item,
-                    segment: segment
+                babyPlayerASRLogger.info(
+                    "/v1/analyze response received mode=whole-song status=\(analysis.status, privacy: .public)"
                 )
-                do {
-                    try Task.checkCancellation()
-                    await onStage?(.recognizing(
-                        index: segment.index + 1,
-                        total: plannedSegments.count
-                    ))
-                    babyPlayerASRLogger.info(
-                        "Upload /v1/analyze start index=\(segment.index, privacy: .public) duration=\(prepared.generatedDurationSeconds, privacy: .public) fileSize=\(prepared.fileSize, privacy: .public)"
-                    )
-                    segmentAnalysis = try await client.analyze(
-                        sampleURL: prepared.fileURL,
-                        durationSeconds: min(
-                            segment.durationSeconds,
-                            prepared.generatedDurationSeconds
-                        ),
-                        mediaFingerprint: segmentFingerprint
-                    )
-                    babyPlayerASRLogger.info(
-                        "/v1/analyze response received index=\(segment.index, privacy: .public) status=\(segmentAnalysis.status, privacy: .public)"
-                    )
-                } catch {
-                    await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
-                    throw error
-                }
+            } catch {
                 await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
+                throw error
             }
-            segmentResults.append(BabyPlayerASRSegmentResult(
-                segment: segment,
-                analysis: segmentAnalysis
-            ))
-
-            if segment.index == 0, plannedSegments.count > 1 {
-                let firstAnalysis = BabyPlayerASRSegmentMerger.merge(segmentResults)
-                let preliminary = BabyPlayerLyricsSoundMatcher.match(
-                    analysis: firstAnalysis,
-                    candidates: candidates.first.map { [$0] } ?? [],
-                    reference: reference,
-                    sampleStartSeconds: item.lyricsMedia.songStartSeconds ?? 0,
-                    mediaTitle: item.lyricsMedia.searchTitle
-                )
-                if !BabyPlayerASRFirstSegmentPolicy.shouldContinue(
-                    after: preliminary.sameSongEvidence
-                ) {
-                    babyPlayerASRLogger.notice(
-                        "First segment clearly mismatched; remaining segments stopped"
-                    )
-                    return preliminary
-                }
-            }
+            await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
+            babyPlayerASRLogger.info("Temporary whole-song audio removed after recognition")
         }
-        babyPlayerASRLogger.info(
-            "All segments completed count=\(segmentResults.count, privacy: .public)"
-        )
-        let analysis = BabyPlayerASRSegmentMerger.merge(segmentResults)
         await onStage?(.aligning)
         babyPlayerASRLogger.info("Alignment start")
         let result = BabyPlayerLyricsSoundMatcher.match(
@@ -1708,7 +1771,8 @@ enum BabyPlayerLyricsSoundMatcher {
                let wordIndex = previous.matchedWordIndex {
                 timed.append(TimedLyricLine(
                     time: words[wordIndex].startSeconds,
-                    text: rawLines[lineIndex]
+                    text: rawLines[lineIndex],
+                    endTime: words[wordIndex + previous.matchedWordCount - 1].endSeconds
                 ))
                 matchedWordCount += previous.matchedWordCount
             }
