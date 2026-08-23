@@ -109,47 +109,36 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
    - 查看当前视频最接近的同步歌词候选，最多 3 个，并可额外使用 1 份本地歌本纯文本；
    - 根据匹配分、歌词时长差和歌词片段选择正确版本；
    - 选择“重新搜索歌词”刷新在线结果；
-   - 使用“提前/延后 0.1 秒或 0.5 秒”校准时间。
+   - 【MODIFIED】选择“声音分析歌词”主动运行腾讯 ASR 核验；分析完成或失败后可选择“重新进行声音分析”；
+   - 使用“提前/延后 0.1 秒或 0.5 秒”校准时间；
    - 在第一句开始时暂停，选择“把第一句对齐到当前位置”，一次消除 MP4 片头偏移。
 
-首次搜索会默认绑定排名第 1 的歌词。点选第 2 或第 3 个候选后，会立即替换当前 Jellyfin 视频的绑定，并保存在这台 Apple TV。下次播放直接使用已选歌词，不会被重新搜索覆盖。
+首次搜索会默认绑定排名第 1 的歌词。点选第 2 或第 3 个候选后，会立即替换当前 Jellyfin 视频的绑定，并保存在这台 Apple TV。下次播放直接使用已选歌词，不会被重新搜索或声音分析覆盖。
 
-时间调整不限次数。每次提前或延后都在当前人工调整上累加；自动偏移和
-人工调整分开保存。每份歌词都有自己的调整值，切换和重启后会恢复。
+时间调整不限次数。每次提前或延后都在当前人工调整上累加；自动偏移和人工调整分开保存。每份歌词都有自己的调整值，切换和重启后会恢复。
 
-未配置声音分析时，BabyPlayer 仍使用歌名、来源/版本、演唱者和歌曲段时长排序，
-并稳定默认绑定第 1 个。配置后使用两轮生成：第一轮腾讯 ASR 产生句/词时间戳和
-初稿；第二轮 DeepSeek V4 Flash 以 ASR 为主证据，以最多 3 份网络歌词和 1 份本地
-纯文本歌本为次证据纠正文案。第二轮不能修改时间戳；服务端会验证并重新附上腾讯
-时间边界。任一环失败都回退到已有的本地确定性结果，家长的手动选择永远不会被自动结果
-覆盖。
+【MODIFIED】未配置声音分析时，BabyPlayer 仍使用歌名、来源/版本、演唱者和歌曲段时长排序，并稳定默认绑定第 1 个。配置后，独立服务器只返回腾讯 ASR 的文字、句时间戳和单词时间戳；最多 3 份网络歌词、可选本地纯文本歌本的比较、自动推荐和时间对齐全部在 Apple TV 本地使用确定性算法完成，不使用 LLM。
+
+只有声音相似度足够高且相对第二名明显领先时，ASR 才允许自动切换；结果接近、转写太少或时间轴无法可靠重建时，当前第 1 份歌词保持不变并提示家长手动选择。用户一旦手动选过歌词或调整过时间，自动分析永远不能覆盖人工结果。
 
 注意：删除 BabyPlayer App 会同时删除 Apple TV 上保存的歌词绑定与缓存；从 Xcode 覆盖安装通常会保留。
 
 ### 可选声音分析
 
-声音分析服务与 EnglishFlow、翻译、TTS 和 Jellyfin 完全独立；实现与部署说明见
-[`BabyPlayerASRServer/README.md`](BabyPlayerASRServer/README.md)，详细边界见
-[`BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md`](BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md)。
+声音分析服务与 EnglishFlow、翻译、TTS 和 Jellyfin 完全独立；实现与部署说明见 [`BabyPlayerASRServer/README.md`](BabyPlayerASRServer/README.md)，详细边界见 [`BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md`](BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md)。
 
-本地 Token 不直接写入 `Info.plist`。复制
-`Config/BabyPlayerSecrets.xcconfig.example` 为 `Config/BabyPlayerSecrets.xcconfig`，只在后者中填入
-BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VPS 的
-`/opt/babyplayer-asr/.env`，不进入 Apple TV 安装包。
+本地 Token 不直接写入 `Info.plist`。复制 `Config/BabyPlayerSecrets.xcconfig.example` 为 `Config/BabyPlayerSecrets.xcconfig`，只在后者中填入 BabyPlayer Bearer Token；该文件已被 Git 忽略，真实值不得提交。
 
-- Apple TV 把完整歌曲段 M4A 保存到 Application Support 下的本地音频库，不会自动淘汰；
-  较长曲目可另有一份最长 120 秒的 ASR 识别前段。这份完整 M4A 可供后续“纯音频 +
-  同步歌词”功能直接复用。
-- VPS 不保存音频、Jellyfin URL 或歌词。ASR 模块只缓存不可逆指纹、转写文字与时间戳；
-  DeepSeek 模块只在请求内存中临时处理候选文本，不写入数据库。
-- 服务端硬限制每个北京时间自然月 18,000 秒（5 小时）。达到上限后提示下月 1 日
-  00:00 再次使用；已有缓存仍可继续匹配。
+- Apple TV 把完整歌曲段 M4A 保存到 Application Support 下的本地音频库，不会自动淘汰；较长曲目可另有一份最长 120 秒的 ASR 识别前段。这份完整 M4A 可供后续“纯音频 + 同步歌词”功能直接复用。
+- VPS 不保存原始音频、Jellyfin URL 或歌词，只缓存不可逆媒体指纹、音频摘要、腾讯转写文字与时间戳。
+- 调用 ASR 前先查媒体指纹缓存；即使媒体指纹变化，相同音频内容也可通过音频摘要复用既有结果，不再次消耗额度。
+- 服务端硬限制每个北京时间自然月 18,000 秒（5 小时）。达到上限后提示下月 1 日 00:00 再次使用；已有缓存仍可继续匹配。
 - 家长设置可查看每首本地歌曲音频、识别状态、总占用、本月剩余时间，并可逐首或全部删除。
-- 腾讯云后付费应保持关闭。
+- 云端账户消费保护应继续保持，作为服务端硬限制之外的第二道保护。
 
 ### 内置 Super Simple Songs 曲目库
 
-项目内的 `BabyPlayer/BabyLyricsCatalog.json` 可以在构建前预置已授权的 SSS 曲目和 LRC。内置库的候选与 LRCLIB 一起评分；分数最高的仍然排在第 1 个。
+项目内的 `BabyPlayer/BabyLyricsCatalog.json` 可以在构建前预置自己有权使用的曲目纯文本或同步歌词。内置时间轴歌词候选与 LRCLIB 一起评分；纯文本歌本不占用最多 3 份网络时间轴歌词的名额。
 
 ```json
 {
@@ -171,9 +160,9 @@ BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VP
 ```
 
 - 内置曲目 `id` 使用负数，避免与 LRCLIB ID 冲突。
-- `syncedLyrics` 可为 `null`；此时该条目只提供标准歌名、别名和艺术家线索，歌词仍从 LRCLIB 搜索。
-- `plainLyrics` 可保存已获授权的纯文本歌本。它不占用 3 个在线同步候选名额；声音分析
-  可用它核验曲目，并在词级时间戳覆盖率足够时在 Apple TV 本地自动校时。
+- `syncedLyrics` 可为 `null`；纯文本歌本仍可以通过声音分析参与核验。
+- `plainLyrics` 在腾讯 ASR 提供足够单词时间戳时，可在 Apple TV 本地生成“本地歌本·自动校时”临时时间轴。
+- 【MODIFIED】时间对齐使用全局单调路径，避免儿童歌曲重复副歌把后半段错误匹配回第一次出现的位置。
 - 只应打包自己有权使用和分发的歌词文件。
 
 ## 五、其他播放控制
@@ -204,8 +193,7 @@ BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VP
 
 ### 某首歌没有歌词或歌词不正确
 
-在该视频的播放页打开“字幕与歌词”，先看最多 3 个同步候选和可选本地歌本；不合适时
-选择“重新搜索歌词”。声音核验置信度不足时不会自动切换，家长选对后会永久绑定。
+在该视频的播放页打开“字幕与歌词”，先看最多 3 个同步候选和可选本地歌本；不合适时选择“重新搜索歌词”。如果希望用声音核验，选择“声音分析歌词”。声音结果不明确时不会自动切换；家长选对后会永久绑定。
 
 ## 当前要求
 
