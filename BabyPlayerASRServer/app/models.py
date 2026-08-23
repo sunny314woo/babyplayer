@@ -1,18 +1,28 @@
-from typing import Annotated
+"""
+BabyPlayerASRServer/app/models.py
 
-from pydantic import BaseModel, Field, StringConstraints
+用途：定义 BabyPlayer 独立 ASR API 的 Pydantic 响应模型。
+主要功能：
+1. 描述腾讯 ASR 单词和句子时间戳。
+2. 描述 ASR 分析结果。
+3. 描述月度额度状态。
+最近修改：2026-08-23 【MODIFIED】移除已停用的 LLM 歌词纠正请求/响应模型。
+"""
 
-
-LyricText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
+from pydantic import BaseModel, Field
 
 
 class AsrWord(BaseModel):
+    """单个 ASR 单词及其相对识别音频的起止时间。"""
+
     text: str
     start_seconds: float
     end_seconds: float
 
 
 class AsrSegment(BaseModel):
+    """单个 ASR 句段，包含句级时间和可选单词时间戳。"""
+
     text: str
     start_seconds: float
     end_seconds: float
@@ -20,6 +30,8 @@ class AsrSegment(BaseModel):
 
 
 class AsrAnalysisResponse(BaseModel):
+    """一次 ASR 或缓存命中的完整返回，不包含原始音频或 Jellyfin 信息。"""
+
     status: str
     cache_hit: bool
     provider: str
@@ -33,46 +45,11 @@ class AsrAnalysisResponse(BaseModel):
 
 
 class UsageResponse(BaseModel):
+    """北京时间自然月的 ASR 用量与下一次重置时间。"""
+
     month: str
     used_seconds: int
     reserved_seconds: int
     remaining_seconds: int
     limit_seconds: int
     next_reset_at: str
-
-
-class LyricsRefineSegment(BaseModel):
-    index: int = Field(ge=0, le=500)
-    text: str = Field(min_length=1, max_length=500)
-    start_seconds: float = Field(ge=0, le=3600)
-    end_seconds: float = Field(ge=0, le=3600)
-
-
-class LyricsRefineCandidate(BaseModel):
-    identifier: str = Field(min_length=3, max_length=256)
-    title: str = Field(min_length=1, max_length=256)
-    artist: str = Field(max_length=256)
-    source: str = Field(max_length=128)
-    lines: list[LyricText] = Field(min_length=1, max_length=300)
-
-
-class LyricsRefineRequest(BaseModel):
-    media_fingerprint: str = Field(min_length=8, max_length=128)
-    transcript: str = Field(max_length=30_000)
-    segments: list[LyricsRefineSegment] = Field(min_length=2, max_length=500)
-    candidates: list[LyricsRefineCandidate] = Field(default_factory=list, max_length=4)
-
-
-class RefinedLyricLine(BaseModel):
-    segment_index: int
-    start_seconds: float
-    end_seconds: float
-    text: str
-
-
-class LyricsRefineResponse(BaseModel):
-    status: str
-    model: str
-    confidence: float
-    selected_candidate_identifier: str | None = None
-    lines: list[RefinedLyricLine]

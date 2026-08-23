@@ -1,6 +1,8 @@
 //
 // BabyPlayerASR.swift
-// Apple TV 本地提取 M4A、管理音频缓存、调用独立 ASR 代理并在本地匹配歌词。
+// Apple TV 本地提取 M4A、管理音频缓存、调用独立腾讯 ASR 代理并在本地确定性匹配歌词。
+// 主要功能：ASR 客户端、额度预检、音频持久缓存、服务端缓存复用、歌词候选评分、单调时间对齐和家长额度/缓存视图模型。
+// 最近修改：2026-08-23 【MODIFIED】移除 LLM 链路，不明确时保持现有歌词，并用单调全局对齐处理重复歌词。
 //
 
 import AVFoundation
@@ -555,6 +557,7 @@ actor BabyPlayerASRCoordinator {
         return try await task.value
     }
 
+    /// 【MODIFIED】端到端只执行“缓存 → 额度预检 → 腾讯 ASR → Apple TV 本地匹配”，不再调用任何 LLM。
     private static func performAnalysis(
         item: BabyPlayerQueueItem,
         candidates: [LyricsCandidate],
@@ -580,36 +583,21 @@ actor BabyPlayerASRCoordinator {
                 mediaFingerprint: fingerprint
             )
         }
-        let result = BabyPlayerLyricsSoundMatcher.match(
+
+        let matched = BabyPlayerLyricsSoundMatcher.match(
             analysis: analysis,
             candidates: candidates,
             reference: reference,
             sampleStartSeconds: item.lyricsMedia.songStartSeconds ?? 0
         )
-        let finalResult: BabyPlayerASRMatchOutcome
-        do {
-            let refined = try await BabyPlayerLyricsRefinerClient().refine(
-                analysis: analysis,
-                candidates: candidates,
-                reference: reference,
-                mediaFingerprint: fingerprint
-            )
-            finalResult = BabyPlayerASRMatchOutcome(
-                candidates: [refined] + result.candidates.filter { $0.id != refined.id },
-                selected: refined,
-                offsetSeconds: item.lyricsMedia.songStartSeconds ?? 0,
-                message: "DeepSeek Flash 已校正文案，并保留腾讯 ASR 时间轴"
-            )
-        } catch BabyPlayerASRError.notConfigured {
-            finalResult = result
-        } catch {
-            finalResult = BabyPlayerASRMatchOutcome(
-                candidates: result.candidates,
-                selected: result.selected,
-                offsetSeconds: result.offsetSeconds,
-                message: "\(result.message) · AI 文案校正暂不可用"
-            )
-        }
+        let cacheSuffix = reusedServerCache ? " · 已使用服务器缓存（不消耗额度）" : ""
+        let finalResult = BabyPlayerASRMatchOutcome(
+            candidates: matched.candidates,
+            selected: matched.selected,
+            offsetSeconds: matched.offsetSeconds,
+            message: "\(matched.message)\(cacheSuffix)"
+        )
+
         if reusedServerCache {
             // VPS 缓存命中时先立即使用转写，再以低优先级补齐本地完整 M4A。
             // 音频库和识别缓存是两份独立资产，命中不应让本地音频永久缺失。
@@ -631,6 +619,19 @@ actor BabyPlayerASRCoordinator {
 }
 
 enum BabyPlayerLyricsSoundMatcher {
+    private struct AlignmentMatch {
+        let lineIndex: Int
+        let startWord: Int
+        let endWord: Int
+        let score: Double
+    }
+
+    private struct AlignmentState {
+        let score: Double
+        let previousIndex: Int?
+    }
+
+    /// 【MODIFIED】只有声音相似度足够高且明显领先时才允许自动选择；不明确时 selected 固定为 nil。
     static func match(
         analysis: BabyPlayerASRAnalysis,
         candidates: [LyricsCandidate],
@@ -647,7 +648,7 @@ enum BabyPlayerLyricsSoundMatcher {
                 candidates: candidates,
                 selected: nil,
                 offsetSeconds: nil,
-                message: "声音文字太少，请手动选择歌词"
+                message: "声音文字太少，已保留当前歌词，请手动选择"
             )
         }
 
@@ -656,8 +657,7 @@ enum BabyPlayerLyricsSoundMatcher {
            !available.contains(where: { $0.id == reference.id }),
            let aligned = alignedReferenceCandidate(
                reference,
-               analysis: analysis,
-               sampleStartSeconds: sampleStartSeconds
+               analysis: analysis
            ) {
             available.append(aligned)
         }
@@ -675,55 +675,52 @@ enum BabyPlayerLyricsSoundMatcher {
 
         guard let best = scored.first else {
             return BabyPlayerASRMatchOutcome(
-                candidates: candidates, selected: nil, offsetSeconds: nil,
-                message: "没有可供声音核验的歌词"
+                candidates: candidates,
+                selected: nil,
+                offsetSeconds: nil,
+                message: "没有可供声音核验的歌词，已保留当前歌词"
             )
         }
         let margin = best.2 - (scored.dropFirst().first?.2 ?? 0)
         let confident = best.1 >= 0.48 && (scored.count == 1 || margin >= 0.08)
-        var selected: LyricsCandidate?
-        var offset: Double?
-        var message: String
+        let selected: LyricsCandidate?
+        let offset: Double?
+        let message: String
+
         if confident && best.0.providerName == "本地歌本·自动校时" {
             selected = best.0
             offset = sampleStartSeconds
-            message = "已用声音时间戳校准本地歌本"
+            message = "已用腾讯单词时间戳校准本地歌本"
         } else if confident,
                   preferSoundTimeline,
                   let retimed = retimedCandidate(best.0, analysis: analysis) {
             selected = retimed
             offset = sampleStartSeconds
-            message = "已忽略网络时间轴，并用声音逐行重新校时"
+            message = "声音匹配明显领先，已用腾讯单词时间戳重新校时"
         } else if confident,
-                  !preferSoundTimeline,
                   let estimated = estimatedOffset(
-                segments: analysis.segments,
-                lines: best.0.lines,
-                sampleStartSeconds: sampleStartSeconds
+                    segments: analysis.segments,
+                    lines: best.0.lines,
+                    sampleStartSeconds: sampleStartSeconds
                   ) {
             selected = best.0
             offset = estimated
-            message = "声音核验已匹配并校正整体偏移"
-        } else if preferSoundTimeline,
-                  let direct = directASRCandidate(analysis) {
-            selected = direct
-            offset = sampleStartSeconds
-            message = confident
-                ? "歌词文字可匹配但无法可靠逐行对齐，已使用声音识别字幕"
-                : "歌词候选不明确，已使用声音识别字幕"
-        } else {
-            selected = confident ? best.0 : nil
+            message = "声音匹配明显领先，已校正整体时间偏移"
+        } else if confident {
+            selected = nil
             offset = nil
-            message = confident
-                ? "声音已确认歌词，但时间轴不足以自动校准"
-                : "声音核验结果接近，请家长确认"
+            message = "声音已确认歌词文字，但时间轴不足以安全自动切换，已保留当前歌词"
+        } else {
+            selected = nil
+            offset = nil
+            message = "声音核验结果不明确，已保留当前歌词，请手动选择"
         }
+
         let referenceScore = reference.map { similarity(transcriptTokens, tokens($0.plainLyrics)) }
         let referenceMessage = referenceScore.map { " · 歌本核验 \(Int($0 * 100)) 分" } ?? ""
         var orderedCandidates = scored.map(\.0)
         if let selected,
            !orderedCandidates.contains(where: { $0.persistentIdentifier == selected.persistentIdentifier }) {
-            // 重校时版本替代同源的旧 LRC，避免 UI 同时显示两个相同标题。
             orderedCandidates.removeAll { $0.id == selected.id }
             orderedCandidates.insert(selected, at: 0)
         }
@@ -735,6 +732,7 @@ enum BabyPlayerLyricsSoundMatcher {
         )
     }
 
+    /// 【MODIFIED】网络歌词只借用文本；时间轴由腾讯单词时间戳通过全局单调对齐重新生成。
     private static func retimedCandidate(
         _ candidate: LyricsCandidate,
         analysis: BabyPlayerASRAnalysis
@@ -751,36 +749,15 @@ enum BabyPlayerLyricsSoundMatcher {
             duration: max(analysis.audioDurationSeconds, timed.last?.time ?? 0),
             lines: timed,
             matchScore: candidate.matchScore,
-            providerName: "\(candidate.providerName ?? "网络歌词")·声音重校时"
+            // 保持 provider 稳定，确保同一歌词重校时后 persistentIdentifier 不变化。
+            providerName: candidate.providerName
         )
     }
 
-    private static func directASRCandidate(_ analysis: BabyPlayerASRAnalysis) -> LyricsCandidate? {
-        let lines = analysis.segments.compactMap { segment -> TimedLyricLine? in
-            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return nil }
-            return TimedLyricLine(time: segment.startSeconds, text: text)
-        }
-        guard !lines.isEmpty else { return nil }
-        let raw = lines.map { "\($0.time)|\($0.text)" }.joined(separator: "\n")
-        let digest = SHA256.hash(data: Data(raw.utf8))
-        let numericID = digest.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-        return LyricsCandidate(
-            id: -1_000_000_000 - Int(numericID),
-            trackName: "声音识别字幕",
-            artistName: "腾讯 ASR",
-            albumName: nil,
-            duration: max(analysis.audioDurationSeconds, lines.last?.time ?? 0),
-            lines: lines,
-            matchScore: 0,
-            providerName: "腾讯 ASR·声音时间轴"
-        )
-    }
-
+    /// 【MODIFIED】把纯文本本地歌本按腾讯单词时间戳生成临时时间轴。
     private static func alignedReferenceCandidate(
         _ reference: LyricsPlainTextReference,
-        analysis: BabyPlayerASRAnalysis,
-        sampleStartSeconds: Double
+        analysis: BabyPlayerASRAnalysis
     ) -> LyricsCandidate? {
         let rawLines = reference.plainLyrics.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -799,39 +776,106 @@ enum BabyPlayerLyricsSoundMatcher {
         )
     }
 
+    /// 【MODIFIED】对每句生成少量候选窗口，再做全局单调动态规划；重复副歌不会回跳到更早出现的位置。
     private static func retimedLines(
         _ rawLines: [String],
         words: [BabyPlayerASRWord]
     ) -> [TimedLyricLine]? {
         guard rawLines.count >= 2, words.count >= 3 else { return nil }
-        var cursor = 0
-        var timed: [TimedLyricLine] = []
-        for line in rawLines {
+
+        var matches: [AlignmentMatch] = []
+        for (lineIndex, line) in rawLines.enumerated() {
             let lineTokens = tokens(line)
-            guard !lineTokens.isEmpty, cursor < words.count else { continue }
-            var best: (index: Int, length: Int, score: Double)?
-            let maximumStart = min(words.count - 1, cursor + 50)
-            for start in cursor...maximumStart {
-                let minimumLength = max(1, lineTokens.count - 2)
+            guard !lineTokens.isEmpty else { continue }
+            let minimumLength = max(1, lineTokens.count - 2)
+            var lineMatches: [AlignmentMatch] = []
+            for start in words.indices {
                 let maximumLength = min(words.count - start, lineTokens.count + 3)
                 guard minimumLength <= maximumLength else { continue }
                 for length in minimumLength...maximumLength {
-                    let recognized = words[start..<(start + length)].map(\.text).joined(separator: " ")
+                    let recognized = words[start..<(start + length)]
+                        .map(\.text)
+                        .joined(separator: " ")
                     let score = similarity(lineTokens, tokens(recognized))
-                    if score > (best?.score ?? 0) { best = (start, length, score) }
+                    guard score >= 0.42 else { continue }
+                    lineMatches.append(AlignmentMatch(
+                        lineIndex: lineIndex,
+                        startWord: start,
+                        endWord: start + length,
+                        score: score
+                    ))
                 }
             }
-            guard let best, best.score >= 0.45 else { continue }
-            timed.append(TimedLyricLine(time: words[best.index].startSeconds, text: line))
-            cursor = min(words.count, best.index + best.length)
+            lineMatches.sort {
+                if $0.score == $1.score { return $0.startWord < $1.startWord }
+                return $0.score > $1.score
+            }
+            matches.append(contentsOf: lineMatches.prefix(8))
         }
-        let recognizedCoverage = Double(cursor) / Double(words.count)
-        let lineCoverage = Double(timed.count) / Double(rawLines.count)
-        guard timed.count >= 2,
-              recognizedCoverage >= 0.55 || lineCoverage >= 0.55 else { return nil }
-        return timed
+        guard !matches.isEmpty else { return nil }
+        matches.sort {
+            if $0.lineIndex == $1.lineIndex { return $0.startWord < $1.startWord }
+            return $0.lineIndex < $1.lineIndex
+        }
+
+        var states = Array(
+            repeating: AlignmentState(score: -.infinity, previousIndex: nil),
+            count: matches.count
+        )
+        for index in matches.indices {
+            let current = matches[index]
+            var bestScore = current.score * 1.6 + 0.12 - Double(current.lineIndex) * 0.10
+            var bestPrevious: Int?
+
+            if index > 0 {
+                for previousIndex in 0..<index {
+                    let previous = matches[previousIndex]
+                    guard previous.lineIndex < current.lineIndex,
+                          previous.endWord <= current.startWord,
+                          states[previousIndex].score.isFinite else { continue }
+                    let skippedLines = current.lineIndex - previous.lineIndex - 1
+                    let gapWords = current.startWord - previous.endWord
+                    let transitionScore = states[previousIndex].score
+                        + current.score * 1.6
+                        + 0.12
+                        - Double(skippedLines) * 0.12
+                        - Double(max(0, gapWords - 10)) * 0.002
+                    if transitionScore > bestScore {
+                        bestScore = transitionScore
+                        bestPrevious = previousIndex
+                    }
+                }
+            }
+            states[index] = AlignmentState(score: bestScore, previousIndex: bestPrevious)
+        }
+
+        guard let bestIndex = states.indices.max(by: { states[$0].score < states[$1].score }) else {
+            return nil
+        }
+        var path: [AlignmentMatch] = []
+        var cursor: Int? = bestIndex
+        while let index = cursor {
+            path.append(matches[index])
+            cursor = states[index].previousIndex
+        }
+        path.reverse()
+
+        let matchedLineCount = Set(path.map(\.lineIndex)).count
+        let lineCoverage = Double(matchedLineCount) / Double(rawLines.count)
+        let matchedWordCount = path.reduce(0) { $0 + max(0, $1.endWord - $1.startWord) }
+        let wordCoverage = min(1, Double(matchedWordCount) / Double(words.count))
+        guard matchedLineCount >= 2,
+              lineCoverage >= 0.45 || wordCoverage >= 0.35 else { return nil }
+
+        return path.map { match in
+            TimedLyricLine(
+                time: words[match.startWord].startSeconds,
+                text: rawLines[match.lineIndex]
+            )
+        }
     }
 
+    /// 根据多个句级匹配的中位数估计整体偏移；离散程度过大时拒绝自动使用。
     private static func estimatedOffset(
         segments: [BabyPlayerASRSegment],
         lines: [TimedLyricLine],
@@ -854,6 +898,7 @@ enum BabyPlayerLyricsSoundMatcher {
         return median
     }
 
+    /// 把文本转为大小写/变音无关的英文数字 token；无副作用。
     private static func tokens(_ text: String) -> [String] {
         text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
             .split { !$0.isLetter && !$0.isNumber }
@@ -861,11 +906,11 @@ enum BabyPlayerLyricsSoundMatcher {
             .filter { !$0.isEmpty }
     }
 
+    /// 计算 ASR 片段相对完整歌词的确定性覆盖分；以 ASR 片段为分母避免长歌词天然降分。
     static func similarity(_ lhs: [String], _ rhs: [String]) -> Double {
         guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
         let leftWords = Set(lhs)
         let rightWords = Set(rhs)
-        // ASR 只覆盖歌曲开头的一段，因此以 ASR 片段为分母，不因完整歌词更长而降分。
         let wordCoverage = Double(leftWords.intersection(rightWords).count)
             / Double(leftWords.count)
         let pairCoverage = ngramCoverage(query: lhs, reference: rhs, size: 2)
@@ -874,6 +919,7 @@ enum BabyPlayerLyricsSoundMatcher {
         return wordCoverage * 0.375 + pairCoverage * 0.375 + tripleCoverage * 0.25
     }
 
+    /// 计算 query 的相邻 n-gram 在 reference 中的覆盖率；无副作用。
     private static func ngramCoverage(
         query: [String],
         reference: [String],
@@ -955,5 +1001,4 @@ final class BabyPlayerAudioCacheViewModel: ObservableObject {
         let minutes = (seconds % 3600) / 60
         return "\(hours) 小时 \(minutes) 分"
     }
-
 }

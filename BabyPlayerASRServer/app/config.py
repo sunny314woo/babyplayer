@@ -1,3 +1,14 @@
+"""
+BabyPlayerASRServer/app/config.py
+
+用途：读取 BabyPlayer 独立 ASR 服务配置。
+主要功能：
+1. 读取独立 Bearer Token 与腾讯 ASR 配置。
+2. 固定月度额度、上传大小、并发与限流参数。
+3. 判断鉴权和腾讯 ASR 是否已完成配置。
+最近修改：2026-08-23 【MODIFIED】按冻结版本 B 删除 DeepSeek/LLM 配置，只保留腾讯 ASR。
+"""
+
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,22 +20,21 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 
 
+# 【MODIFIED】配置占位符检测只服务于 BabyPlayer Token 与腾讯 ASR Secret，不读取其他产品 Secret。
 def _placeholder(value: str) -> bool:
+    """判断配置值是否仍为空或为可提交的 XX 占位符；无副作用。"""
     normalized = value.strip().upper()
     return not normalized or normalized == "XX" or normalized.startswith("XX_")
 
 
 @dataclass(frozen=True)
 class Settings:
+    """BabyPlayer 独立 ASR 服务的只读配置集合。"""
+
     api_token: str = os.getenv("BABYPLAYER_API_TOKEN", "XX_BABYPLAYER_API_TOKEN")
     app_id: str = os.getenv("TENCENT_ASR_APP_ID", "XX_APP_ID")
     secret_id: str = os.getenv("TENCENT_ASR_SECRET_ID", "XX_SECRET_ID")
     secret_key: str = os.getenv("TENCENT_ASR_SECRET_KEY", "XX_SECRET_KEY")
-    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "XX_DEEPSEEK_API_KEY")
-    deepseek_endpoint: str = os.getenv(
-        "DEEPSEEK_ENDPOINT", "https://api.deepseek.com/chat/completions"
-    )
-    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
     endpoint: str = os.getenv("TENCENT_ASR_ENDPOINT", "https://asr.cloud.tencent.com")
     engine_type: str = os.getenv("TENCENT_ASR_ENGINE_TYPE", "16k_en")
     monthly_limit_seconds: int = int(
@@ -45,17 +55,15 @@ class Settings:
 
     @property
     def auth_enabled(self) -> bool:
+        """返回独立 BabyPlayer Bearer Token 是否可用；不修改配置。"""
         return not _placeholder(self.api_token)
 
     @property
     def provider_enabled(self) -> bool:
+        """返回腾讯 ASR 所需三项凭据是否均已配置；不显示任何 Secret。"""
         return not any(_placeholder(value) for value in (
             self.app_id, self.secret_id, self.secret_key,
         ))
-
-    @property
-    def lyrics_refiner_enabled(self) -> bool:
-        return not _placeholder(self.deepseek_api_key)
 
 
 settings = Settings()

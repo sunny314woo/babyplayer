@@ -1,0 +1,83 @@
+# Temporary branch verification for frozen ASR lyrics Version B.
+# 【MODIFIED】No production credentials are injected; tests use fake providers only.
+name: BabyPlayer Branch Verification
+
+on:
+  push:
+    branches:
+      - fix/asr-lyrics-deterministic-vb
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  server-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: BabyPlayerASRServer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install server dependencies
+        run: pip install -r requirements.txt
+      - name: Run all ASR server tests
+        run: python -m pytest -q -p no:cacheprovider
+
+  tvos-builds:
+    # 【MODIFIED】项目当前由 Xcode 26.x 开发；旧 Xcode 16.4 对既有 tvOS SwiftUI API 会误报 unavailable。
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select current Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcodebuild -project BabyPlayer.xcodeproj -list
+      - name: Build tvOS Simulator SDK
+        run: |
+          xcodebuild \
+            -project BabyPlayer.xcodeproj \
+            -scheme BabyPlayer \
+            -configuration Debug \
+            -sdk appletvsimulator \
+            -destination 'generic/platform=tvOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Build tvOS device SDK
+        run: |
+          xcodebuild \
+            -project BabyPlayer.xcodeproj \
+            -scheme BabyPlayer \
+            -configuration Debug \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Resolve tvOS Simulator
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes
+          xcrun simctl list devices available
+          UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(item["udid"] for runtime,items in d.items() if "tvOS" in runtime for item in items if item.get("isAvailable")))')
+          echo "TVOS_SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
+      - name: Run BabyPlayer unit tests
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project BabyPlayer.xcodeproj \
+            -scheme BabyPlayer \
+            -configuration Debug \
+            -destination "id=$TVOS_SIMULATOR_UDID" \
+            -parallel-testing-enabled NO \
+            -only-testing:BabyPlayerTests/LyricsAndASRTests \
+            CODE_SIGNING_ALLOWED=NO \
+            test
