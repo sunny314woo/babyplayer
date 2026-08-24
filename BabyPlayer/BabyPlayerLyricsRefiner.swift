@@ -8,20 +8,8 @@
 import CryptoKit
 import Foundation
 
-private struct LyricsRefinerConfiguration {
-    let baseURL: URL
-    let apiToken: String
-
-    static func load() throws -> LyricsRefinerConfiguration {
-        let rawURL = Bundle.main.object(forInfoDictionaryKey: "BabyPlayerASRBaseURL") as? String ?? ""
-        let token = Bundle.main.object(forInfoDictionaryKey: "BabyPlayerASRAPIToken") as? String ?? ""
-        guard let baseURL = URL(string: rawURL), baseURL.scheme == "https",
-              !token.isEmpty, !token.uppercased().hasPrefix("XX_") else {
-            throw BabyPlayerASRError.notConfigured
-        }
-        return LyricsRefinerConfiguration(baseURL: baseURL, apiToken: token)
-    }
-}
+// 【MODIFIED】DeepSeek 和 ASR 必须共用同一份 Debug/Release 服务地址规则。
+private typealias LyricsRefinerConfiguration = BabyPlayerServiceConfiguration
 
 // 【MODIFIED】请求以 AI v1 原始行和确定性对齐证据为中心，不再要求模型重建 ASR segments。
 private struct LyricsRefinerRequest: Encodable {

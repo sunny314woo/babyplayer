@@ -21,6 +21,15 @@ def _boolean(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _path_list(name: str) -> tuple[str, ...]:
+    """读取由系统路径分隔符连接的目录列表；空值代表不允许本地文件分析。"""
+    return tuple(
+        value.strip()
+        for value in os.getenv(name, "").split(os.pathsep)
+        if value.strip()
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     api_token: str = os.getenv("BABYPLAYER_API_TOKEN", "XX_BABYPLAYER_API_TOKEN")
@@ -55,10 +64,30 @@ class Settings:
         os.getenv("TENCENT_ASR_REQUESTS_PER_MINUTE", "3")
     )
     analysis_version: str = os.getenv("ASR_ANALYSIS_VERSION", "babyplayer-asr-v1")
+    asr_timeline_version: str = os.getenv(
+        "ASR_TIMELINE_VERSION", "mac-chunked-60s-overlap-5s-v1"
+    )
     database_path: str = os.getenv(
         "DATABASE_PATH", str(BASE_DIR / "babyplayer-asr.sqlite3")
     )
     product_env: str = os.getenv("PRODUCT_ENV", "development")
+    development_artifacts_directory: str = os.getenv(
+        "DEVELOPMENT_ARTIFACTS_DIRECTORY", ""
+    )
+    # 【MODIFIED】Mac 本地分析只允许读取显式白名单目录，不开放任意文件路径。
+    local_media_roots: tuple[str, ...] = _path_list("LOCAL_MEDIA_ROOTS")
+    local_ffmpeg_path: str = os.getenv(
+        "LOCAL_FFMPEG_PATH", "/Applications/Jellyfin.app/Contents/MacOS/ffmpeg"
+    )
+    local_extraction_timeout_seconds: float = float(
+        os.getenv("LOCAL_EXTRACTION_TIMEOUT_SECONDS", "180")
+    )
+    local_asr_chunk_seconds: float = float(
+        os.getenv("LOCAL_ASR_CHUNK_SECONDS", "60")
+    )
+    local_asr_chunk_overlap_seconds: float = float(
+        os.getenv("LOCAL_ASR_CHUNK_OVERLAP_SECONDS", "5")
+    )
 
     @property
     def auth_enabled(self) -> bool:

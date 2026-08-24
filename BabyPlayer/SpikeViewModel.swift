@@ -1,7 +1,7 @@
 //
 // SpikeViewModel.swift
 // BabyPlayer 产品状态：首次配对、持久授权、儿童首页和播放队列。
-// 最近修改：2026-08-22 增加本地喜欢、不喜欢、屏蔽记录和按喜好播放。
+// 最近修改：2026-08-24 将 Jellyfin 本机媒体路径随队列交给 Mac 本地歌词分析。
 //
 
 import Combine
@@ -75,6 +75,8 @@ struct BabyPlayerQueueItem: Identifiable {
     let title: String
     let url: URL
     let lyricsMedia: LyricsMediaDescriptor
+    /// 【MODIFIED】仅作为 Mac 开发服务的本机文件定位，不写日志、不用于 Apple TV 直接读取。
+    let localMediaPath: String?
     let chapterIntroEndSeconds: Double?
     let chapterOutroStartSeconds: Double?
 }
@@ -565,6 +567,7 @@ final class SpikeViewModel: ObservableObject {
                     songStartSeconds: inferredSongStart,
                     songEndSeconds: inferredSongEnd
                 ),
+                localMediaPath: item.path,
                 chapterIntroEndSeconds: markers.introEnd,
                 chapterOutroStartSeconds: markers.outroStart
             )

@@ -6,6 +6,8 @@
 // 最近修改：2026-08-23 验证 AI 进度卡会展示完整的 ASR、时间轴和字幕内容里程碑。
 // 最近修改：2026-08-23 覆盖单曲循环退避与片头边界不得导致音频导出作废。
 // 最近修改：2026-08-23 冻结 ASR 临时分段、全局时间戳合并、首段早停与同 fingerprint 任务复用行为。
+// 最近修改：2026-08-24 覆盖 Apple TV 遥控器中间键的播放/暂停决策。
+// 最近修改：2026-08-24 覆盖 Apple TV 只提交 Mac 本机路径、不上传音频的任务合同。
 //
 
 import Foundation
@@ -13,6 +15,148 @@ import XCTest
 @testable import BabyPlayer
 
 final class LyricsAndASRTests: XCTestCase {
+    /// 播放器倍速菜单包含用于快速检查字幕的 3×，默认仍为正常 1×。
+    func testPlaybackRateMenuUsesRequestedRatesIncludingThreeTimes() {
+        XCTAssertEqual(BabyPlayerPlaybackRatePolicy.availableRates, [0.8, 1, 1.5, 2, 3])
+        XCTAssertEqual(BabyPlayerPlaybackRatePolicy.defaultRate, 1)
+        XCTAssertEqual(BabyPlayerPlaybackRatePolicy.normalized(0.82), 0.8)
+        XCTAssertEqual(BabyPlayerPlaybackRatePolicy.normalized(1.8), 2)
+        XCTAssertEqual(BabyPlayerPlaybackRatePolicy.title(for: 1.5), "1.5×")
+        XCTAssertEqual(BabyPlayerPlaybackRatePolicy.title(for: 3), "3×")
+    }
+
+    /// 验证中间键对播放、缓冲和暂停状态的决策；不启动真实播放器。
+    // 【MODIFIED】缓冲中仍视为“正在尝试播放”，再按中间键必须暂停。
+    func testCenterPressTogglesPlaybackAndPause() {
+        XCTAssertEqual(
+            BabyPlayerPlaybackTogglePolicy.action(timeControlStatus: .playing, rate: 1),
+            .pause
+        )
+        XCTAssertEqual(
+            BabyPlayerPlaybackTogglePolicy.action(
+                timeControlStatus: .waitingToPlayAtSpecifiedRate,
+                rate: 0
+            ),
+            .pause
+        )
+        XCTAssertEqual(
+            BabyPlayerPlaybackTogglePolicy.action(timeControlStatus: .paused, rate: 0),
+            .play
+        )
+    }
+
+    /// 【MODIFIED】ASR 已返回后的文件错误必须明确显示为保存失败，避免误判腾讯识别失败。
+    func testASRPostProcessingErrorIdentifiesPersistenceFailure() {
+        let error = NSError(domain: NSCocoaErrorDomain, code: 513)
+
+        XCTAssertEqual(
+            BabyPlayerAnalysisErrorPresentation.message(error, fallback: "ASR 处理失败"),
+            "ASR 已完成，但结果保存失败（513）"
+        )
+    }
+
+    /// 腾讯长 segment 必须按词级时间拆成电视可读短行，不能把一分钟文字铺满屏幕。
+    func testRawASRCandidateSplitsLongTencentSegmentForTVReadability() throws {
+        let words = (0..<25).map {
+            makeWord("word\($0)", at: Double($0) * 0.35)
+        }
+        let analysis = makeAnalysis(segments: [BabyPlayerASRSegment(
+            text: words.map(\.text).joined(separator: " "),
+            startSeconds: 0,
+            endSeconds: 9,
+            words: words
+        )])
+
+        let candidate = try analysis.lyricsCandidate(
+            title: "Long ASR",
+            mediaFingerprint: "test-fingerprint"
+        )
+
+        XCTAssertGreaterThan(candidate.lines.count, 3)
+        XCTAssertTrue(candidate.lines.allSatisfy { $0.text.split(separator: " ").count <= 6 })
+        XCTAssertTrue(candidate.lines.allSatisfy { $0.text.count <= 30 })
+        XCTAssertTrue(candidate.lines.allSatisfy {
+            ($0.endTime ?? $0.time) - $0.time <= 3.2 + 0.0001
+        })
+        XCTAssertEqual(candidate.lines.first?.time ?? -1, 0, accuracy: 0.0001)
+        XCTAssertEqual(candidate.lines.last?.endTime ?? -1, 8.7, accuracy: 0.0001)
+    }
+
+    /// 腾讯缺少 word timeline 时也不得把整分钟 segment 当成一条字幕。
+    func testRawASRFallbackDistributesUntimedSegmentIntoMovingShortLines() throws {
+        let text = (0..<18).map { "word\($0)" }.joined(separator: " ")
+        let analysis = makeAnalysis(segments: [BabyPlayerASRSegment(
+            text: text,
+            startSeconds: 0,
+            endSeconds: 18,
+            words: []
+        )])
+
+        let candidate = try analysis.lyricsCandidate(
+            title: "Untimed ASR",
+            mediaFingerprint: "untimed-test-fingerprint"
+        )
+
+        XCTAssertGreaterThan(candidate.lines.count, 1)
+        XCTAssertTrue(candidate.lines.allSatisfy { $0.text.split(separator: " ").count <= 6 })
+        XCTAssertTrue(candidate.lines.allSatisfy { $0.text.count <= 30 })
+        XCTAssertTrue(candidate.lines.allSatisfy {
+            ($0.endTime ?? $0.time) - $0.time <= 3.2 + 0.0001
+        })
+        XCTAssertEqual(candidate.lines.first?.time ?? -1, 0, accuracy: 0.0001)
+        XCTAssertEqual(candidate.lines.last?.endTime ?? -1, 18, accuracy: 0.0001)
+    }
+
+    /// 同一原视频改用完整分片时间线后，旧 DeepSeek 映射必须被判定为过期。
+    func testASREvidenceHashIncludesWordTimelineForSameSourceVideo() {
+        let first = makeAnalysis(
+            segments: [BabyPlayerASRSegment(
+                text: "round and round",
+                startSeconds: 1,
+                endSeconds: 2,
+                words: [makeWord("round", at: 1), makeWord("round", at: 1.6)]
+            )],
+            audioContentHash: "same-audio",
+            mediaContentHash: "same-video"
+        )
+        let extended = makeAnalysis(
+            segments: [BabyPlayerASRSegment(
+                text: "round and round again",
+                startSeconds: 1,
+                endSeconds: 3,
+                words: [
+                    makeWord("round", at: 1),
+                    makeWord("round", at: 1.6),
+                    makeWord("again", at: 2.4)
+                ]
+            )],
+            audioContentHash: "same-audio",
+            mediaContentHash: "same-video"
+        )
+
+        XCTAssertNotEqual(first.evidenceHash, extended.evidenceHash)
+    }
+
+    /// 【MODIFIED】在物理 Apple TV 的真实 App 容器写入探针，冻结 tvOS 可写目录边界。
+    func testDurableLyricsDirectoryIsInsideWritableAppContainer() throws {
+        let fileManager = FileManager.default
+        let root = BabyPlayerLyricsStoragePolicy.writableStorageBase(
+            fileManager: fileManager
+        ).appendingPathComponent("BabyPlayerLyrics", isDirectory: true)
+        let probe = root.appendingPathComponent(
+            "BabyPlayer-Write-Probe-" + UUID().uuidString
+        )
+
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        XCTAssertTrue(fileManager.createFile(
+            atPath: probe.path,
+            contents: Data("probe".utf8)
+        ))
+
+        XCTAssertTrue(fileManager.fileExists(atPath: probe.path))
+        XCTAssertTrue(root.path.contains("/Library/Caches/BabyPlayerLyrics"))
+    }
+
     /// 验证 MVP 对 2–3 分钟媒体只生成一个整首窗口；输入为 170 秒视频及片头片尾，输出 160 秒连续范围，不执行分片。
     // 【MODIFIED】当前生产验收以临时整首 M4A 为准，60 秒分片留待以后。
     func testMVPUsesOneTemporaryWholeSongWindow() {
@@ -45,7 +189,10 @@ final class LyricsAndASRTests: XCTestCase {
 
         let capture = BabyPlayerMockRequestCapture()
         BabyPlayerMockURLProtocol.setHandler { request in
-            capture.record(request)
+            let body = request.httpMethod == "POST"
+                ? try requestBodyData(request)
+                : Data()
+            capture.record(request, body: body)
             let response = HTTPURLResponse(
                 url: request.url!,
                 statusCode: 200,
@@ -70,14 +217,91 @@ final class LyricsAndASRTests: XCTestCase {
         let analysis = try await client.analyze(
             sampleURL: temporaryURL,
             durationSeconds: 160,
-            mediaFingerprint: "mock-media-fingerprint"
+            mediaFingerprint: "mock-media-fingerprint",
+            mediaTitle: "Mock Song",
+            forceRefresh: true
         )
 
         XCTAssertEqual(capture.method, "POST")
         XCTAssertEqual(capture.path, "/v1/analyze")
         XCTAssertEqual(capture.authorization, "Bearer mock-token")
+        XCTAssertTrue(capture.bodyText.contains("name=\"force_refresh\"\r\n\r\ntrue"))
+        XCTAssertTrue(capture.bodyText.contains("name=\"media_title\"\r\n\r\nMock Song"))
         XCTAssertEqual(analysis.transcript, "twinkle little star")
         XCTAssertEqual(analysis.segments.first?.words.first?.startSeconds, 1.2)
+    }
+
+    /// 验证本地开发链路只提交路径 JSON 并轮询小结果；不会构造 multipart 或上传音频。
+    // 【MODIFIED】Mac 负责读取原视频、提取音频和等待腾讯 ASR。
+    func testMacLocalAnalysisSubmitsPathAndPollsResultWithoutAudioUpload() async throws {
+        let capture = BabyPlayerMockRequestCapture()
+        BabyPlayerMockURLProtocol.setHandler { request in
+            let body = request.httpMethod == "POST"
+                ? try requestBodyData(request)
+                : Data()
+            capture.record(request, body: body)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            if request.httpMethod == "POST" {
+                return (response, Data(#"{"job_id":"local-job-1","status":"queued","message":"任务已提交到 Mac"}"#.utf8))
+            }
+            let payload = Data(#"{"job_id":"local-job-1","status":"completed","message":"识别完成","analysis":{"status":"completed","cache_hit":false,"provider":"mock","engine_type":"16k_en","audio_duration_seconds":155,"transcript":"rain rain go away","segments":[{"text":"rain rain go away","start_seconds":0.2,"end_seconds":2.1,"words":[]}],"monthly_used_seconds":155,"monthly_reserved_seconds":0,"monthly_limit_seconds":18000,"audio_sha256":"audio-content-hash","media_content_sha256":"video-content-hash"}}"#.utf8)
+            return (response, payload)
+        }
+        defer { BabyPlayerMockURLProtocol.setHandler(nil) }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BabyPlayerMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        let client = BabyPlayerASRClient(
+            baseURL: URL(string: "http://192.168.3.33:8011/v1")!,
+            apiToken: "mock-token",
+            session: session
+        )
+        let media = LyricsMediaDescriptor(
+            id: "rain",
+            title: "Rain Rain Go Away",
+            searchTitle: "Rain Rain Go Away",
+            artistName: nil,
+            sourceHint: nil,
+            versionHint: nil,
+            durationSeconds: 155,
+            songStartSeconds: 0,
+            songEndSeconds: 155,
+            mediaSourceID: "rain-source"
+        )
+
+        let submitted = try await client.submitLocalAnalysis(
+            mediaPath: "/Users/test/Music/Rain Rain Go Away.mp4",
+            media: media,
+            mediaFingerprint: "rain-local-fingerprint",
+            mediaTitle: "Rain Rain Go Away",
+            forceRefresh: true
+        )
+        let completed = try await client.localAnalysisJob(id: submitted.jobID)
+
+        XCTAssertEqual(capture.methods, ["POST", "GET"])
+        XCTAssertEqual(capture.paths, [
+            "/v1/local-analysis/jobs",
+            "/v1/local-analysis/jobs/local-job-1"
+        ])
+        let body = try XCTUnwrap(capture.bodyTexts.first)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(json["media_path"] as? String, "/Users/test/Music/Rain Rain Go Away.mp4")
+        XCTAssertNil(json["audio"])
+        XCTAssertFalse(body.contains("multipart/form-data"))
+        XCTAssertEqual(completed.analysis?.transcript, "rain rain go away")
+        XCTAssertEqual(completed.analysis?.audioContentHash, "audio-content-hash")
+        XCTAssertEqual(completed.analysis?.mediaContentHash, "video-content-hash")
+        XCTAssertFalse(completed.analysis?.evidenceHash.isEmpty ?? true)
+        XCTAssertNotEqual(completed.analysis?.evidenceHash, "video-content-hash")
     }
 
     /// 验证 ASR 计划只包含临时短分段；输入为 320 秒歌曲，输出为多个不超过集中时长的 segment，不修改状态。
@@ -89,6 +313,22 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertTrue(segments.allSatisfy { $0.durationSeconds <= BabyPlayerASRSegmentPolicy.durationSeconds })
         XCTAssertTrue(segments.allSatisfy(\.isTemporary))
         XCTAssertEqual(segments.first?.startSeconds, 0)
+    }
+
+    // 【MODIFIED】Debug 只开放回环与 RFC1918/.local HTTP，公网明文地址必须拒绝。
+    func testDebugLocalServiceURLPolicyRejectsPublicPlainHTTP() {
+        XCTAssertTrue(BabyPlayerServiceConfiguration.isAllowed(
+            URL(string: "http://192.168.3.33:8011/v1")!
+        ))
+        XCTAssertTrue(BabyPlayerServiceConfiguration.isAllowed(
+            URL(string: "http://babyplayer.local:8011/v1")!
+        ))
+        XCTAssertFalse(BabyPlayerServiceConfiguration.isAllowed(
+            URL(string: "http://203.0.113.10:8011/v1")!
+        ))
+        XCTAssertTrue(BabyPlayerServiceConfiguration.isAllowed(
+            URL(string: "https://player.example.test/v1")!
+        ))
     }
 
     /// 验证第一段可独立成为一次识别工作；输入为 150 秒歌曲，输出第一段元数据，不依赖后续 segment 或完整音频状态。
@@ -299,7 +539,8 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertFalse(guardState.permitsAutomaticResult(startedAt: automaticGeneration))
     }
 
-    func testFirstCandidateIsDefaultAndPersists() async throws {
+    // 【MODIFIED】普通候选可默认显示，但未经家长固定不得永久绑定。
+    func testFirstCandidateIsTemporaryUntilExplicitlyPinned() async throws {
         let storage = try makeStorage()
         defer { try? FileManager.default.removeItem(at: storage) }
         let repository = makeRepository(storage)
@@ -314,8 +555,104 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(playback?.isConfirmed, false)
         let reloaded = makeRepository(storage)
         let stored = await reloaded.storedLyrics(for: media)
-        XCTAssertEqual(stored?.candidateID, first.id)
-        XCTAssertEqual(stored?.isConfirmed, false)
+        XCTAssertNil(stored)
+    }
+
+    // 【MODIFIED】分析结果必须持久保留，但保存本身不得替换当前默认歌词。
+    func testStoredAnalysisResultSurvivesReloadWithoutChangingPinnedLyrics() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let repository = makeRepository(storage)
+        let media = makeMedia()
+        let ordinary = makeCandidate(id: 1, title: "Ordinary", words: "one two three four")
+        let analyzed = makeCandidate(id: -10, title: "ASR", words: "five six seven eight")
+        let pinned = await repository.playback(for: ordinary, media: media, selectionOrigin: .manual)
+        _ = try await repository.confirm(pinned, for: media)
+
+        _ = try await repository.storeASRResult(
+            analyzed,
+            asrEvidenceHash: "audio-hash-1",
+            for: media
+        )
+
+        let reloaded = makeRepository(storage)
+        let bundle = await reloaded.analysisBundle(for: media)
+        let stillPinned = await reloaded.storedLyrics(for: media)
+        XCTAssertEqual(bundle?.asrResult?.candidate.id, analyzed.id)
+        XCTAssertEqual(bundle?.asrResult?.asrEvidenceHash, "audio-hash-1")
+        XCTAssertEqual(bundle?.pinnedOrdinaryPlayback?.candidateID, ordinary.id)
+        XCTAssertEqual(stillPinned?.candidateID, ordinary.id)
+        XCTAssertEqual(stillPinned?.selectionOrigin, .manual)
+
+        let adopted = await reloaded.playback(for: analyzed, media: media, selectionOrigin: .asr)
+        _ = try await reloaded.confirm(adopted, for: media)
+        let afterAdoption = await reloaded.analysisBundle(for: media)
+        let preferred = await reloaded.storedLyrics(for: media)
+        XCTAssertEqual(afterAdoption?.pinnedOrdinaryPlayback?.candidateID, ordinary.id)
+        XCTAssertEqual(preferred?.candidateID, analyzed.id)
+        XCTAssertEqual(preferred?.selectionOrigin, .asr)
+    }
+
+    /// ASR 和 DeepSeek 并列保留，用户可在两份字幕之间分别采用。
+    func testASRAndDeepSeekResultsCanBeAdoptedIndependently() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let repository = makeRepository(storage)
+        let media = makeMedia()
+        let asr = makeCandidate(id: -10, title: "ASR", words: "raw transcript line")
+        let deepSeek = makeCandidate(id: -11, title: "DeepSeek", words: "calibrated lyric line")
+        _ = try await repository.storeASRResult(asr, asrEvidenceHash: "same-evidence", for: media)
+        let bundle = try await repository.storeDeepSeekResult(
+            deepSeek,
+            asrEvidenceHash: "same-evidence",
+            for: media
+        )
+
+        XCTAssertEqual(bundle.result(for: .asr)?.candidate.id, asr.id)
+        XCTAssertEqual(bundle.result(for: .deepSeek)?.candidate.id, deepSeek.id)
+
+        let asrPlayback = await repository.playback(for: asr, media: media, selectionOrigin: .asr)
+        _ = try await repository.confirm(asrPlayback, for: media)
+        let adoptedASR = await repository.storedLyrics(for: media)
+        XCTAssertEqual(adoptedASR?.candidateID, asr.id)
+
+        let deepSeekPlayback = await repository.playback(
+            for: deepSeek,
+            media: media,
+            selectionOrigin: .asr
+        )
+        _ = try await repository.confirm(deepSeekPlayback, for: media)
+        let adoptedDeepSeek = await repository.storedLyrics(for: media)
+        XCTAssertEqual(adoptedDeepSeek?.candidateID, deepSeek.id)
+        let reloaded = makeRepository(storage)
+        let reloadedBundle = await reloaded.analysisBundle(for: media)
+        XCTAssertNotNil(reloadedBundle?.asrResult)
+        XCTAssertNotNil(reloadedBundle?.deepSeekResult)
+    }
+
+    // 【MODIFIED】重新 ASR 产生不同证据时，基于旧证据的 DeepSeek 结果不得继续可采用。
+    func testNewASREvidenceInvalidatesStoredDeepSeekResult() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let repository = makeRepository(storage)
+        let media = makeMedia()
+        let asr = makeCandidate(id: -10, title: "ASR", words: "one two three four")
+        let deepSeek = makeCandidate(id: -11, title: "AI", words: "one two three four")
+        _ = try await repository.storeASRResult(asr, asrEvidenceHash: "hash-1", for: media)
+        _ = try await repository.storeDeepSeekResult(
+            deepSeek,
+            asrEvidenceHash: "hash-1",
+            for: media
+        )
+
+        let updated = try await repository.storeASRResult(
+            asr,
+            asrEvidenceHash: "hash-2",
+            for: media
+        )
+
+        XCTAssertNotNil(updated.asrResult)
+        XCTAssertNil(updated.deepSeekResult)
     }
 
     func testManualBindingCannotBeOverwrittenByASRRecommendation() async throws {
@@ -477,7 +814,9 @@ final class LyricsAndASRTests: XCTestCase {
             )],
             monthlyUsedSeconds: 10,
             monthlyReservedSeconds: 0,
-            monthlyLimitSeconds: 18_000
+            monthlyLimitSeconds: 18_000,
+            audioContentHash: nil,
+            mediaContentHash: nil
         )
 
         let outcome = BabyPlayerLyricsSoundMatcher.match(
@@ -894,6 +1233,43 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertFalse(result.webSearchUsed)
     }
 
+    /// 没有下载歌词时仍会发送歌曲名和空候选列表，由 Mac 用已缓存 ASR 整理时间线。
+    func testD3ReconcilerAllowsASROnlyRequestWithoutDownloadedLyrics() async throws {
+        BabyPlayerMockURLProtocol.setHandler { request in
+            let body = try requestBodyData(request)
+            let json = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: body) as? [String: Any]
+            )
+            XCTAssertEqual(json["song_title"] as? String, "Baby Shark")
+            XCTAssertEqual((json["candidates"] as? [[String: Any]])?.count, 0)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            let payload = Data(#"{"status":"completed","cache_hit":false,"model":"deepseek-v4-flash","reconciliation_version":"babyplayer-lyrics-d3-v1","song_match_confidence":0.86,"primary_source":"asr_only","web_search_used":false,"lines":[{"text":"Baby shark doo doo doo doo doo doo","asr_word_start_index":0,"asr_word_end_index":7,"start_seconds":1.0,"end_seconds":3.4,"source":"asr_only","source_line_ids":[],"confidence":0.9,"text_corrected":false},{"text":"Baby shark","asr_word_start_index":8,"asr_word_end_index":9,"start_seconds":3.5,"end_seconds":4.1,"source":"asr_only","source_line_ids":[],"confidence":0.88,"text_corrected":false}],"discarded_lines":[]}"#.utf8)
+            return (response, payload)
+        }
+        defer { BabyPlayerMockURLProtocol.setHandler(nil) }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BabyPlayerMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        let result = try await BabyPlayerLyricsReconcilerClient(session: session).reconcile(
+            songTitle: "Baby Shark",
+            mediaFingerprint: "baby-shark-media-fingerprint",
+            candidates: []
+        )
+
+        XCTAssertEqual(result.candidate.lines.count, 2)
+        XCTAssertEqual(result.candidate.lines.map(\.time), [1.0, 3.5])
+        XCTAssertEqual(result.candidate.providerName, "AI 证据歌词")
+        XCTAssertEqual(result.confidence, 0.86)
+    }
+
     /// 验证全局单调 alignment 会跳过孤立的重复前奏；输入是含额外首句的重复副歌，输出是连续完整副歌的时间轴，不修改状态。
     // 【MODIFIED】Version C 要求整首歌全局优化，不允许 cursor + local-window greedy。
     func testRepeatedChorusUsesGlobalMonotonicAlignment() {
@@ -935,7 +1311,9 @@ final class LyricsAndASRTests: XCTestCase {
             )],
             monthlyUsedSeconds: 10,
             monthlyReservedSeconds: 0,
-            monthlyLimitSeconds: 18_000
+            monthlyLimitSeconds: 18_000,
+            audioContentHash: nil,
+            mediaContentHash: nil
         )
 
         let outcome = BabyPlayerLyricsSoundMatcher.match(
@@ -1046,7 +1424,11 @@ final class LyricsAndASRTests: XCTestCase {
         BabyPlayerASRWord(text: text, startSeconds: start, endSeconds: start + 0.3)
     }
 
-    private func makeAnalysis(segments: [BabyPlayerASRSegment]) -> BabyPlayerASRAnalysis {
+    private func makeAnalysis(
+        segments: [BabyPlayerASRSegment],
+        audioContentHash: String? = nil,
+        mediaContentHash: String? = nil
+    ) -> BabyPlayerASRAnalysis {
         BabyPlayerASRAnalysis(
             status: "completed",
             cacheHit: false,
@@ -1057,7 +1439,9 @@ final class LyricsAndASRTests: XCTestCase {
             segments: segments,
             monthlyUsedSeconds: 10,
             monthlyReservedSeconds: 0,
-            monthlyLimitSeconds: 18_000
+            monthlyLimitSeconds: 18_000,
+            audioContentHash: audioContentHash,
+            mediaContentHash: mediaContentHash
         )
     }
 
@@ -1096,18 +1480,30 @@ private final class BabyPlayerMockRequestCapture: @unchecked Sendable {
     private var storedMethod: String?
     private var storedPath: String?
     private var storedAuthorization: String?
+    private var storedBodyText = ""
+    private var storedMethods: [String] = []
+    private var storedPaths: [String] = []
+    private var storedBodyTexts: [String] = []
 
-    func record(_ request: URLRequest) {
+    func record(_ request: URLRequest, body: Data = Data()) {
         lock.withLock {
             storedMethod = request.httpMethod
             storedPath = request.url?.path
             storedAuthorization = request.value(forHTTPHeaderField: "Authorization")
+            storedBodyText = String(decoding: body, as: UTF8.self)
+            storedMethods.append(request.httpMethod ?? "")
+            storedPaths.append(request.url?.path ?? "")
+            storedBodyTexts.append(String(decoding: body, as: UTF8.self))
         }
     }
 
     var method: String? { lock.withLock { storedMethod } }
     var path: String? { lock.withLock { storedPath } }
     var authorization: String? { lock.withLock { storedAuthorization } }
+    var bodyText: String { lock.withLock { storedBodyText } }
+    var methods: [String] { lock.withLock { storedMethods } }
+    var paths: [String] { lock.withLock { storedPaths } }
+    var bodyTexts: [String] { lock.withLock { storedBodyTexts } }
 }
 
 /// 截获 URLSession 请求并返回本地 JSON；不会访问真实 VPS 或 Tencent。

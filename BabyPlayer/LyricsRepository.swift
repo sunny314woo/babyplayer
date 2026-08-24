@@ -3,6 +3,7 @@
 // BabyPlayer 歌词候选、本地绑定和时间偏移。
 // 当前主要功能：搜索与缓存候选、稳定默认绑定、每歌词独立校时及人工优先持久化。
 // 最近修改：2026-08-23 引入不依赖时间戳的 persistentIdentifier v2 和 v1 timing fallback。
+// 最近修改：2026-08-24 持久保留人工触发的 ASR/DeepSeek 结果，分析完成不再自动替换当前歌词。
 //
 
 import CryptoKit
@@ -174,6 +175,65 @@ struct LyricsCandidate: Codable, Identifiable, Sendable {
     }
 }
 
+// 【MODIFIED】分析阶段与普通候选来源分开，禁止再用 selectionOrigin 或展示文案推断。
+enum LyricsAnalysisSource: String, Codable, Equatable, Sendable {
+    case asr
+    case deepSeek
+
+    var displayName: String {
+        switch self {
+        case .asr: return "腾讯 ASR"
+        case .deepSeek: return "DeepSeek 校准"
+        }
+    }
+}
+
+/// 一份可重复采用的分析歌词；输入来源、候选和证据哈希，输出可持久记录，不修改当前播放选择。
+struct StoredLyricsAnalysisResult: Codable, Sendable {
+    let source: LyricsAnalysisSource
+    let candidate: LyricsCandidate
+    let lyricsContentHash: String
+    let asrEvidenceHash: String
+    let createdAt: Date
+}
+
+/// 一首媒体的 ASR/DeepSeek 并列结果；两者可同时保留，只有人工“采用”才会另外写入默认歌词 binding。
+struct StoredLyricsAnalysisBundle: Codable, Sendable {
+    let mediaID: String
+    let mediaFingerprint: String
+    let mediaSourceID: String?
+    let mediaTitle: String
+    var pinnedOrdinaryPlayback: LyricsPlayback?
+    var asrResult: StoredLyricsAnalysisResult?
+    var deepSeekResult: StoredLyricsAnalysisResult?
+    var updatedAt: Date
+
+    func result(for source: LyricsAnalysisSource) -> StoredLyricsAnalysisResult? {
+        switch source {
+        case .asr: return asrResult
+        case .deepSeek: return deepSeekResult
+        }
+    }
+
+    var bestAvailableResult: StoredLyricsAnalysisResult? {
+        deepSeekResult ?? asrResult
+    }
+}
+
+// 【MODIFIED】歌词哈希用于去重和标识采用版本，不代替媒体内容哈希。
+enum LyricsContentHash {
+    /// 对规范化时间轴生成 SHA256；输入候选与来源，输出稳定摘要，不修改文件或 UI。
+    static func make(candidate: LyricsCandidate, source: LyricsAnalysisSource) -> String {
+        let lines = candidate.lines.map {
+            "\(String(format: "%.3f", $0.time))|\(String(format: "%.3f", $0.endTime ?? $0.time))|\($0.text)"
+        }.joined(separator: "\n")
+        let raw = "babyplayer-analyzed-lyrics-v1|\(source.rawValue)|\(lines)"
+        return SHA256.hash(data: Data(raw.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
 private enum LyricsIdentity {
     // 【MODIFIED】v2 仅使用稳定来源和规范文本；AI anchor 让文本有限修复不改 identity。
     /// 生成 v2 identity；输入为稳定来源、candidate ID、规范文本和可选 AI anchor，输出为摘要字符串，不修改状态。
@@ -314,7 +374,7 @@ enum LyricsSelectionOrigin: String, Codable, Equatable, Sendable {
     case manual
 }
 
-struct LyricsPlayback: Sendable {
+struct LyricsPlayback: Codable, Sendable {
     static let maximumOffsetSeconds: Double = 600
 
     let candidateID: Int
@@ -453,7 +513,19 @@ private struct BundledLyricsTrack: Decodable {
     let syncedLyrics: String?
 }
 
-/// 未确认候选位于 Caches；家长确认的绑定位于 Application Support。
+/// tvOS 不允许 App 自行写入 Documents / Application Support；歌词文件保存在
+/// App 私有 Caches，Mac 本地分析服务保留可重建的权威 ASR 结果。
+enum BabyPlayerLyricsStoragePolicy {
+    static func writableStorageBase(
+        fileManager: FileManager = .default
+    ) -> URL {
+        fileManager.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        )[0]
+    }
+}
+
 actor BabyLyricsRepository {
     static let shared = BabyLyricsRepository()
 
@@ -463,6 +535,7 @@ actor BabyLyricsRepository {
     private let bundledCatalogData: Data?
     private var candidateMemoryCache: [String: [LyricsCandidate]] = [:]
     private var bindingMemoryCache: [String: LyricsBinding?] = [:]
+    private var analysisMemoryCache: [String: StoredLyricsAnalysisBundle?] = [:]
     private var bundledCatalogCache: [BundledLyricsTrack]?
 
     init(
@@ -496,8 +569,7 @@ actor BabyLyricsRepository {
             return playback(from: binding)
         }
 
-        // 候选已按确定性匹配分和 ID 排序；首次直接绑定第 1 个。
-        // 之后家长选择第 2/3 个时会覆盖这份绑定。
+        // 【MODIFIED】首份候选只作即时显示，不持久化为“已固定”，也不自动触发分析。
         guard let candidate = candidates.first else { return nil }
         let playback = LyricsPlayback(
             candidateID: candidate.id,
@@ -513,7 +585,6 @@ actor BabyLyricsRepository {
             lyricIdentifier: candidate.persistentIdentifier,
             providerName: candidate.providerName
         )
-        _ = try? confirm(playback, for: media)
         return playback
     }
 
@@ -538,11 +609,89 @@ actor BabyLyricsRepository {
             lines: candidate.lines,
             autoOffsetSeconds: adjustment.autoOffsetSeconds,
             manualAdjustmentSeconds: adjustment.manualAdjustmentSeconds,
-            isConfirmed: true,
+            isConfirmed: selectionOrigin != .manual,
             selectionOrigin: selectionOrigin,
             lyricIdentifier: identifier,
             providerName: candidate.providerName
         )
+    }
+
+    // 【MODIFIED】分析结果位于 Application Support，只有 App 卸载或确认媒体已删除时才清理。
+    /// 读取媒体的持久分析结果；输入媒体描述，输出 ASR/DeepSeek bundle，不改变默认歌词。
+    func analysisBundle(for media: LyricsMediaDescriptor) -> StoredLyricsAnalysisBundle? {
+        if let cached = analysisMemoryCache[media.id] { return cached }
+        if let exact = try? loadAnalysisBundleFromDisk(mediaID: media.id) {
+            analysisMemoryCache[media.id] = exact
+            return exact
+        }
+        if let fallback = try? loadAllAnalysisBundles().first(where: { stored in
+            let sourceMatches = media.mediaSourceID.map { $0 == stored.mediaSourceID } ?? false
+            return sourceMatches
+                || stored.mediaFingerprint == mediaFingerprint(for: media)
+                || stored.mediaFingerprint == legacyMediaFingerprint(for: media)
+        }) {
+            let migrated = StoredLyricsAnalysisBundle(
+                mediaID: media.id,
+                mediaFingerprint: mediaFingerprint(for: media),
+                mediaSourceID: media.mediaSourceID,
+                mediaTitle: media.title,
+                pinnedOrdinaryPlayback: fallback.pinnedOrdinaryPlayback,
+                asrResult: fallback.asrResult,
+                deepSeekResult: fallback.deepSeekResult,
+                updatedAt: Date()
+            )
+            try? saveAnalysisBundleToDisk(migrated)
+            analysisMemoryCache[media.id] = migrated
+            return migrated
+        }
+        analysisMemoryCache[media.id] = nil
+        return nil
+    }
+
+    /// 保存人工运行的 ASR 结果；新证据会使基于旧 ASR 的 DeepSeek 结果过期，不修改当前歌词。
+    @discardableResult
+    func storeASRResult(
+        _ candidate: LyricsCandidate,
+        asrEvidenceHash: String,
+        for media: LyricsMediaDescriptor
+    ) throws -> StoredLyricsAnalysisBundle {
+        var bundle = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
+        let result = StoredLyricsAnalysisResult(
+            source: .asr,
+            candidate: candidate,
+            lyricsContentHash: LyricsContentHash.make(candidate: candidate, source: .asr),
+            asrEvidenceHash: asrEvidenceHash,
+            createdAt: Date()
+        )
+        if bundle.asrResult?.asrEvidenceHash != asrEvidenceHash {
+            bundle.deepSeekResult = nil
+        }
+        bundle.asrResult = result
+        bundle.updatedAt = Date()
+        try saveAnalysisBundleToDisk(bundle)
+        analysisMemoryCache[media.id] = bundle
+        return bundle
+    }
+
+    /// 保存人工运行的 DeepSeek 结果；输入候选和所依赖 ASR 哈希，输出更新 bundle，不自动采用。
+    @discardableResult
+    func storeDeepSeekResult(
+        _ candidate: LyricsCandidate,
+        asrEvidenceHash: String,
+        for media: LyricsMediaDescriptor
+    ) throws -> StoredLyricsAnalysisBundle {
+        var bundle = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
+        bundle.deepSeekResult = StoredLyricsAnalysisResult(
+            source: .deepSeek,
+            candidate: candidate,
+            lyricsContentHash: LyricsContentHash.make(candidate: candidate, source: .deepSeek),
+            asrEvidenceHash: asrEvidenceHash,
+            createdAt: Date()
+        )
+        bundle.updatedAt = Date()
+        try saveAnalysisBundleToDisk(bundle)
+        analysisMemoryCache[media.id] = bundle
+        return bundle
     }
 
     /// Repository 层强制人工优先，避免未来新 UI 绕过播放器里的保护判断。
@@ -808,6 +957,13 @@ actor BabyLyricsRepository {
         )
         try saveBindingToDisk(binding)
         bindingMemoryCache[media.id] = binding
+        if playback.selectionOrigin == .manual {
+            var analysis = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
+            analysis.pinnedOrdinaryPlayback = playback
+            analysis.updatedAt = Date()
+            try saveAnalysisBundleToDisk(analysis)
+            analysisMemoryCache[media.id] = analysis
+        }
         return binding
     }
 
@@ -1133,11 +1289,46 @@ actor BabyLyricsRepository {
     }
 
     private func bindingsRoot(createDirectory: Bool = true) throws -> URL {
-        let base = applicationSupportDirectory
-            ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let base = try durableApplicationSupportRoot(
+            createDirectory: createDirectory
+        )
         let root = base
             .appendingPathComponent("BabyPlayerLyrics", isDirectory: true)
             .appendingPathComponent("Bindings", isDirectory: true)
+        if createDirectory {
+            try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+        return root
+    }
+
+    private func analysisRoot(createDirectory: Bool = true) throws -> URL {
+        let base = try durableApplicationSupportRoot(
+            createDirectory: createDirectory
+        )
+        let root = base
+            .appendingPathComponent("BabyPlayerLyrics", isDirectory: true)
+            .appendingPathComponent("AnalysisResults-v1", isDirectory: true)
+        if createDirectory {
+            try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+        return root
+    }
+
+    /// tvOS 真机仅允许这里使用 Caches；注入目录仍用于隔离单元测试。
+    /// 输入是否需要创建目录，输出 App 私有歌词目录；只在保存时创建目录。
+    private func durableApplicationSupportRoot(createDirectory: Bool) throws -> URL {
+        if let applicationSupportDirectory {
+            if createDirectory {
+                try fileManager.createDirectory(
+                    at: applicationSupportDirectory,
+                    withIntermediateDirectories: true
+                )
+            }
+            return applicationSupportDirectory
+        }
+        let root = BabyPlayerLyricsStoragePolicy.writableStorageBase(
+            fileManager: fileManager
+        )
         if createDirectory {
             try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
         }
@@ -1150,6 +1341,12 @@ actor BabyLyricsRepository {
 
     private func bindingURL(mediaID: String, createDirectory: Bool = true) throws -> URL {
         try bindingsRoot(createDirectory: createDirectory)
+            .appendingPathComponent(safeFileName(mediaID))
+            .appendingPathExtension("json")
+    }
+
+    private func analysisURL(mediaID: String, createDirectory: Bool = true) throws -> URL {
+        try analysisRoot(createDirectory: createDirectory)
             .appendingPathComponent(safeFileName(mediaID))
             .appendingPathExtension("json")
     }
@@ -1186,5 +1383,44 @@ actor BabyLyricsRepository {
     private func saveBindingToDisk(_ binding: LyricsBinding) throws {
         let data = try JSONEncoder().encode(binding)
         try data.write(to: bindingURL(mediaID: binding.mediaID), options: .atomic)
+    }
+
+    private func emptyAnalysisBundle(for media: LyricsMediaDescriptor) -> StoredLyricsAnalysisBundle {
+        StoredLyricsAnalysisBundle(
+            mediaID: media.id,
+            mediaFingerprint: mediaFingerprint(for: media),
+            mediaSourceID: media.mediaSourceID,
+            mediaTitle: media.title,
+            pinnedOrdinaryPlayback: nil,
+            asrResult: nil,
+            deepSeekResult: nil,
+            updatedAt: Date()
+        )
+    }
+
+    private func loadAnalysisBundleFromDisk(mediaID: String) throws -> StoredLyricsAnalysisBundle {
+        let data = try Data(contentsOf: analysisURL(mediaID: mediaID, createDirectory: false))
+        return try JSONDecoder().decode(StoredLyricsAnalysisBundle.self, from: data)
+    }
+
+    private func loadAllAnalysisBundles() throws -> [StoredLyricsAnalysisBundle] {
+        let root = try analysisRoot(createDirectory: false)
+        guard fileManager.fileExists(atPath: root.path) else { return [] }
+        return try fileManager.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ).compactMap { url in
+            guard url.pathExtension == "json",
+                  let data = try? Data(contentsOf: url) else { return nil }
+            return try? JSONDecoder().decode(StoredLyricsAnalysisBundle.self, from: data)
+        }
+    }
+
+    private func saveAnalysisBundleToDisk(_ bundle: StoredLyricsAnalysisBundle) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(bundle)
+        try data.write(to: analysisURL(mediaID: bundle.mediaID), options: .atomic)
     }
 }

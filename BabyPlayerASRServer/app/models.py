@@ -1,10 +1,10 @@
 """BabyPlayer ASR/usage 与 AI Lyrics limited-repair API 数据模型。
 
 当前主要功能：校验腾讯时间证据、用量响应、AI v1 原始行和逐行文本修复建议。
-最近修改：2026-08-23 将 /v1/refine 收紧为 Version C 结构化 repair contract。
+最近修改：2026-08-24 增加 Mac 本地媒体异步分析任务模型。
 """
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
@@ -36,6 +36,8 @@ class AsrAnalysisResponse(BaseModel):
     monthly_used_seconds: int
     monthly_reserved_seconds: int
     monthly_limit_seconds: int
+    audio_sha256: str | None = None
+    media_content_sha256: str | None = None
 
 
 class UsageResponse(BaseModel):
@@ -45,6 +47,39 @@ class UsageResponse(BaseModel):
     remaining_seconds: int
     limit_seconds: int
     next_reset_at: str
+
+
+class LocalAnalysisJobRequest(BaseModel):
+    """Apple TV 只提交媒体身份与 Mac 本机路径，不上传音频。"""
+
+    media_fingerprint: str = Field(min_length=8, max_length=512)
+    media_title: str = Field(default="", max_length=500)
+    media_path: str = Field(min_length=1, max_length=4096)
+    duration_seconds: float = Field(gt=0, le=86_400)
+    song_start_seconds: float = Field(default=0, ge=0, le=86_400)
+    song_end_seconds: float | None = Field(default=None, gt=0, le=86_400)
+    force_refresh: bool = False
+
+    @model_validator(mode="after")
+    def validate_song_window(self):
+        end = self.song_end_seconds or self.duration_seconds
+        if end > self.duration_seconds + 1:
+            raise ValueError("song end exceeds media duration")
+        if end <= self.song_start_seconds:
+            raise ValueError("song end must be after song start")
+        return self
+
+    @property
+    def analysis_duration_seconds(self) -> float:
+        return (self.song_end_seconds or self.duration_seconds) - self.song_start_seconds
+
+
+class LocalAnalysisJobResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "extracting", "recognizing", "completed", "failed"]
+    message: str | None = None
+    error_code: str | None = None
+    analysis: AsrAnalysisResponse | None = None
 
 
 class LyricsAlignedWord(BaseModel):

@@ -18,11 +18,15 @@ from app.database import (
 )
 from app.deepseek_refiner import DeepSeekLyricsRefinerClient, DeepSeekRefinerError
 from app.deepseek_lyrics_reconciler import DeepSeekLyricsReconcilerClient
+from app.development_artifacts import DevelopmentArtifactWriter
 from app.lyrics_reconciler import LyricsReconciliationError, LyricsReconcilerService
 from app.lyrics_refiner import LyricsRefinementValidationError, LyricsRefinerService
 from app.lyrics_retriever import AllowlistedWebLyricsRetriever, NoopLyricsRetriever
+from app.local_analysis import LocalAnalysisJobManager, LocalMediaAudioExtractor
 from app.models import (
     AsrAnalysisResponse,
+    LocalAnalysisJobRequest,
+    LocalAnalysisJobResponse,
     LyricsReconcileRequest,
     LyricsReconcileResponse,
     LyricsRefineRequest,
@@ -43,6 +47,7 @@ def create_app(
     refiner_client=None,
     reconciler_client=None,
     lyrics_retriever=None,
+    local_media_extractor=None,
 ) -> FastAPI:
     database = repository or AsrRepository(config.database_path)
     database.initialize()
@@ -55,6 +60,18 @@ def create_app(
         timeout_seconds=config.timeout_seconds,
     )
     service = AsrService(database, provider, config)
+    artifact_writer = DevelopmentArtifactWriter(
+        config.development_artifacts_directory,
+        enabled=config.product_env != "production",
+    )
+    # 【MODIFIED】本地路径分析只在 Mac 开发环境使用，最终结果仍进入现有 SQLite 缓存。
+    resolved_local_extractor = local_media_extractor or LocalMediaAudioExtractor(config)
+    local_jobs = LocalAnalysisJobManager(
+        service=service,
+        extractor=resolved_local_extractor,
+        artifact_writer=artifact_writer,
+        max_concurrency=config.max_concurrency,
+    )
     refiner_provider = refiner_client or DeepSeekLyricsRefinerClient(
         api_key=config.deepseek_api_key,
         endpoint=config.deepseek_endpoint,
@@ -79,7 +96,7 @@ def create_app(
         model=reconciliation_provider,
         retriever=resolved_retriever,
         model_name=config.deepseek_model,
-        analysis_version=config.analysis_version,
+        analysis_version=service.analysis_version,
         reconciliation_version=config.lyrics_reconciliation_version,
     )
     application = FastAPI(
@@ -131,6 +148,7 @@ def create_app(
             "provider_configured": config.provider_enabled,
             "lyrics_refiner_configured": config.lyrics_refiner_enabled,
             "monthly_limit_seconds": config.monthly_limit_seconds,
+            "local_analysis_enabled": config.product_env != "production",
         }
 
     @application.get("/v1/usage", response_model=UsageResponse)
@@ -165,12 +183,56 @@ def create_app(
             )
         return cached
 
+    @application.post(
+        "/v1/local-analysis/jobs", response_model=LocalAnalysisJobResponse
+    )
+    def submit_local_analysis(
+        request: LocalAnalysisJobRequest,
+        subject_hash: str = Depends(require_babyplayer_token),
+    ) -> dict:
+        if config.product_env == "production":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "LOCAL_ANALYSIS_DISABLED"},
+            )
+        if not config.provider_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "TENCENT_ASR_NOT_CONFIGURED"},
+            )
+        return local_jobs.submit(
+            subject_hash=subject_hash,
+            request=request,
+        )
+
+    @application.get(
+        "/v1/local-analysis/jobs/{job_id}", response_model=LocalAnalysisJobResponse
+    )
+    def local_analysis_status(
+        job_id: str,
+        subject_hash: str = Depends(require_babyplayer_token),
+    ) -> dict:
+        if config.product_env == "production":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "LOCAL_ANALYSIS_DISABLED"},
+            )
+        job = local_jobs.get(job_id, subject_hash=subject_hash)
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "LOCAL_ANALYSIS_JOB_NOT_FOUND"},
+            )
+        return job
+
     @application.post("/v1/analyze", response_model=AsrAnalysisResponse)
     def analyze(
         operation_id: str = Form(...),
         media_fingerprint: str = Form(...),
+        media_title: str = Form(""),
         duration_seconds: float = Form(...),
         voice_format: str = Form("m4a"),
+        force_refresh: bool = Form(False),
         audio: UploadFile = File(...),
         subject_hash: str = Depends(require_babyplayer_token),
     ) -> dict:
@@ -184,15 +246,24 @@ def create_app(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail={"code": "TENCENT_ASR_NOT_CONFIGURED"},
                 )
-            return service.analyze(
+            result = service.analyze(
                 subject_hash=subject_hash,
                 operation_id=operation_id,
                 media_fingerprint=media_fingerprint,
                 duration_seconds=duration_seconds,
                 voice_format=voice_format,
                 audio=audio_bytes,
+                force_refresh=force_refresh,
                 now=now,
             )
+            artifact_writer.store_asr(
+                media_fingerprint=media_fingerprint,
+                media_title=media_title,
+                audio=audio_bytes,
+                response=result,
+                force_refresh=force_refresh,
+            )
+            return result
         except MonthlyLimitReachedError:
             reset = next_reset_at(now)
             reset_date = datetime.fromisoformat(reset)
@@ -296,12 +367,19 @@ def create_app(
                 },
             )
         try:
-            return reconciliation_service.reconcile(
+            result = reconciliation_service.reconcile(
                 subject_hash=subject_hash,
                 request=request,
                 asr_analysis=asr_analysis,
                 now=now,
             )
+            artifact_writer.store_deepseek(
+                media_fingerprint=request.media_fingerprint,
+                media_title=request.song_title,
+                request=request.model_dump(mode="json"),
+                response=result,
+            )
+            return result
         except LyricsReconciliationError as exc:
             logger.error("Lyrics reconciliation rejected reason=%s", str(exc))
             raise HTTPException(
@@ -309,6 +387,11 @@ def create_app(
                 detail={"code": "INVALID_LYRICS_RECONCILIATION", "message": str(exc)},
             )
         except DeepSeekRefinerError:
+            logger.exception(
+                "DeepSeek lyrics reconciliation unavailable title=%s fingerprint=%s",
+                request.song_title,
+                request.media_fingerprint,
+            )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail={"code": "DEEPSEEK_UNAVAILABLE", "message": "AI 歌词重建暂时不可用"},

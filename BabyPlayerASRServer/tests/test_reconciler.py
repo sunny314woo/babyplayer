@@ -67,15 +67,17 @@ def request(candidate_text=("Twinkle, twinkle, little star", "How I wonder what 
 class MemoryRepository:
     def __init__(self):
         self.cached_result = None
+        self.cached_version = None
         self.store_calls = 0
 
     def cached_ai_lyrics(self, subject_hash, fingerprint_hash, reconciliation_version):
-        del subject_hash, fingerprint_hash, reconciliation_version
-        return self.cached_result
+        del subject_hash, fingerprint_hash
+        return self.cached_result if reconciliation_version == self.cached_version else None
 
     def store_ai_lyrics(self, **kwargs):
         self.store_calls += 1
         self.cached_result = kwargs["result"]
+        self.cached_version = kwargs["reconciliation_version"]
 
 
 class FakeD3Model:
@@ -125,23 +127,24 @@ class FakeD3Model:
 
 
 class FakeRetriever:
-    def __init__(self, results=None):
+    def __init__(self, results=None, *, expected_title="Twinkle Twinkle Little Star"):
         self.calls = 0
         self.results = results or []
+        self.expected_title = expected_title
 
     def search(self, song_title):
         self.calls += 1
-        assert song_title == "Twinkle Twinkle Little Star"
+        assert song_title == self.expected_title
         return self.results
 
 
-def service(repository, model, retriever):
+def service(repository, model, retriever, *, analysis_version="asr-v1"):
     return LyricsReconcilerService(
         repository=repository,
         model=model,
         retriever=retriever,
         model_name="deepseek-v4-flash",
-        analysis_version="asr-v1",
+        analysis_version=analysis_version,
         reconciliation_version="d3-v1",
     )
 
@@ -167,6 +170,41 @@ def test_reconciler_uses_candidate_without_unnecessary_web_search_and_caches() -
     assert first["cache_hit"] is False
     assert second["cache_hit"] is True
     assert repository.store_calls == 1
+
+
+def test_reconciler_cache_is_invalidated_when_asr_timeline_version_changes() -> None:
+    repository = MemoryRepository()
+    first_model = FakeD3Model()
+    first = service(
+        repository,
+        first_model,
+        FakeRetriever(),
+        analysis_version="asr-whole-song-v1",
+    )
+    first.reconcile(
+        subject_hash="subject",
+        request=request(),
+        asr_analysis=asr_analysis(),
+        now=NOW,
+    )
+    second_model = FakeD3Model()
+    second = service(
+        repository,
+        second_model,
+        FakeRetriever(),
+        analysis_version="asr-chunked-v2",
+    )
+
+    result = second.reconcile(
+        subject_hash="subject",
+        request=request(),
+        asr_analysis=asr_analysis(),
+        now=NOW,
+    )
+
+    assert result["cache_hit"] is False
+    assert second_model.reconcile_calls == 1
+    assert repository.store_calls == 2
 
 
 def test_reconciler_searches_when_all_existing_candidates_are_weak() -> None:
@@ -221,6 +259,57 @@ def test_reconciler_searches_when_all_existing_candidates_are_weak() -> None:
     assert reconciled["primary_source"] == "web_1"
 
 
+def test_reconciler_can_build_asr_only_timeline_without_downloaded_lyrics() -> None:
+    repository = MemoryRepository()
+    asr_only_result = {
+        "song_match_confidence": 0.86,
+        "primary_source": "asr_only",
+        "lines": [
+            {
+                "text": "twinkle twinkle little star",
+                "asr_word_start_index": 0,
+                "asr_word_end_index": 3,
+                "source": "asr_only",
+                "source_line_ids": [],
+                "confidence": 0.9,
+                "text_corrected": False,
+            },
+            {
+                "text": "how I wonder what you are",
+                "asr_word_start_index": 4,
+                "asr_word_end_index": 9,
+                "source": "asr_only",
+                "source_line_ids": [],
+                "confidence": 0.88,
+                "text_corrected": False,
+            },
+        ],
+        "discarded_lines": [],
+    }
+    model = FakeD3Model(result=asr_only_result)
+    retriever = FakeRetriever([])
+    empty_request = LyricsReconcileRequest.model_validate({
+        "media_fingerprint": "media-fingerprint-0001",
+        "song_title": "Twinkle Twinkle Little Star",
+        "candidates": [],
+    })
+
+    reconciled = service(repository, model, retriever).reconcile(
+        subject_hash="subject",
+        request=empty_request,
+        asr_analysis=asr_analysis(),
+        now=NOW,
+    )
+
+    assert model.assess_calls == 0
+    assert retriever.calls == 1
+    assert model.reconcile_calls == 1
+    assert reconciled["primary_source"] == "asr_only"
+    assert reconciled["web_search_used"] is False
+    assert [line["start_seconds"] for line in reconciled["lines"]] == [0.4, 2.2]
+    assert [line["end_seconds"] for line in reconciled["lines"]] == [2.0, 4.1]
+
+
 def test_reconciler_rejects_model_generated_timestamps_or_nonmonotonic_ranges() -> None:
     invalid = FakeD3Model().result
     invalid["lines"][1]["asr_word_start_index"] = 2
@@ -235,10 +324,12 @@ def test_reconciler_rejects_model_generated_timestamps_or_nonmonotonic_ranges() 
 
 def test_deepseek_d3_client_uses_separate_assessment_and_reconciliation_prompts() -> None:
     prompts = []
+    max_tokens = []
 
     def handler(http_request: httpx.Request) -> httpx.Response:
         payload = json.loads(http_request.read())
         prompts.append(payload["messages"][0]["content"])
+        max_tokens.append(payload["max_tokens"])
         content = {"candidate_scores": [], "need_web_search": False, "reason_code": "no_candidates"}
         if "Lyrics Evidence Reconciler" in prompts[-1]:
             content = {
@@ -264,6 +355,8 @@ def test_deepseek_d3_client_uses_separate_assessment_and_reconciliation_prompts(
 
     assert "do not use song memory" in prompts[0]
     assert "Never output a timestamp" in prompts[1]
+    assert "do not enumerate rejected candidate lines" in prompts[1]
+    assert max_tokens == [1200, 8000]
 
 
 def test_d3_endpoint_requires_cached_asr_before_calling_deepseek(tmp_path) -> None:

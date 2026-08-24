@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS asr_analysis_cache (
   media_fingerprint_hash TEXT NOT NULL,
   analysis_version TEXT NOT NULL,
   audio_sha256 TEXT NOT NULL,
+  media_content_sha256 TEXT,
   engine_type TEXT NOT NULL,
   audio_duration_seconds REAL NOT NULL,
   transcript TEXT NOT NULL,
@@ -101,11 +102,21 @@ class AsrRepository:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            # 【MODIFIED】兼容已经保存过 ASR 的本地数据库，不删除旧结果。
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(asr_analysis_cache)")
+            }
+            if "media_content_sha256" not in columns:
+                connection.execute(
+                    "ALTER TABLE asr_analysis_cache ADD COLUMN media_content_sha256 TEXT"
+                )
 
     def cached(self, subject_hash: str, fingerprint_hash: str, version: str):
         with self._connect() as connection:
             row = connection.execute(
-                """SELECT engine_type, audio_duration_seconds, transcript, segments_json
+                """SELECT audio_sha256, media_content_sha256, engine_type,
+                          audio_duration_seconds, transcript, segments_json
                    FROM asr_analysis_cache
                    WHERE subject_hash=? AND media_fingerprint_hash=? AND analysis_version=?""",
                 (subject_hash, fingerprint_hash, version),
@@ -113,6 +124,8 @@ class AsrRepository:
         if not row:
             return None
         return {
+            "audio_sha256": row["audio_sha256"],
+            "media_content_sha256": row["media_content_sha256"],
             "engine_type": row["engine_type"],
             "audio_duration_seconds": float(row["audio_duration_seconds"]),
             "transcript": row["transcript"],
@@ -169,6 +182,7 @@ class AsrRepository:
         subject_hash: str,
         fingerprint_hash: str,
         audio_sha256: str,
+        media_content_sha256: str | None,
         version: str,
         now: datetime,
     ):
@@ -188,22 +202,27 @@ class AsrRepository:
             connection.execute(
                 """INSERT INTO asr_analysis_cache
                    (subject_hash, media_fingerprint_hash, analysis_version, audio_sha256,
+                    media_content_sha256,
                     engine_type, audio_duration_seconds, transcript, segments_json,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(subject_hash, media_fingerprint_hash, analysis_version)
                    DO UPDATE SET audio_sha256=excluded.audio_sha256,
+                     media_content_sha256=excluded.media_content_sha256,
                      engine_type=excluded.engine_type,
                      audio_duration_seconds=excluded.audio_duration_seconds,
                      transcript=excluded.transcript, segments_json=excluded.segments_json,
                      updated_at=excluded.updated_at""",
                 (
                     subject_hash, fingerprint_hash, version, audio_sha256,
+                    media_content_sha256,
                     row["engine_type"], row["audio_duration_seconds"], row["transcript"],
                     row["segments_json"], row["created_at"], timestamp,
                 ),
             )
         return {
+            "audio_sha256": audio_sha256,
+            "media_content_sha256": media_content_sha256,
             "engine_type": row["engine_type"],
             "audio_duration_seconds": float(row["audio_duration_seconds"]),
             "transcript": row["transcript"],
@@ -311,9 +330,17 @@ class AsrRepository:
         segments: list[dict],
         monthly_limit: int,
         now: datetime,
+        media_content_sha256: str | None = None,
+        provider_billed_seconds: int | None = None,
+        provider_request_count: int = 1,
     ) -> Usage:
         timestamp = now.astimezone(timezone.utc).isoformat()
-        provider_seconds = max(1, int(duration_seconds + 0.999))
+        provider_seconds = (
+            max(1, int(provider_billed_seconds))
+            if provider_billed_seconds is not None
+            else max(1, int(duration_seconds + 0.999))
+        )
+        request_count = max(1, int(provider_request_count))
         with self._transaction() as connection:
             operation = connection.execute(
                 """SELECT usage_month, reserved_seconds, status FROM asr_operations
@@ -334,9 +361,9 @@ class AsrRepository:
             connection.execute(
                 """UPDATE asr_usage_monthly
                    SET reserved_seconds=MAX(reserved_seconds-?, 0),
-                       used_seconds=used_seconds+?, request_count=request_count+1,
+                       used_seconds=used_seconds+?, request_count=request_count+?,
                        updated_at=? WHERE month=?""",
-                (reserved, billed, timestamp, usage_month),
+                (reserved, billed, request_count, timestamp, usage_month),
             )
             connection.execute(
                 """UPDATE asr_operations SET billed_seconds=?, status='COMPLETED', updated_at=?
@@ -346,23 +373,93 @@ class AsrRepository:
             connection.execute(
                 """INSERT INTO asr_analysis_cache
                    (subject_hash, media_fingerprint_hash, analysis_version, audio_sha256,
+                    media_content_sha256,
                     engine_type, audio_duration_seconds, transcript, segments_json,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(subject_hash, media_fingerprint_hash, analysis_version)
                    DO UPDATE SET audio_sha256=excluded.audio_sha256,
+                     media_content_sha256=excluded.media_content_sha256,
                      engine_type=excluded.engine_type,
                      audio_duration_seconds=excluded.audio_duration_seconds,
                      transcript=excluded.transcript, segments_json=excluded.segments_json,
                      updated_at=excluded.updated_at""",
                 (
                     subject_hash, fingerprint_hash, analysis_version, audio_sha256,
+                    media_content_sha256,
                     engine_type, duration_seconds, transcript,
                     json.dumps(segments, ensure_ascii=False, separators=(",", ":")),
                     timestamp, timestamp,
                 ),
             )
         return self.usage(monthly_limit, now)
+
+    def settle_failed_provider_usage(
+        self,
+        *,
+        operation_id: str,
+        subject_hash: str,
+        billed_seconds: int,
+        provider_request_count: int,
+        now: datetime,
+    ) -> None:
+        """结算分片任务失败前已经成功返回的腾讯调用，但不写入不完整缓存。"""
+        timestamp = now.astimezone(timezone.utc).isoformat()
+        with self._transaction() as connection:
+            operation = connection.execute(
+                """SELECT usage_month, reserved_seconds, status FROM asr_operations
+                   WHERE operation_id=? AND subject_hash=?""",
+                (operation_id, subject_hash),
+            ).fetchone()
+            if not operation or operation["status"] != "CLAIMED":
+                return
+            reserved = int(operation["reserved_seconds"])
+            billed = min(reserved, max(0, int(billed_seconds)))
+            request_count = max(0, int(provider_request_count))
+            connection.execute(
+                """UPDATE asr_usage_monthly
+                   SET reserved_seconds=MAX(reserved_seconds-?, 0),
+                       used_seconds=used_seconds+?, request_count=request_count+?,
+                       updated_at=? WHERE month=?""",
+                (
+                    reserved,
+                    billed,
+                    request_count,
+                    timestamp,
+                    operation["usage_month"],
+                ),
+            )
+            connection.execute(
+                """UPDATE asr_operations SET billed_seconds=?, status='COMPLETED', updated_at=?
+                   WHERE operation_id=?""",
+                (billed, timestamp, operation_id),
+            )
+
+    def attach_media_content_hash(
+        self,
+        *,
+        subject_hash: str,
+        fingerprint_hash: str,
+        analysis_version: str,
+        media_content_sha256: str,
+        now: datetime,
+    ) -> None:
+        """给旧缓存补登记源文件哈希；不改 transcript、用量或分析时间轴。"""
+        timestamp = now.astimezone(timezone.utc).isoformat()
+        with self._transaction() as connection:
+            connection.execute(
+                """UPDATE asr_analysis_cache
+                   SET media_content_sha256=?, updated_at=?
+                   WHERE subject_hash=? AND media_fingerprint_hash=?
+                     AND analysis_version=? AND media_content_sha256 IS NULL""",
+                (
+                    media_content_sha256,
+                    timestamp,
+                    subject_hash,
+                    fingerprint_hash,
+                    analysis_version,
+                ),
+            )
 
     def release(self, operation_id: str, now: datetime) -> None:
         timestamp = now.astimezone(timezone.utc).isoformat()

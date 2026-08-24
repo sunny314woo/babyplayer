@@ -7,11 +7,40 @@
 // 最近修改：2026-08-23 在播放画面增加可持续可见的 AI 歌词分阶段进度卡。
 // 最近修改：2026-08-23 为单曲循环的可恢复 AI 失败增加不阻塞播放的封顶退避重试。
 // 最近修改：2026-08-23 让同 fingerprint 分段分析跨单曲循环复用，并按真实准备、识别、校准、优化阶段反馈。
+// 最近修改：2026-08-24 停止自动 ASR/DeepSeek，改为分阶段人工触发与人工采用。
+// 最近修改：2026-08-24 让 Apple TV 遥控器中间键在播放画面直接切换播放/暂停。
+// 最近修改：2026-08-24 ASR 后处理失败时显示解析或持久化阶段，不再统一显示“识别失败”。
+// 最近修改：2026-08-24 用 0.8×/1×/1.5×/2×/3× 播放倍速菜单取代 App 内声音调节。
 //
 
 import AVKit
 import Foundation
+import OSLog
 import SwiftUI
+
+private let babyPlayerSystemPlayerLogger = Logger(
+    subsystem: "com.wufengyu.BabyPlayer",
+    category: "SystemPlayer"
+)
+
+// 【MODIFIED】错误提示只暴露阶段与系统错误码，不显示本机路径或服务密钥。
+enum BabyPlayerAnalysisErrorPresentation {
+    static func message(_ error: Error, fallback: String) -> String {
+        if error is DecodingError {
+            return "ASR 结果解析失败"
+        }
+        let cocoa = error as NSError
+        if cocoa.domain == NSCocoaErrorDomain {
+            return "ASR 已完成，但结果保存失败（" + String(cocoa.code) + "）"
+        }
+        if let localized = error as? LocalizedError,
+           let description = localized.errorDescription,
+           !description.isEmpty {
+            return description
+        }
+        return fallback + "（" + cocoa.domain + " " + String(cocoa.code) + "）"
+    }
+}
 
 enum BabyPlayerLyricTimeline {
     static func visibleLineIndex(at elapsed: Double, lines: [TimedLyricLine]) -> Int? {
@@ -20,6 +49,47 @@ enum BabyPlayerLyricTimeline {
             return nil
         }
         return index
+    }
+}
+
+// 【MODIFIED】将中间键的播放状态决策独立出来，便于覆盖正在缓冲等边界。
+enum BabyPlayerPlaybackToggleAction: Equatable {
+    case play
+    case pause
+}
+
+enum BabyPlayerPlaybackTogglePolicy {
+    /// 计算中间键的目标动作；输入当前播放状态和速率，不修改播放器。
+    static func action(
+        timeControlStatus: AVPlayer.TimeControlStatus,
+        rate: Float
+    ) -> BabyPlayerPlaybackToggleAction {
+        if timeControlStatus == .playing
+            || timeControlStatus == .waitingToPlayAtSpecifiedRate
+            || rate > 0 {
+            return .pause
+        }
+        return .play
+    }
+}
+
+enum BabyPlayerPlaybackRatePolicy {
+    static let availableRates: [Float] = [0.8, 1.0, 1.5, 2.0, 3.0]
+    static let defaultRate: Float = 1.0
+
+    /// 只允许菜单定义的倍速；输入任意值，输出最近的可用档位。
+    static func normalized(_ value: Float) -> Float {
+        availableRates.min(by: { abs($0 - value) < abs($1 - value) }) ?? defaultRate
+    }
+
+    static func title(for rate: Float) -> String {
+        switch normalized(rate) {
+        case 0.8: return "0.8×"
+        case 1.5: return "1.5×"
+        case 2.0: return "2×"
+        case 3.0: return "3×"
+        default: return "1×"
+        }
     }
 }
 
@@ -77,6 +147,23 @@ enum BabyPlayerAILyricsProgress: Equatable {
             return "AI 歌词\n○ \(message)"
         case .retrying(let attempt, let delaySeconds, let reason):
             return "AI 歌词\n⚠ \(reason)\n↻ 单曲循环已保持播放\n\(delaySeconds) 秒后第 \(attempt) 次自动重试"
+        }
+    }
+}
+
+// 【MODIFIED】真实记录 ASR/DeepSeek 各自状态，禁止从 message 文案推断业务阶段。
+enum BabyPlayerManualAnalysisStatus: Equatable {
+    case notRun
+    case running
+    case completed
+    case failed(String)
+
+    var displayText: String {
+        switch self {
+        case .notRun: return "未运行"
+        case .running: return "处理中…"
+        case .completed: return "已完成"
+        case .failed(let message): return "失败：\(message)"
         }
     }
 }
@@ -186,7 +273,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var activePlaybackMode: ActivePlaybackMode = .single
     private var sessionEndsAt: Date?
     private var timerDurationMinutes: Int?
-    private var currentVolume: Float = 1
+    private var currentPlaybackRate = BabyPlayerPlaybackRatePolicy.defaultRate
     private var endObserver: NSObjectProtocol?
     private var timeObserver: Any?
     private var lyricsTask: Task<Void, Never>?
@@ -196,12 +283,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var lyricLines: [TimedLyricLine] = []
     private var lyricPlayback: LyricsPlayback?
     private var lyricCandidates: [LyricsCandidate] = []
-    private var plainTextReference: LyricsPlainTextReference?
+    private var analysisBundle: StoredLyricsAnalysisBundle?
+    private var latestAnalysisSource: LyricsAnalysisSource?
+    private var asrAnalysisStatus: BabyPlayerManualAnalysisStatus = .notRun
+    private var deepSeekAnalysisStatus: BabyPlayerManualAnalysisStatus = .notRun
     private var isSearchingLyrics = false
     private var isAnalyzingSound = false
     private var lyricsSearchMessage: String?
     private var soundAnalysisMessage: String?
-    private var shouldAnalyzeAfterSearch = false
     private var pendingLyricSelectionIdentifier: String?
     private let lyricsAutomationGuard = LyricsAutomationGenerationGuard()
     private var currentLyricsMode: BabyPlayerLyricsMode = .off
@@ -210,8 +299,6 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var lyricsLabel: UILabel?
     private var aiProgressContainer: UIView?
     private var aiProgressLabel: UILabel?
-    private var soundAnalysisFailureCounts: [String: Int] = [:]
-    private var soundAnalysisRetryNotBefore: [String: Date] = [:]
     private var preparedLyricsFingerprint: String?
     private var soundAnalysisFingerprint: String?
     private var isAdvancing = false
@@ -247,7 +334,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         showsPlaybackControls = true
 
         let playbackPlayer = AVPlayer()
-        playbackPlayer.volume = currentVolume
+        playbackPlayer.defaultRate = currentPlaybackRate
         player = playbackPlayer
         setUpLyricsOverlay()
 
@@ -302,7 +389,37 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             finishPlayback()
             return
         }
+        // 【MODIFIED】无菜单控件焦点时，中间键直接播放/暂停；有焦点时仍由 AVKit 执行选择。
+        if presses.contains(where: { $0.type == .select }), centerPressShouldTogglePlayback() {
+            togglePlaybackFromCenterPress()
+            return
+        }
         super.pressesBegan(presses, with: event)
+    }
+
+    /// 判断中间键是否应控制播放；输入当前焦点，不修改 UI。
+    private func centerPressShouldTogglePlayback() -> Bool {
+        guard let focusedItem = UIFocusSystem.focusSystem(for: view)?.focusedItem,
+              let focusedView = focusedItem as? UIView else {
+            return true
+        }
+        if focusedView === view { return true }
+        if let overlay = contentOverlayView, focusedView === overlay { return true }
+        return false
+    }
+
+    /// 根据现有播放状态切换播放/暂停；只修改 AVPlayer 的播放状态。
+    private func togglePlaybackFromCenterPress() {
+        guard let player, player.currentItem != nil else { return }
+        switch BabyPlayerPlaybackTogglePolicy.action(
+            timeControlStatus: player.timeControlStatus,
+            rate: player.rate
+        ) {
+        case .play:
+            player.playImmediately(atRate: currentPlaybackRate)
+        case .pause:
+            player.pause()
+        }
     }
 
     private var currentQueueItem: BabyPlayerQueueItem? {
@@ -347,7 +464,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 self.updateLyrics(at: elapsed)
             }
         }
-        player?.play()
+        player?.defaultRate = currentPlaybackRate
+        player?.playImmediately(atRate: currentPlaybackRate)
     }
 
     private func handleProgress(_ elapsed: Double) {
@@ -521,9 +639,28 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         updateLyricsTransportMenu()
     }
 
+    /// 显示人工分析结果；输入菜单标题与详情，输出 Void，只更新可见 UI 状态。
+    private func showManualAnalysisMessage(_ title: String, detail: String) {
+        soundAnalysisMessage = title
+        aiProgressLabel?.text = "歌词测试\n\(detail)"
+        aiProgressContainer?.isHidden = false
+        updateLyricsTransportMenu()
+    }
+
     private func prepareLyrics(for item: BabyPlayerQueueItem, mode: BabyPlayerLyricsMode) {
         let fingerprint = item.lyricsMedia.asrFingerprint
         let isSameFingerprint = preparedLyricsFingerprint == fingerprint
+        // 【MODIFIED】单曲循环只重建 AVPlayerItem，完整保留当前歌词、候选和分析状态。
+        if isSameFingerprint {
+            currentLyricsMode = mode
+            currentLyricIndex = nil
+            if mode == .off {
+                lyricsContainer?.isHidden = true
+                lyricsLabel?.text = nil
+            }
+            updateLyricsTransportMenu()
+            return
+        }
         lyricsTask?.cancel()
         if !isSameFingerprint {
             let previousFingerprint = soundAnalysisFingerprint
@@ -534,9 +671,12 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             pendingLyricSelectionIdentifier = nil
             // 【MODIFIED】只有真正切歌才使旧 generation 失效；单曲循环保留 task 和 manual lock。
             lyricsAutomationGuard.resetForNewMedia()
-            shouldAnalyzeAfterSearch = false
             isAnalyzingSound = false
             soundAnalysisMessage = nil
+            analysisBundle = nil
+            latestAnalysisSource = nil
+            asrAnalysisStatus = .notRun
+            deepSeekAnalysisStatus = .notRun
             aiProgressLabel?.text = nil
             aiProgressContainer?.isHidden = true
             if let previousFingerprint {
@@ -552,7 +692,6 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         lyricLines = []
         lyricPlayback = nil
         lyricCandidates = []
-        plainTextReference = nil
         isSearchingLyrics = true
         lyricsSearchMessage = nil
         currentLyricIndex = nil
@@ -565,11 +704,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             let storedPlayback = await BabyLyricsRepository.shared.storedLyrics(
                 for: item.lyricsMedia
             )
-            let plainReference = await BabyLyricsRepository.shared.plainTextReference(
+            let storedAnalysis = await BabyLyricsRepository.shared.analysisBundle(
                 for: item.lyricsMedia
             )
             guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
-            self.plainTextReference = plainReference
+            self.analysisBundle = storedAnalysis
+            self.latestAnalysisSource = storedAnalysis?.bestAvailableResult?.source
+            self.asrAnalysisStatus = storedAnalysis?.asrResult == nil ? .notRun : .completed
+            self.deepSeekAnalysisStatus = storedAnalysis?.deepSeekResult == nil ? .notRun : .completed
             var playback = storedPlayback
             var foundCandidates: [LyricsCandidate] = []
             do {
@@ -600,155 +742,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 }
             }
             self.updateLyricsTransportMenu()
-
-            let canAutomaticallyAnalyze = self.shouldAnalyzeAfterSearch
-                || (self.currentLyricsMode != .off
-                    && (playback == nil || playback?.selectionOrigin == .automatic))
-            self.shouldAnalyzeAfterSearch = false
-            guard canAutomaticallyAnalyze else { return }
-            self.startSoundAnalysis(
-                for: item,
-                candidates: foundCandidates,
-                reference: plainReference,
-                waitForBuffer: true
-            )
-        }
-    }
-
-    private func startSoundAnalysis(
-        for item: BabyPlayerQueueItem,
-        candidates: [LyricsCandidate],
-        reference: LyricsPlainTextReference?,
-        waitForBuffer: Bool,
-        manuallyRequested: Bool = false
-    ) {
-        let fingerprint = item.lyricsMedia.asrFingerprint
-        guard isCurrentMedia(fingerprint: fingerprint) else { return }
-        if isAnalyzingSound, soundAnalysisFingerprint == fingerprint { return }
-        // 【MODIFIED】人工点击可立即开始新一轮；自动轮询则继承上次退避。
-        if manuallyRequested {
-            soundAnalysisFailureCounts[fingerprint] = 0
-            soundAnalysisRetryNotBefore[fingerprint] = nil
-        }
-        // 【MODIFIED】后台链路只能在启动 generation 仍有效时自动应用。
-        let automaticGeneration = lyricsAutomationGuard.generation
-        if let previousFingerprint = soundAnalysisFingerprint,
-           previousFingerprint != fingerprint {
-            soundAnalysisTask?.cancel()
-            Task {
-                await BabyPlayerASRCoordinator.shared.cancel(
-                    mediaFingerprint: previousFingerprint
-                )
-            }
-        }
-        soundAnalysisFingerprint = fingerprint
-        isAnalyzingSound = true
-        // 【MODIFIED】当前 MVP 只准备并上传一份临时整首音频；分片计划暂不进入生产链路。
-        let plannedCount = 1
-        // 【MODIFIED】点击后只显示真实的本地准备阶段，不再提前宣称已调用语音识别。
-        showAILyricsProgress(.preparingAudio(index: 1, total: plannedCount))
-
-        soundAnalysisTask = Task { [weak self] in
-            guard let self else { return }
-            // 【MODIFIED】单曲重播重建 player item 时会继承 not-before，不会重置为立即猛烈重试。
-            if let retryDate = self.soundAnalysisRetryNotBefore[fingerprint] {
-                let remaining = retryDate.timeIntervalSinceNow
-                if remaining > 0 {
-                    let attempt = self.soundAnalysisFailureCounts[fingerprint] ?? 1
-                    self.showAILyricsProgress(.retrying(
-                        attempt: attempt,
-                        delaySeconds: Int(remaining.rounded(.up)),
-                        reason: "上一次声音分析未完成"
-                    ))
-                    try? await Task.sleep(for: .seconds(remaining))
-                }
-            }
-            if waitForBuffer {
-                guard await self.waitForPlaybackBuffer(fingerprint: fingerprint) else {
-                    guard !Task.isCancelled,
-                          self.isCurrentMedia(fingerprint: fingerprint) else { return }
-                    self.isAnalyzingSound = false
-                    self.showAILyricsProgress(.deferred("播放优先：本次暂缓声音分析"))
-                    return
-                }
-            }
-            guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
-            while !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) {
-                do {
-                    let outcome = try await BabyPlayerASRCoordinator.shared.analyze(
-                        item: item,
-                        candidates: candidates,
-                        reference: reference,
-                        forceLyricsRefresh: manuallyRequested,
-                        onStage: { [weak self] stage in
-                            guard let self,
-                                  !Task.isCancelled,
-                                  self.isCurrentMedia(fingerprint: fingerprint) else { return }
-                            self.showAILyricsProgress(self.visibleProgress(for: stage))
-                        },
-                        onAILyricsV1: { [weak self] v1Outcome in
-                            guard let self,
-                                  !Task.isCancelled,
-                                  self.isCurrentMedia(fingerprint: fingerprint) else { return }
-                            await self.receiveSoundAnalysisOutcome(
-                                v1Outcome,
-                                for: item,
-                                automaticGeneration: automaticGeneration,
-                                progress: .aligning
-                            )
-                        }
-                    )
-                    guard !Task.isCancelled,
-                          self.isCurrentMedia(fingerprint: fingerprint) else { return }
-                    self.soundAnalysisFailureCounts[fingerprint] = nil
-                    self.soundAnalysisRetryNotBefore[fingerprint] = nil
-                    let finalProgress: BabyPlayerAILyricsProgress
-                    if outcome.selected == nil {
-                        finalProgress = .unmatched
-                    } else if outcome.message == "AI 优化完成" {
-                        finalProgress = .completed
-                    } else {
-                        finalProgress = .warning(outcome.message)
-                    }
-                    await self.receiveSoundAnalysisOutcome(
-                        outcome,
-                        for: item,
-                        automaticGeneration: automaticGeneration,
-                        progress: finalProgress
-                    )
-                    break
-                } catch {
-                    guard !Task.isCancelled,
-                          self.isCurrentMedia(fingerprint: fingerprint) else { return }
-                    let message = (error as? LocalizedError)?.errorDescription
-                        ?? "声音歌词生成暂时不可用"
-                    let canRetry = self.activeRepeatMode == .repeatOne
-                        && BabyPlayerAIAnalysisRetryPolicy.shouldRetry(error)
-                    guard canRetry else {
-                        self.showAILyricsProgress(.failed(message))
-                        break
-                    }
-                    // 【MODIFIED】退避只 suspend 分析 Task，AVPlayer 持续播放不受影响。
-                    let failureCount = (self.soundAnalysisFailureCounts[fingerprint] ?? 0) + 1
-                    let delay = BabyPlayerAIAnalysisRetryPolicy.delay(
-                        afterFailureCount: failureCount
-                    )
-                    self.soundAnalysisFailureCounts[fingerprint] = failureCount
-                    self.soundAnalysisRetryNotBefore[fingerprint] = Date().addingTimeInterval(delay)
-                    self.showAILyricsProgress(.retrying(
-                        attempt: failureCount,
-                        delaySeconds: Int(delay),
-                        reason: message
-                    ))
-                    try? await Task.sleep(for: .seconds(delay))
-                }
-            }
-            if self.soundAnalysisFingerprint == fingerprint {
-                self.isAnalyzingSound = false
-                self.soundAnalysisTask = nil
-                self.soundAnalysisFingerprint = nil
-                self.updateLyricsTransportMenu()
-            }
+            // 【MODIFIED】普通歌词搜索在此结束；不再自动进入 ASR 或 DeepSeek。
         }
     }
 
@@ -769,58 +763,6 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
     }
 
-    // 【MODIFIED】AI v1/v2 共用一个接收点：始终保留候选，但只有强证据且 generation 未被 manual lock 作废时自动展示。
-    /// 接收渐进 AI outcome；输入为 outcome、媒体、启动 generation 和可见进度，输出 Void，会更新 UI 并可能通过 repository 自动绑定。
-    private func receiveSoundAnalysisOutcome(
-        _ outcome: BabyPlayerASRMatchOutcome,
-        for item: BabyPlayerQueueItem,
-        automaticGeneration: Int,
-        progress: BabyPlayerAILyricsProgress
-    ) async {
-        let fingerprint = item.lyricsMedia.asrFingerprint
-        guard isCurrentMedia(fingerprint: fingerprint) else { return }
-        lyricCandidates = Array(outcome.candidates.prefix(4))
-        showAILyricsProgress(progress)
-        guard let selected = outcome.selected,
-              outcome.shouldAutomaticallyApply,
-              lyricsAutomationGuard.permitsAutomaticResult(startedAt: automaticGeneration),
-              lyricPlayback?.selectionOrigin != .manual,
-              let verified = try? await BabyLyricsRepository.shared.applyAutomaticRecommendation(
-                  selected,
-                  autoOffsetSeconds: outcome.offsetSeconds,
-                  for: item.lyricsMedia,
-                  automationGuard: lyricsAutomationGuard,
-                  startedAtGeneration: automaticGeneration
-              ) else {
-            updateLyricsTransportMenu()
-            return
-        }
-        // 【MODIFIED】repository await 返回后再检查一次，禁止旧结果更新 UI。
-        guard lyricsAutomationGuard.permitsAutomaticResult(startedAt: automaticGeneration) else {
-            updateLyricsTransportMenu()
-            return
-        }
-        lyricPlayback = verified
-        if currentLyricsMode != .off {
-            lyricLines = verified.lines
-            currentLyricIndex = nil
-            if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
-                updateLyrics(at: elapsed)
-            }
-        }
-        updateLyricsTransportMenu()
-    }
-
-    /// 避免远程 MP4 同时播放和导出时争抢局域网带宽；缓冲不稳就让本轮分析让路。
-    private func waitForPlaybackBuffer(fingerprint: String) async -> Bool {
-        for _ in 0..<20 {
-            guard !Task.isCancelled,
-                  isCurrentMedia(fingerprint: fingerprint) else { return false }
-            if player?.currentItem?.isPlaybackLikelyToKeepUp == true { return true }
-            try? await Task.sleep(for: .milliseconds(500))
-        }
-        return false
-    }
 
     private func updateLyrics(at elapsed: Double) {
         guard elapsed.isFinite, !lyricLines.isEmpty else { return }
@@ -914,20 +856,18 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         if isSearchingLyrics { refresh.attributes = .disabled }
         children.append(refresh)
 
-        if isAnalyzingSound {
-            let analyzing = UIAction(
-                title: soundAnalysisMessage ?? "正在校准歌词…",
-                image: UIImage(systemName: "sparkles")
-            ) { _ in }
-            analyzing.attributes = .disabled
-            children.append(analyzing)
-        } else if let soundAnalysisMessage {
-            let result = UIAction(
-                title: soundAnalysisMessage,
-                image: UIImage(systemName: "sparkles")
-            ) { _ in }
-            result.attributes = .disabled
-            children.append(result)
+        if let pinned = analysisBundle?.pinnedOrdinaryPlayback {
+            let isCurrentPinned = lyricPlayback?.selectionOrigin == .manual
+                && lyricPlayback?.lyricIdentifier == pinned.lyricIdentifier
+            let pinnedAction = UIAction(
+                title: isCurrentPinned ? "已固定普通歌词" : "切换回已固定的普通歌词",
+                subtitle: pinned.trackName,
+                image: UIImage(systemName: "pin.fill")
+            ) { [weak self] _ in
+                self?.restorePinnedOrdinaryLyrics()
+            }
+            pinnedAction.state = isCurrentPinned ? .on : .off
+            children.append(pinnedAction)
         }
 
         if let playback = lyricPlayback {
@@ -935,11 +875,11 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             let statusTitle: String
             switch playback.selectionOrigin {
             case .automatic:
-                statusTitle = "网络歌词兜底·待声音分析"
+                statusTitle = "普通歌词·临时选择"
             case .asr:
-                statusTitle = "AI 歌词·已绑定"
+                statusTitle = "\(currentAdoptedAnalysisSource()?.displayName ?? "分析")字幕·已采用"
             case .manual:
-                statusTitle = playback.isConfirmed ? "家长已绑定" : "已选择·未确认"
+                statusTitle = playback.isConfirmed ? "普通歌词·已固定" : "已选择·未固定"
             }
             let status = UIAction(
                 title: "\(statusTitle)  总计 \(formattedOffset(offset)) · 自动 \(formattedOffset(playback.autoOffsetSeconds)) · 手动 \(formattedOffset(playback.manualAdjustmentSeconds))",
@@ -982,7 +922,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             ]
             if !playback.isConfirmed {
                 let confirm = UIAction(
-                    title: "确认并绑定这份歌词",
+                    title: "固定为这首视频的默认歌词",
                     image: UIImage(systemName: "pin.fill")
                 ) { [weak self] _ in
                     self?.confirmCurrentLyrics()
@@ -993,29 +933,133 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             children.append(contentsOf: timingChildren)
         }
 
-        let soundAnalysis = UIAction(
-            title: isAnalyzingSound
-                ? "AI 歌词·处理中…"
-                : (soundAnalysisMessage == nil ? "AI 歌词" : "重新分析 AI 歌词"),
-            image: UIImage(systemName: "sparkles")
-        ) { [weak self] _ in
-            self?.requestSoundAnalysis()
-        }
-        if isAnalyzingSound {
-            soundAnalysis.attributes = .disabled
-        }
-
         transportBarCustomMenuItems = [
             UIMenu(
                 title: "字幕与歌词",
                 image: UIImage(systemName: "captions.bubble.fill"),
                 children: children
             ),
-            soundAnalysis,
+            lyricsAnalysisMenu(),
             ratingMenu(),
             playbackModeMenu(),
-            volumeMenu()
+            playbackRateMenu()
         ]
+    }
+
+    // 【MODIFIED】分析菜单只提供显式操作；分析完成只更新可采用结果，不修改当前字幕。
+    /// 构建 Apple TV 歌词分析菜单；无输入，输出单层 UIMenu，不访问网络或持久化。
+    private func lyricsAnalysisMenu() -> UIMenu {
+        let asr = UIAction(
+            title: "ASR 识别歌词",
+            subtitle: analysisBundle?.asrResult == nil
+                ? "人工运行腾讯识别"
+                : "检查 Mac 缓存与版本；命中时不重复计费",
+            image: UIImage(systemName: "waveform")
+        ) { [weak self] _ in
+            self?.requestASRRecognition(forceRefresh: false)
+        }
+        let deepSeek = UIAction(
+            title: "DeepSeek 校准歌词",
+            subtitle: analysisBundle?.deepSeekResult == nil
+                ? (lyricCandidates.isEmpty && !isSearchingLyrics
+                    ? "仅用歌曲名与 ASR 时间线整理"
+                    : "使用已有 ASR 与最多三份候选")
+                : "检查 Mac 缓存与 ASR 版本",
+            image: UIImage(systemName: "sparkles")
+        ) { [weak self] _ in
+            self?.requestDeepSeekCalibration(forceRefresh: false)
+        }
+        let rerunASR = UIAction(
+            title: "重新 ASR 识别",
+            subtitle: "强制再次消耗腾讯 API",
+            image: UIImage(systemName: "arrow.clockwise")
+        ) { [weak self] _ in
+            self?.requestASRRecognition(forceRefresh: true)
+        }
+        let rerunDeepSeek = UIAction(
+            title: "重新 DeepSeek 校准",
+            subtitle: "只重新运行 DeepSeek，不重新 ASR",
+            image: UIImage(systemName: "arrow.triangle.2.circlepath")
+        ) { [weak self] _ in
+            self?.requestDeepSeekCalibration(forceRefresh: true)
+        }
+
+        let hasASR = analysisBundle?.asrResult != nil
+        if isAnalyzingSound {
+            asr.attributes = .disabled
+            deepSeek.attributes = .disabled
+            rerunASR.attributes = .disabled
+            rerunDeepSeek.attributes = .disabled
+        } else {
+            if !hasASR {
+                deepSeek.attributes = .disabled
+                rerunDeepSeek.attributes = .disabled
+            }
+            if analysisBundle?.asrResult == nil { rerunASR.attributes = .disabled }
+            if analysisBundle?.deepSeekResult == nil { rerunDeepSeek.attributes = .disabled }
+        }
+
+        let asrStatus = UIAction(
+            title: "ASR：\(asrAnalysisStatus.displayText)",
+            image: UIImage(systemName: analysisBundle?.asrResult == nil ? "circle" : "checkmark.circle.fill")
+        ) { _ in }
+        asrStatus.attributes = .disabled
+        let deepSeekStatus = UIAction(
+            title: "DeepSeek：\(deepSeekAnalysisStatus.displayText)",
+            image: UIImage(systemName: analysisBundle?.deepSeekResult == nil ? "circle" : "checkmark.circle.fill")
+        ) { _ in }
+        deepSeekStatus.attributes = .disabled
+
+        let adoptedSource = currentAdoptedAnalysisSource()
+        let currentResult = UIAction(
+            title: "当前采用字幕：\(adoptedSource?.displayName ?? "未采用分析字幕")",
+            image: UIImage(systemName: "doc.text.magnifyingglass")
+        ) { _ in }
+        currentResult.attributes = .disabled
+        let adoptASR = analysisAdoptionAction(for: .asr)
+        let adoptDeepSeek = analysisAdoptionAction(for: .deepSeek)
+
+        return UIMenu(
+            title: "歌词分析",
+            image: UIImage(systemName: "sparkles"),
+            children: [
+                asr,
+                deepSeek,
+                rerunASR,
+                rerunDeepSeek,
+                asrStatus,
+                deepSeekStatus,
+                currentResult,
+                adoptASR,
+                adoptDeepSeek
+            ]
+        )
+    }
+
+    /// 为 ASR/DeepSeek 分别创建可采用项；一个结果缺失不会阻塞另一个。
+    private func analysisAdoptionAction(for source: LyricsAnalysisSource) -> UIAction {
+        let result = analysisBundle?.result(for: source)
+        let isAdopted = source == currentAdoptedAnalysisSource()
+        let action = UIAction(
+            title: isAdopted ? "已采用 \(source.displayName) 字幕" : "采用 \(source.displayName) 字幕",
+            subtitle: result.map { "共 \($0.candidate.lines.count) 行；采用后设为这首视频的默认字幕" }
+                ?? "请先生成该分析结果",
+            image: UIImage(systemName: isAdopted ? "checkmark.seal.fill" : "checkmark.seal")
+        ) { [weak self] _ in
+            self?.adoptAnalysisResult(source: source)
+        }
+        action.state = isAdopted ? .on : .off
+        if result == nil || isAnalyzingSound { action.attributes = .disabled }
+        return action
+    }
+
+    /// 根据当前 playback 的稳定歌词标识判断实际采用了哪一份分析字幕。
+    private func currentAdoptedAnalysisSource() -> LyricsAnalysisSource? {
+        guard lyricPlayback?.selectionOrigin == .asr,
+              let identifier = lyricPlayback?.lyricIdentifier else { return nil }
+        return [LyricsAnalysisSource.asr, .deepSeek].first { source in
+            analysisBundle?.result(for: source)?.candidate.persistentIdentifier == identifier
+        }
     }
 
     /// 创建当前视频的三态本地评分菜单；屏蔽后结束当前播放会话。
@@ -1126,24 +1170,23 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         )
     }
 
-    private func volumeMenu() -> UIMenu {
-        let high = volumeAction(title: "高", value: 1.0, symbol: "speaker.wave.3.fill")
-        let mediumHigh = volumeAction(title: "中高", value: 0.75, symbol: "speaker.wave.3.fill")
-        let medium = volumeAction(title: "中", value: 0.5, symbol: "speaker.wave.2.fill")
-        let low = volumeAction(title: "低", value: 0.25, symbol: "speaker.wave.1.fill")
-        let muted = volumeAction(title: "静音", value: 0, symbol: "speaker.slash.fill")
+    private func playbackRateMenu() -> UIMenu {
+        let actions = BabyPlayerPlaybackRatePolicy.availableRates.map { rate in
+            playbackRateAction(rate)
+        }
         return UIMenu(
-            title: "声音",
-            image: UIImage(systemName: currentVolume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill"),
-            children: [high, mediumHigh, medium, low, muted]
+            title: "倍速：\(BabyPlayerPlaybackRatePolicy.title(for: currentPlaybackRate))",
+            image: UIImage(systemName: "speedometer"),
+            children: actions
         )
     }
 
-    private func volumeAction(title: String, value: Float, symbol: String) -> UIAction {
-        let action = UIAction(title: title, image: UIImage(systemName: symbol)) { [weak self] _ in
-            self?.setPlayerVolume(value)
+    private func playbackRateAction(_ rate: Float) -> UIAction {
+        let title = BabyPlayerPlaybackRatePolicy.title(for: rate) + " 倍速"
+        let action = UIAction(title: title) { [weak self] _ in
+            self?.setPlaybackRate(rate)
         }
-        action.state = abs(currentVolume - value) < 0.01 ? .on : .off
+        action.state = abs(currentPlaybackRate - rate) < 0.01 ? .on : .off
         return action
     }
 
@@ -1197,9 +1240,21 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         updateLyricsTransportMenu()
     }
 
-    private func setPlayerVolume(_ value: Float) {
-        currentVolume = min(1, max(0, value))
-        player?.volume = currentVolume
+    private func setPlaybackRate(_ value: Float) {
+        let normalized = BabyPlayerPlaybackRatePolicy.normalized(value)
+        currentPlaybackRate = normalized
+        guard let player else {
+            updateLyricsTransportMenu()
+            return
+        }
+        let wasPlaying = BabyPlayerPlaybackTogglePolicy.action(
+            timeControlStatus: player.timeControlStatus,
+            rate: player.rate
+        ) == .pause
+        player.defaultRate = normalized
+        if wasPlaying {
+            player.rate = normalized
+        }
         updateLyricsTransportMenu()
     }
 
@@ -1221,15 +1276,6 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 updateLyrics(at: elapsed)
             }
             updateLyricsTransportMenu()
-            if playback.selectionOrigin == .automatic,
-               let item = currentQueueItem {
-                startSoundAnalysis(
-                    for: item,
-                    candidates: lyricCandidates,
-                    reference: plainTextReference,
-                    waitForBuffer: true
-                )
-            }
             return
         }
         guard let item = currentQueueItem else {
@@ -1239,31 +1285,155 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         prepareLyrics(for: item, mode: mode)
     }
 
-    private func requestSoundAnalysis() {
-        guard let item = currentQueueItem else { return }
-        if currentLyricsMode == .off {
-            currentLyricsMode = .english
-            if let playback = lyricPlayback {
-                lyricLines = playback.lines
-                currentLyricIndex = nil
-                if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
-                    updateLyrics(at: elapsed)
-                }
+    // 【MODIFIED】以下三个入口是分析生命周期的唯一 UI 触发点。
+    /// 人工运行或强制重跑 ASR；输入是否强制刷新，输出 Void，会访问 Mac 服务并持久结果，不切换当前歌词。
+    private func requestASRRecognition(forceRefresh: Bool) {
+        guard let item = currentQueueItem, !isAnalyzingSound else { return }
+
+        isAnalyzingSound = true
+        asrAnalysisStatus = .running
+        showManualAnalysisMessage(
+            forceRefresh ? "ASR：强制重新识别" : "ASR：识别中…",
+            detail: "ASR：识别中…\nDeepSeek：\(deepSeekAnalysisStatus.displayText)\n当前字幕未改变"
+        )
+        soundAnalysisFingerprint = item.lyricsMedia.asrFingerprint
+        soundAnalysisTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let analysis = try await BabyPlayerASRCoordinator.shared.recognize(
+                    item: item,
+                    forceRefresh: forceRefresh,
+                    onStage: { [weak self] stage in
+                        guard let self else { return }
+                        self.showAILyricsProgress(self.visibleProgress(for: stage))
+                    }
+                )
+                let candidate = try analysis.lyricsCandidate(
+                    title: item.lyricsMedia.searchTitle,
+                    mediaFingerprint: item.lyricsMedia.asrFingerprint
+                )
+                let bundle = try await BabyLyricsRepository.shared.storeASRResult(
+                    candidate,
+                    asrEvidenceHash: analysis.evidenceHash,
+                    for: item.lyricsMedia
+                )
+                guard !Task.isCancelled,
+                      self.isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint) else { return }
+                self.analysisBundle = bundle
+                self.latestAnalysisSource = .asr
+                self.asrAnalysisStatus = .completed
+                self.deepSeekAnalysisStatus = bundle.deepSeekResult == nil ? .notRun : .completed
+                self.showManualAnalysisMessage(
+                    "ASR：已完成",
+                    detail: "ASR：已完成\nDeepSeek：\(self.deepSeekAnalysisStatus.displayText)\n请手动选择是否采用"
+                )
+            } catch {
+                guard !Task.isCancelled else { return }
+                let cocoa = error as NSError
+                babyPlayerSystemPlayerLogger.error(
+                    "ASR post-processing failed domain=\(cocoa.domain, privacy: .public) code=\(cocoa.code, privacy: .public)"
+                )
+                let message = BabyPlayerAnalysisErrorPresentation.message(
+                    error,
+                    fallback: "ASR 处理失败"
+                )
+                self.asrAnalysisStatus = .failed(message)
+                self.showManualAnalysisMessage(
+                    "ASR：失败",
+                    detail: "ASR：失败\n\(message)\n当前字幕未改变"
+                )
             }
+            self.isAnalyzingSound = false
+            self.soundAnalysisTask = nil
+            self.soundAnalysisFingerprint = nil
+            self.updateLyricsTransportMenu()
         }
-        guard !isAnalyzingSound else { return }
-        if isSearchingLyrics {
-            shouldAnalyzeAfterSearch = true
-            showAILyricsProgress(.deferred("歌词搜索完成后开始声音分析"))
+    }
+
+    /// 人工运行或强制重跑 DeepSeek；输入是否强制刷新，输出 Void，只使用已有 ASR 缓存与普通候选。
+    private func requestDeepSeekCalibration(forceRefresh: Bool) {
+        guard let item = currentQueueItem,
+              let asrResult = analysisBundle?.asrResult,
+              !isAnalyzingSound else { return }
+        guard !isSearchingLyrics else {
+            deepSeekAnalysisStatus = .failed("请先等待普通歌词搜索完成")
+            updateLyricsTransportMenu()
             return
         }
-        startSoundAnalysis(
-            for: item,
-            candidates: lyricCandidates,
-            reference: plainTextReference,
-            waitForBuffer: true,
-            manuallyRequested: true
+
+        isAnalyzingSound = true
+        deepSeekAnalysisStatus = .running
+        showManualAnalysisMessage(
+            forceRefresh ? "DeepSeek：强制重新校准" : "DeepSeek：校准中…",
+            detail: "ASR：已完成\nDeepSeek：校准中…\n当前字幕未改变"
         )
+        soundAnalysisFingerprint = item.lyricsMedia.asrFingerprint
+        soundAnalysisTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let reconciliation = try await BabyPlayerASRCoordinator.shared.reconcile(
+                    item: item,
+                    candidates: self.lyricCandidates,
+                    forceRefresh: forceRefresh
+                )
+                let bundle = try await BabyLyricsRepository.shared.storeDeepSeekResult(
+                    reconciliation.candidate,
+                    asrEvidenceHash: asrResult.asrEvidenceHash,
+                    for: item.lyricsMedia
+                )
+                guard !Task.isCancelled,
+                      self.isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint) else { return }
+                self.analysisBundle = bundle
+                self.latestAnalysisSource = .deepSeek
+                self.deepSeekAnalysisStatus = .completed
+                self.showManualAnalysisMessage(
+                    "DeepSeek：已完成",
+                    detail: "ASR：已完成\nDeepSeek：已完成\n请手动选择是否采用"
+                )
+            } catch {
+                guard !Task.isCancelled else { return }
+                let message = (error as? LocalizedError)?.errorDescription ?? "DeepSeek 校准失败"
+                self.deepSeekAnalysisStatus = .failed(message)
+                self.showManualAnalysisMessage(
+                    "DeepSeek：失败",
+                    detail: "ASR：已完成\nDeepSeek：失败\n\(message)"
+                )
+            }
+            self.isAnalyzingSound = false
+            self.soundAnalysisTask = nil
+            self.soundAnalysisFingerprint = nil
+            self.updateLyricsTransportMenu()
+        }
+    }
+
+    /// 采用指定的 ASR 或 DeepSeek 结果；只切换/持久化字幕，不会调用分析 API。
+    private func adoptAnalysisResult(source: LyricsAnalysisSource) {
+        guard let result = analysisBundle?.result(for: source),
+              let media = currentQueueItem?.lyricsMedia else { return }
+        latestAnalysisSource = source
+        lyricsAutomationGuard.lockManually()
+        lyricsSelectionTask?.cancel()
+        lyricsSelectionTask = Task { [weak self] in
+            guard let self else { return }
+            let playback = await BabyLyricsRepository.shared.playback(
+                for: result.candidate,
+                media: media,
+                selectionOrigin: .asr
+            )
+            _ = try? await BabyLyricsRepository.shared.confirm(playback, for: media)
+            guard !Task.isCancelled, self.currentQueueItem?.lyricsMedia.id == media.id else { return }
+            self.currentLyricsMode = .english
+            self.lyricPlayback = playback
+            self.lyricLines = playback.lines
+            self.currentLyricIndex = nil
+            if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
+                self.updateLyrics(at: elapsed)
+            }
+            self.showManualAnalysisMessage(
+                "已采用 \(source.displayName) 字幕",
+                detail: "当前字幕：\(result.source.displayName)\n以后打开这首视频将直接使用"
+            )
+        }
     }
 
     private func refreshLyricsCandidates() {
@@ -1351,8 +1521,24 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 self.updateLyrics(at: elapsed)
             }
             self.updateLyricsTransportMenu()
-            self.persistLyricsPlayback(playback, for: media)
+            // 【MODIFIED】点击候选只切换当前字幕；只有“固定为默认”才持久化。
         }
+    }
+
+    /// 切回保留的普通固定歌词；无输入，输出 Void，会把默认优先级从分析结果改回普通歌词。
+    private func restorePinnedOrdinaryLyrics() {
+        guard let pinned = analysisBundle?.pinnedOrdinaryPlayback,
+              let media = currentQueueItem?.lyricsMedia else { return }
+        lyricsAutomationGuard.lockManually()
+        lyricPlayback = pinned
+        lyricLines = pinned.lines
+        currentLyricsMode = .english
+        currentLyricIndex = nil
+        if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
+            updateLyrics(at: elapsed)
+        }
+        updateLyricsTransportMenu()
+        persistLyricsPlayback(pinned, for: media)
     }
 
     private func adjustLyricsOffset(by delta: Double) {
@@ -1427,6 +1613,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         lyricsSaveTask = Task {
             await pendingSave?.value
             _ = try? await BabyLyricsRepository.shared.confirm(playback, for: media)
+            let refreshed = await BabyLyricsRepository.shared.analysisBundle(for: media)
+            guard self.currentQueueItem?.lyricsMedia.id == media.id else { return }
+            self.analysisBundle = refreshed
+            self.updateLyricsTransportMenu()
         }
     }
 

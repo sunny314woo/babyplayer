@@ -2,7 +2,7 @@
 // JellyfinSpikeClient.swift
 // 用途：封装技术 Spike 所需的最小 Jellyfin HTTP API。
 // 主要功能：服务器探测、Quick Connect、读取视频库和生成直放 URL。
-// 最近修改：2026-08-20 从单视频 Spike 扩展为全量媒体列表。
+// 最近修改：2026-08-24 接收 Jellyfin 本机 Path，供 Mac 本地歌词分析读取原视频。
 //
 
 import Foundation
@@ -90,6 +90,7 @@ struct JellyfinChapter: Decodable {
 struct JellyfinMediaItem: Decodable, Identifiable {
     let id: String
     let name: String
+    let path: String?
     let collectionType: String?
     let artists: [String]?
     let runTimeTicks: Int64?
@@ -100,6 +101,7 @@ struct JellyfinMediaItem: Decodable, Identifiable {
     enum CodingKeys: String, CodingKey {
         case id = "Id"
         case name = "Name"
+        case path = "Path"
         case collectionType = "CollectionType"
         case artists = "Artists"
         case runTimeTicks = "RunTimeTicks"

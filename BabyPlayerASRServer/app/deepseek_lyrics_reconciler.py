@@ -32,8 +32,9 @@ Return JSON only:
 "lines":[{"text":"...","asr_word_start_index":0,"asr_word_end_index":0,
 "source":"candidate_id|web_id|mixed|asr_only","source_line_ids":["candidate_id:line_id"],
 "confidence":0.0,"text_corrected":false}],
-"discarded_lines":[{"source_line_id":"candidate_id:line_id","text":"...",
-"reason":"no_audio_evidence|wrong_version|duplicate_error|unsupported"}]}.
+"discarded_lines":[]}.
+Always return discarded_lines as an empty array; do not enumerate rejected candidate lines.
+Keep source_line_ids minimal and include at most three identifiers per final line.
 The goal is the most faithful lyric for this audio, not the prettiest standard version."""
 
 
@@ -59,7 +60,7 @@ class DeepSeekLyricsReconcilerClient:
         return self._complete_json(ASSESSMENT_SYSTEM_PROMPT, evidence, max_tokens=1200)
 
     def reconcile(self, evidence: dict) -> dict:
-        return self._complete_json(RECONCILIATION_SYSTEM_PROMPT, evidence, max_tokens=6000)
+        return self._complete_json(RECONCILIATION_SYSTEM_PROMPT, evidence, max_tokens=8000)
 
     def _complete_json(self, system_prompt: str, evidence: dict, *, max_tokens: int) -> dict:
         request_body = {

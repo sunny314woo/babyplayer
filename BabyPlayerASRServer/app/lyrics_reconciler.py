@@ -52,6 +52,9 @@ class LyricsReconcilerService:
         self.model_name = model_name
         self.analysis_version = analysis_version
         self.reconciliation_version = reconciliation_version
+        # DeepSeek output maps ASR word indices. A new ASR timeline version must not
+        # reuse lyrics calibrated against the previous whole-song/partial timeline.
+        self.cache_version = f"{reconciliation_version}|asr:{analysis_version}"
 
     def reconcile(
         self,
@@ -64,7 +67,7 @@ class LyricsReconcilerService:
         fingerprint_hash = fingerprint(request.media_fingerprint)
         if not request.force_refresh:
             cached = self.repository.cached_ai_lyrics(
-                subject_hash, fingerprint_hash, self.reconciliation_version
+                subject_hash, fingerprint_hash, self.cache_version
             )
             if cached:
                 return {**cached, "status": "cached", "cache_hit": True}
@@ -123,7 +126,7 @@ class LyricsReconcilerService:
         self.repository.store_ai_lyrics(
             subject_hash=subject_hash,
             fingerprint_hash=fingerprint_hash,
-            reconciliation_version=self.reconciliation_version,
+            reconciliation_version=self.cache_version,
             result=result,
             now=now,
         )
