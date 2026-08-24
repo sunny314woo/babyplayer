@@ -67,6 +67,18 @@ HTTP 429、错误码 `MONTHLY_ASR_LIMIT_REACHED` 和北京时间的 `next_availa
 
 ## VPS 部署
 
+服务代码、systemd、Nginx 示例和部署脚本应提交到 Git；真实 `.env` 只保存在 VPS 和
+本机被忽略的私密副本中。需要把 VPS 当前配置安全同步到 Mac 时，在项目根目录运行：
+
+```bash
+bash BabyPlayerASRServer/scripts/download-vps-env.sh
+```
+
+脚本会要求一次 VPS sudo 授权，将 `/opt/babyplayer-asr/.env` 下载为本地
+`BabyPlayerASRServer/.env`（权限 `0600`），验证必要配置项，并立即删除 VPS 上的临时
+副本。已有本地 `.env` 会先备份；`.env`、下载临时文件和备份文件均被 Git 忽略，脚本
+不会显示任何密钥内容。
+
 把本目录上传到新的 release 目录后执行：
 
 ```bash

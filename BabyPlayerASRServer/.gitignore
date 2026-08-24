@@ -1,4 +1,6 @@
 .env
+.env.backup-*
+.env.download.*
 .venv/
 __pycache__/
 .pytest_cache/
