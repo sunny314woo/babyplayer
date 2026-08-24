@@ -835,6 +835,65 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(bounded.last?.text, "word99")
     }
 
+    /// 验证 D3 客户端只上传标题/候选，并接受由 VPS 从 ASR word range 换算的时间轴。
+    func testD3ReconcilerPostsCandidatesAndDecodesServerTimedLyrics() async throws {
+        let capture = BabyPlayerMockRequestCapture()
+        BabyPlayerMockURLProtocol.setHandler { request in
+            capture.record(request)
+            let body = try requestBodyData(request)
+            let json = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: body) as? [String: Any]
+            )
+            XCTAssertEqual(json["song_title"] as? String, "Twinkle Twinkle")
+            XCTAssertNil(json["transcript"])
+            XCTAssertNil(json["asr_words"])
+            XCTAssertEqual((json["candidates"] as? [[String: Any]])?.count, 1)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            let payload = Data(#"{"status":"completed","cache_hit":false,"model":"deepseek-v4-flash","reconciliation_version":"babyplayer-lyrics-d3-v1","song_match_confidence":0.94,"primary_source":"candidate_1","web_search_used":false,"lines":[{"text":"Twinkle, twinkle, little star","asr_word_start_index":0,"asr_word_end_index":3,"start_seconds":0.4,"end_seconds":2.0,"source":"candidate_1","source_line_ids":["candidate_1:line_0"],"confidence":0.96,"text_corrected":true},{"text":"How I wonder what you are","asr_word_start_index":4,"asr_word_end_index":9,"start_seconds":2.2,"end_seconds":4.1,"source":"candidate_1","source_line_ids":["candidate_1:line_1"],"confidence":0.95,"text_corrected":false}],"discarded_lines":[]}"#.utf8)
+            return (response, payload)
+        }
+        defer { BabyPlayerMockURLProtocol.setHandler(nil) }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BabyPlayerMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        let input = LyricsCandidate(
+            id: 42,
+            trackName: "Twinkle Twinkle",
+            artistName: "Kids",
+            albumName: nil,
+            duration: 10,
+            lines: [
+                TimedLyricLine(time: 20, text: "Twinkle twinkle little star"),
+                TimedLyricLine(time: 2, text: "How I wonder what you are")
+            ],
+            matchScore: 0,
+            providerName: "LRCLIB"
+        )
+
+        let result = try await BabyPlayerLyricsReconcilerClient(session: session).reconcile(
+            songTitle: "Twinkle Twinkle",
+            mediaFingerprint: "test-media-fingerprint",
+            candidates: [input]
+        )
+
+        XCTAssertEqual(capture.path, "/v1/lyrics/reconcile")
+        XCTAssertEqual(result.candidate.lines.map(\.time), [0.4, 2.2])
+        XCTAssertEqual(result.candidate.lines.compactMap(\.endTime), [2.0, 4.1])
+        XCTAssertEqual(result.candidate.lines.map(\.text), [
+            "Twinkle, twinkle, little star",
+            "How I wonder what you are"
+        ])
+        XCTAssertEqual(result.confidence, 0.94)
+        XCTAssertFalse(result.webSearchUsed)
+    }
+
     /// 验证全局单调 alignment 会跳过孤立的重复前奏；输入是含额外首句的重复副歌，输出是连续完整副歌的时间轴，不修改状态。
     // 【MODIFIED】Version C 要求整首歌全局优化，不允许 cursor + local-window greedy。
     func testRepeatedChorusUsesGlobalMonotonicAlignment() {
@@ -1081,4 +1140,23 @@ private final class BabyPlayerMockURLProtocol: URLProtocol, @unchecked Sendable 
     }
 
     override func stopLoading() { }
+}
+
+/// URLSession 可能把 JSON body 转换为 stream；测试统一读取两种形式。
+private func requestBodyData(_ request: URLRequest) throws -> Data {
+    if let body = request.httpBody { return body }
+    guard let stream = request.httpBodyStream else {
+        throw URLError(.badServerResponse)
+    }
+    stream.open()
+    defer { stream.close() }
+    var result = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while stream.hasBytesAvailable {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count < 0 { throw stream.streamError ?? URLError(.cannotDecodeRawData) }
+        if count == 0 { break }
+        result.append(buffer, count: count)
+    }
+    return result
 }

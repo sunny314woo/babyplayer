@@ -80,6 +80,15 @@ ON asr_analysis_cache(subject_hash, audio_sha256);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_asr_one_claimed_audio
 ON asr_operations(subject_hash, audio_sha256)
 WHERE status='CLAIMED';
+CREATE TABLE IF NOT EXISTS ai_lyrics_cache (
+  subject_hash TEXT NOT NULL,
+  media_fingerprint_hash TEXT NOT NULL,
+  reconciliation_version TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (subject_hash, media_fingerprint_hash, reconciliation_version)
+);
 """
 
 
@@ -109,6 +118,50 @@ class AsrRepository:
             "transcript": row["transcript"],
             "segments": json.loads(row["segments_json"]),
         }
+
+    def cached_ai_lyrics(
+        self, subject_hash: str, fingerprint_hash: str, reconciliation_version: str
+    ):
+        """Read a cached D3 result without exposing or copying ASR/audio evidence."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT result_json FROM ai_lyrics_cache
+                   WHERE subject_hash=? AND media_fingerprint_hash=?
+                     AND reconciliation_version=?""",
+                (subject_hash, fingerprint_hash, reconciliation_version),
+            ).fetchone()
+        return json.loads(row["result_json"]) if row else None
+
+    def store_ai_lyrics(
+        self,
+        *,
+        subject_hash: str,
+        fingerprint_hash: str,
+        reconciliation_version: str,
+        result: dict,
+        now: datetime,
+    ) -> None:
+        """Atomically replace one fingerprint's reusable D3 lyrics result."""
+        timestamp = now.astimezone(timezone.utc).isoformat()
+        serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO ai_lyrics_cache
+                   (subject_hash, media_fingerprint_hash, reconciliation_version,
+                    result_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(subject_hash, media_fingerprint_hash, reconciliation_version)
+                   DO UPDATE SET result_json=excluded.result_json,
+                     updated_at=excluded.updated_at""",
+                (
+                    subject_hash,
+                    fingerprint_hash,
+                    reconciliation_version,
+                    serialized,
+                    timestamp,
+                    timestamp,
+                ),
+            )
 
     def alias_cached_audio(
         self,

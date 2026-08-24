@@ -14,6 +14,13 @@ def _placeholder(value: str) -> bool:
     return not normalized or normalized == "XX" or normalized.startswith("XX_")
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     api_token: str = os.getenv("BABYPLAYER_API_TOKEN", "XX_BABYPLAYER_API_TOKEN")
@@ -25,6 +32,16 @@ class Settings:
         "DEEPSEEK_ENDPOINT", "https://api.deepseek.com/chat/completions"
     )
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    lyrics_reconciliation_version: str = os.getenv(
+        "LYRICS_RECONCILIATION_VERSION", "babyplayer-lyrics-d3-v1"
+    )
+    lyrics_web_search_enabled: bool = _boolean("LYRICS_WEB_SEARCH_ENABLED", True)
+    lyrics_web_search_timeout_seconds: float = float(
+        os.getenv("LYRICS_WEB_SEARCH_TIMEOUT_SECONDS", "8")
+    )
+    lyrics_web_search_max_results: int = int(
+        os.getenv("LYRICS_WEB_SEARCH_MAX_RESULTS", "3")
+    )
     endpoint: str = os.getenv("TENCENT_ASR_ENDPOINT", "https://asr.cloud.tencent.com")
     engine_type: str = os.getenv("TENCENT_ASR_ENGINE_TYPE", "16k_en")
     monthly_limit_seconds: int = int(

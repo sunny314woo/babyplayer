@@ -19,12 +19,13 @@ babyplayer-asr.service              独立 systemd 服务
 player.wisteriasoftware.uk          独立子域名
 ```
 
-同一 BabyPlayer 服务进程内有两个彼此独立的模块：
+同一 BabyPlayer 服务进程内有三个边界清晰的模块：
 
 - ASR 模块保护腾讯密钥、执行每月 18,000 秒硬上限，并缓存腾讯返回的转写文字和时间戳。
-- 歌词修复模块调用 DeepSeek V4 Flash 非思考模式，输入是 AI v1 原始行、本地 deterministic alignment、ASR words 和 same-song 证据；输出只有逐行 `suggested_text`/evidence/confidence，不包含时间戳。
+- 兼容歌词修复模块保留原 `/v1/refine` limited-repair contract，供新 D3 链路失败时回退。
+- D3 Lyrics Evidence Reconciler 从服务端缓存读取 ASR，两阶段调用 DeepSeek 完成候选审查和最终 word-range 映射；必要时通过独立限域检索器获取新的候选证据。
 
-服务不下载 Jellyfin 视频、不搜索歌词、不保存音频，也不持久化候选歌词或 DeepSeek 输出。
+服务不下载 Jellyfin 视频、不保存音频。网页候选只存在于当次请求内存；最终通过服务端验证的 AI Lyrics 会按媒体指纹和 reconciliation version 写入 SQLite 缓存。
 
 ## 本地运行
 
@@ -51,6 +52,14 @@ python -m pytest -q -p no:cacheprovider
 - `GET /v1/cache?media_fingerprint=...`：读取已有转写，缓存命中不消耗额度。
 - `POST /v1/analyze`：上传 M4A/AAC/MP3；BabyPlayer 实际固定使用 M4A。
 - `POST /v1/refine`：接收 `original_lines` 及其 `aligned_words`、ASR transcript 和集中计算的 evidence；返回 `line_identifier / original_text / suggested_text / should_modify / evidence / confidence`。响应 contract 不存在时间戳字段。
+- `POST /v1/lyrics/reconcile`：D3 主接口。Apple TV 只传 `media_fingerprint`/`song_title`/最多 3 份候选；服务器读取 ASR 缓存，必要时限域检索，验证 DeepSeek 返回的 ASR word ranges 后生成最终时间。`force_refresh=true` 可忽略 AI Lyrics 缓存重新分析。
+
+D3 的可复用边界：
+
+- `lyrics_reconciler.py`：纯编排/校验服务，不依赖 FastAPI 或 DeepSeek 传输层；
+- `deepseek_lyrics_reconciler.py`：候选评估 + 最终重建两阶段 JSON 适配器；
+- `lyrics_retriever.py`：HTTPS/域名/超时/响应大小均受限的候选证据检索器；
+- `AsrRepository`：ASR 和最终 AI Lyrics 分表缓存。
 
 所有 `/v1/*` 请求使用独立的 `Authorization: Bearer ...`。达到 5 小时后，新的分析返回
 HTTP 429、错误码 `MONTHLY_ASR_LIMIT_REACHED` 和北京时间的 `next_available_at`；已缓存

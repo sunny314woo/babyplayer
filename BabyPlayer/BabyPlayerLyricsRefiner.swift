@@ -5,6 +5,7 @@
 // 最近修改：2026-08-23 收紧 Version C repair contract，确保 AI v1/v2 共用 identity 且时间戳不受 DeepSeek 控制。
 //
 
+import CryptoKit
 import Foundation
 
 private struct LyricsRefinerConfiguration {
@@ -354,5 +355,202 @@ struct BabyPlayerLyricsRefinerClient {
                 }
             )
         }
+    }
+}
+
+// MARK: - Version D3 reusable evidence reconciliation client
+
+private struct LyricsReconciliationRequest: Encodable {
+    struct CandidateLine: Encodable {
+        let lineIdentifier: String
+        let text: String
+        let originalStartSeconds: Double?
+        let originalEndSeconds: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case text
+            case lineIdentifier = "line_identifier"
+            case originalStartSeconds = "original_start_seconds"
+            case originalEndSeconds = "original_end_seconds"
+        }
+    }
+
+    struct Candidate: Encodable {
+        let candidateID: String
+        let source: String
+        let title: String
+        let artist: String
+        let lines: [CandidateLine]
+
+        enum CodingKeys: String, CodingKey {
+            case source, title, artist, lines
+            case candidateID = "candidate_id"
+        }
+    }
+
+    let mediaFingerprint: String
+    let songTitle: String
+    let candidates: [Candidate]
+    let forceRefresh: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case candidates
+        case mediaFingerprint = "media_fingerprint"
+        case songTitle = "song_title"
+        case forceRefresh = "force_refresh"
+    }
+}
+
+private struct LyricsReconciliationResponse: Decodable {
+    struct Line: Decodable {
+        let text: String
+        let asrWordStartIndex: Int
+        let asrWordEndIndex: Int
+        let startSeconds: Double
+        let endSeconds: Double
+        let source: String
+        let confidence: Double
+        let textCorrected: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case text, source, confidence
+            case asrWordStartIndex = "asr_word_start_index"
+            case asrWordEndIndex = "asr_word_end_index"
+            case startSeconds = "start_seconds"
+            case endSeconds = "end_seconds"
+            case textCorrected = "text_corrected"
+        }
+    }
+
+    let status: String
+    let cacheHit: Bool
+    let model: String
+    let reconciliationVersion: String
+    let songMatchConfidence: Double
+    let primarySource: String
+    let webSearchUsed: Bool
+    let lines: [Line]
+
+    enum CodingKeys: String, CodingKey {
+        case status, model, lines
+        case cacheHit = "cache_hit"
+        case reconciliationVersion = "reconciliation_version"
+        case songMatchConfidence = "song_match_confidence"
+        case primarySource = "primary_source"
+        case webSearchUsed = "web_search_used"
+    }
+}
+
+struct BabyPlayerLyricsReconciliationResult: Sendable {
+    let candidate: LyricsCandidate
+    let confidence: Double
+    let cacheHit: Bool
+    let webSearchUsed: Bool
+}
+
+/// D3 API 只上传标题和最多三份候选；ASR 和时间轴由 VPS 缓存与验证。
+struct BabyPlayerLyricsReconcilerClient {
+    private let configuration: LyricsRefinerConfiguration
+    private let session: URLSession
+
+    init(session: URLSession = .shared) throws {
+        configuration = try .load()
+        self.session = session
+    }
+
+    func reconcile(
+        songTitle: String,
+        mediaFingerprint: String,
+        candidates: [LyricsCandidate],
+        forceRefresh: Bool = false
+    ) async throws -> BabyPlayerLyricsReconciliationResult {
+        let ordinaryCandidates = candidates.filter { $0.identityAnchor == nil }
+        let requestCandidates = ordinaryCandidates.prefix(3).enumerated().map { index, candidate in
+            LyricsReconciliationRequest.Candidate(
+                candidateID: "candidate_\(index + 1)",
+                source: candidate.providerName ?? "unknown",
+                title: candidate.trackName,
+                artist: candidate.artistName,
+                lines: candidate.lines.enumerated().map { lineIndex, line in
+                    .init(
+                        lineIdentifier: "line_\(lineIndex)",
+                        text: line.text,
+                        originalStartSeconds: line.time,
+                        originalEndSeconds: line.endTime
+                    )
+                }
+            )
+        }
+        let body = LyricsReconciliationRequest(
+            mediaFingerprint: mediaFingerprint,
+            songTitle: songTitle,
+            candidates: Array(requestCandidates),
+            forceRefresh: forceRefresh
+        )
+        var request = URLRequest(
+            url: configuration.baseURL.appendingPathComponent("lyrics/reconcile")
+        )
+        request.httpMethod = "POST"
+        request.timeoutInterval = 100
+        request.setValue("Bearer \(configuration.apiToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BabyPlayerASRError.invalidResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
+                throw BabyPlayerASRError.server(envelope.detail.message ?? envelope.detail.code)
+            }
+            throw BabyPlayerASRError.invalidResponse
+        }
+        let reconciled = try JSONDecoder().decode(LyricsReconciliationResponse.self, from: data)
+        guard reconciled.lines.count >= 2,
+              (0.0...1.0).contains(reconciled.songMatchConfidence) else {
+            throw BabyPlayerASRError.server("AI 歌词重建证据不足")
+        }
+        var previousEnd = -1
+        let lines = try reconciled.lines.map { line -> TimedLyricLine in
+            guard line.asrWordStartIndex > previousEnd,
+                  line.asrWordEndIndex >= line.asrWordStartIndex,
+                  line.endSeconds >= line.startSeconds,
+                  !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw BabyPlayerASRError.invalidResponse
+            }
+            previousEnd = line.asrWordEndIndex
+            return TimedLyricLine(
+                time: line.startSeconds,
+                text: line.text,
+                endTime: line.endSeconds
+            )
+        }
+        let anchor = "ai-reconciled:\(mediaFingerprint)"
+        let digest = SHA256.hash(data: Data(anchor.utf8))
+        let numericID = digest.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        let candidate = LyricsCandidate(
+            id: -1_900_000_000 - Int(numericID % 200_000_000),
+            trackName: songTitle,
+            artistName: ordinaryCandidates.first?.artistName ?? "",
+            albumName: nil,
+            duration: max(
+                ordinaryCandidates.map(\.duration).max() ?? 0,
+                lines.last?.endTime ?? lines.last?.time ?? 0
+            ),
+            lines: lines,
+            matchScore: max(0, 100 - reconciled.songMatchConfidence * 100),
+            providerName: reconciled.webSearchUsed
+                ? "AI 证据歌词·限定检索"
+                : "AI 证据歌词",
+            identityAnchor: anchor
+        )
+        return BabyPlayerLyricsReconciliationResult(
+            candidate: candidate,
+            confidence: reconciled.songMatchConfidence,
+            cacheHit: reconciled.cacheHit,
+            webSearchUsed: reconciled.webSearchUsed
+        )
     }
 }

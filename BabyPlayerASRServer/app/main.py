@@ -17,9 +17,14 @@ from app.database import (
     next_reset_at,
 )
 from app.deepseek_refiner import DeepSeekLyricsRefinerClient, DeepSeekRefinerError
+from app.deepseek_lyrics_reconciler import DeepSeekLyricsReconcilerClient
+from app.lyrics_reconciler import LyricsReconciliationError, LyricsReconcilerService
 from app.lyrics_refiner import LyricsRefinementValidationError, LyricsRefinerService
+from app.lyrics_retriever import AllowlistedWebLyricsRetriever, NoopLyricsRetriever
 from app.models import (
     AsrAnalysisResponse,
+    LyricsReconcileRequest,
+    LyricsReconcileResponse,
     LyricsRefineRequest,
     LyricsRefineResponse,
     UsageResponse,
@@ -36,6 +41,8 @@ def create_app(
     repository: AsrRepository | None = None,
     provider_client=None,
     refiner_client=None,
+    reconciler_client=None,
+    lyrics_retriever=None,
 ) -> FastAPI:
     database = repository or AsrRepository(config.database_path)
     database.initialize()
@@ -55,6 +62,26 @@ def create_app(
         timeout_seconds=config.timeout_seconds,
     )
     refiner_service = LyricsRefinerService(refiner_provider, config.deepseek_model)
+    reconciliation_provider = reconciler_client or DeepSeekLyricsReconcilerClient(
+        api_key=config.deepseek_api_key,
+        endpoint=config.deepseek_endpoint,
+        model=config.deepseek_model,
+        timeout_seconds=config.timeout_seconds,
+    )
+    resolved_retriever = lyrics_retriever
+    if resolved_retriever is None:
+        resolved_retriever = AllowlistedWebLyricsRetriever(
+            timeout_seconds=config.lyrics_web_search_timeout_seconds,
+            max_results=config.lyrics_web_search_max_results,
+        ) if config.lyrics_web_search_enabled else NoopLyricsRetriever()
+    reconciliation_service = LyricsReconcilerService(
+        repository=database,
+        model=reconciliation_provider,
+        retriever=resolved_retriever,
+        model_name=config.deepseek_model,
+        analysis_version=config.analysis_version,
+        reconciliation_version=config.lyrics_reconciliation_version,
+    )
     application = FastAPI(
         title="BabyPlayer ASR Service",
         version="1.0.0",
@@ -240,6 +267,51 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail={"code": "DEEPSEEK_UNAVAILABLE", "message": "AI 文案校正暂时不可用"},
+            )
+
+    @application.post(
+        "/v1/lyrics/reconcile", response_model=LyricsReconcileResponse
+    )
+    def reconcile_lyrics(
+        request: LyricsReconcileRequest,
+        subject_hash: str = Depends(require_babyplayer_token),
+    ) -> dict:
+        if not config.lyrics_refiner_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "DEEPSEEK_NOT_CONFIGURED"},
+            )
+        now = datetime.now(timezone.utc)
+        asr_analysis = service.lookup(
+            subject_hash=subject_hash,
+            media_fingerprint=request.media_fingerprint,
+            now=now,
+        )
+        if not asr_analysis:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "ASR_CACHE_REQUIRED",
+                    "message": "请先完成这首歌的腾讯声音分析",
+                },
+            )
+        try:
+            return reconciliation_service.reconcile(
+                subject_hash=subject_hash,
+                request=request,
+                asr_analysis=asr_analysis,
+                now=now,
+            )
+        except LyricsReconciliationError as exc:
+            logger.error("Lyrics reconciliation rejected reason=%s", str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "INVALID_LYRICS_RECONCILIATION", "message": str(exc)},
+            )
+        except DeepSeekRefinerError:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={"code": "DEEPSEEK_UNAVAILABLE", "message": "AI 歌词重建暂时不可用"},
             )
 
     return application

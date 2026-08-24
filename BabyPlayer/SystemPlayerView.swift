@@ -679,6 +679,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                         item: item,
                         candidates: candidates,
                         reference: reference,
+                        forceLyricsRefresh: manuallyRequested,
                         onStage: { [weak self] stage in
                             guard let self,
                                   !Task.isCancelled,

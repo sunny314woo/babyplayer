@@ -1217,6 +1217,7 @@ actor BabyPlayerASRCoordinator {
         item: BabyPlayerQueueItem,
         candidates: [LyricsCandidate],
         reference: LyricsPlainTextReference?,
+        forceLyricsRefresh: Bool = false,
         onStage: BabyPlayerASRStageHandler? = nil,
         onAILyricsV1: BabyPlayerAILyricsProgressHandler? = nil
     ) async throws -> BabyPlayerASRMatchOutcome {
@@ -1227,6 +1228,7 @@ actor BabyPlayerASRCoordinator {
             candidates: candidates,
             reference: reference,
             fingerprint: fingerprint,
+            forceLyricsRefresh: forceLyricsRefresh,
             onStage: onStage,
             onAILyricsV1: onAILyricsV1
         )
@@ -1247,6 +1249,7 @@ actor BabyPlayerASRCoordinator {
         candidates: [LyricsCandidate],
         reference: LyricsPlainTextReference?,
         fingerprint: String,
+        forceLyricsRefresh: Bool,
         onStage: BabyPlayerASRStageHandler?,
         onAILyricsV1: BabyPlayerAILyricsProgressHandler?
     ) async throws -> BabyPlayerASRMatchOutcome {
@@ -1310,6 +1313,39 @@ actor BabyPlayerASRCoordinator {
         // 【MODIFIED】T1 在确定性 retiming 完成的立即时刻发布，绝不等 DeepSeek。
         if result.selected != nil {
             await onAILyricsV1?(result)
+        }
+        // D3 优先把标题和全部候选交给 VPS 证据协调器；旧 repair 链路仍作兼容回退。
+        do {
+            await onStage?(.refining)
+            babyPlayerASRLogger.info("DeepSeek D3 reconciliation start")
+            let reconciliation = try await BabyPlayerLyricsReconcilerClient().reconcile(
+                songTitle: item.lyricsMedia.searchTitle,
+                mediaFingerprint: fingerprint,
+                candidates: candidates,
+                forceRefresh: forceLyricsRefresh
+            )
+            let reconciled = reconciliation.candidate
+            let orderedCandidates = [reconciled] + result.candidates.filter {
+                $0.persistentIdentifier != reconciled.persistentIdentifier
+            }
+            babyPlayerASRLogger.info(
+                "DeepSeek D3 reconciliation end status=completed cacheHit=\(reconciliation.cacheHit, privacy: .public) webSearch=\(reconciliation.webSearchUsed, privacy: .public)"
+            )
+            return BabyPlayerASRMatchOutcome(
+                candidates: orderedCandidates,
+                selected: reconciled,
+                offsetSeconds: item.lyricsMedia.songStartSeconds ?? 0,
+                message: "AI 优化完成",
+                shouldAutomaticallyApply: reconciliation.confidence >= 0.72,
+                sameSongEvidence: result.sameSongEvidence
+            )
+        } catch BabyPlayerASRError.notConfigured {
+            babyPlayerASRLogger.info("DeepSeek D3 reconciliation unavailable status=not-configured")
+        } catch {
+            let nsError = error as NSError
+            babyPlayerASRLogger.error(
+                "DeepSeek D3 reconciliation failed; using legacy repair fallback domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)"
+            )
         }
         let finalResult: BabyPlayerASRMatchOutcome
         // 【MODIFIED】没有通过 same-song + alignment 的 AI v1 时，DeepSeek 没有修复对象，直接保留普通歌词。

@@ -6,7 +6,7 @@
 
 from typing import Annotated
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 
 LyricText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
@@ -101,3 +101,76 @@ class LyricsRefineResponse(BaseModel):
     model: str
     overall_confidence: float = Field(ge=0, le=1)
     repairs: list[LyricsTextRepair]
+
+
+class LyricsCandidateLineInput(BaseModel):
+    line_identifier: str = Field(min_length=3, max_length=128)
+    text: str = Field(min_length=1, max_length=500)
+    original_start_seconds: float | None = Field(default=None, ge=0, le=3600)
+    original_end_seconds: float | None = Field(default=None, ge=0, le=3600)
+
+
+class LyricsCandidateInput(BaseModel):
+    candidate_id: str = Field(min_length=1, max_length=128)
+    source: str = Field(min_length=1, max_length=128)
+    title: str | None = Field(default=None, max_length=500)
+    artist: str | None = Field(default=None, max_length=500)
+    lines: list[LyricsCandidateLineInput] = Field(min_length=1, max_length=300)
+
+    @model_validator(mode="after")
+    def validate_unique_line_identifiers(self):
+        identifiers = [line.line_identifier for line in self.lines]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("candidate line identifiers must be unique")
+        return self
+
+
+class LyricsReconcileRequest(BaseModel):
+    media_fingerprint: str = Field(min_length=8, max_length=512)
+    song_title: str = Field(min_length=1, max_length=500)
+    candidates: list[LyricsCandidateInput] = Field(default_factory=list, max_length=3)
+    force_refresh: bool = False
+
+    @model_validator(mode="after")
+    def validate_candidate_evidence(self):
+        candidate_ids = [candidate.candidate_id for candidate in self.candidates]
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("candidate identifiers must be unique")
+        total_characters = sum(
+            len(line.text)
+            for candidate in self.candidates
+            for line in candidate.lines
+        )
+        if total_characters > 60_000:
+            raise ValueError("candidate lyric evidence is too large")
+        return self
+
+
+class LyricsReconciledLine(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+    asr_word_start_index: int = Field(ge=0, le=20_000)
+    asr_word_end_index: int = Field(ge=0, le=20_000)
+    start_seconds: float = Field(ge=0, le=3600)
+    end_seconds: float = Field(ge=0, le=3600)
+    source: str = Field(min_length=1, max_length=128)
+    source_line_ids: list[str] = Field(default_factory=list, max_length=20)
+    confidence: float = Field(ge=0, le=1)
+    text_corrected: bool
+
+
+class LyricsDiscardedLine(BaseModel):
+    source_line_id: str | None = Field(default=None, max_length=128)
+    text: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=128)
+
+
+class LyricsReconcileResponse(BaseModel):
+    status: str
+    cache_hit: bool
+    model: str
+    reconciliation_version: str
+    song_match_confidence: float = Field(ge=0, le=1)
+    primary_source: str = Field(min_length=1, max_length=128)
+    web_search_used: bool
+    lines: list[LyricsReconciledLine]
+    discarded_lines: list[LyricsDiscardedLine] = Field(default_factory=list)

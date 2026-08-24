@@ -8,7 +8,7 @@
 
 - Apple TV 从 Jellyfin MP4 提取并永久保留本地 M4A；
 - 独立域名 `player.wisteriasoftware.uk` 下的 VPS 负责腾讯 ASR、缓存、额度和
-  DeepSeek V4 Flash 受限逐行文本 repair；
+  Version D3 Lyrics Evidence Reconciler；
 - 歌词搜索、候选比较、绑定、时间偏移和持久化都在 Apple TV 本地完成；
 - 当前不实现用户注册、登录、订阅、支付、家庭共享或多租户隔离；
 - 服务器仍保留独立 Bearer Token 边界，未来公开分发时可替换为逐设备配对 Token，
@@ -49,8 +49,9 @@ BabyPlayer 独立 VPS（8011）
 Apple TV
     ├── T0：立即显示第 1 份普通歌词
     ├── T1：同歌置信度 + 全局单调 alignment 生成 AI 校时歌词 v1
-    ├── T2：DeepSeek 只向同一 AI object 提交逐行文本建议
-    ├── 时间边界永远复制自本地 deterministic v1，DeepSeek 无权修改
+    ├── T2：VPS 读取 ASR 缓存，DeepSeek 审查最多 3 份候选
+    ├── 候选都弱时由 VPS 限域检索，新结果仍须与 ASR 比较
+    ├── DeepSeek 返回 ASR word ranges，服务器换算/验证时间
     └── 手动选择永远优先且不会被自动结果覆盖
 ```
 
@@ -83,7 +84,7 @@ Apple TV 原生导出 M4A，不额外引入 MP3 编码器。腾讯极速版支�
 
 页面先稳定绑定第 1 份普通歌词。腾讯 ASR 只提供句/词时间戳和噪声 transcript。本地的 `sameSongConfidence` 使用五类命名证据和集中阈值，不要求 ASR 逐字匹配。证据足够时，动态规划在整首歌上完成全局单调对齐，保留原歌词文本并产生 AI v1。
 
-DeepSeek V4 Flash 使用非思考 JSON contract，每行只能返回 identifier、原文、建议文本、是否修改、证据和置信度。服务端验证原文必须精确复制、修复长度受限、修改必须受原文或 aligned ASR words 支持。响应不包含时间戳；Apple TV 只把文本建议套回 AI v1 的原时间线，形成同 identity 的 v2。
+DeepSeek V4 Flash 使用两阶段非思考 JSON contract：先评估现有候选并返回 `need_web_search`，再根据 ASR、原候选和可选检索证据返回最终文本及 `asr_word_start_index/asr_word_end_index`。服务端校验范围单调、不重叠、不越界且文本受 ASR/候选支持，再机械生成时间。原 `/v1/refine` 只作兼容回退。
 
 本地确定性同歌证据包括：
 
@@ -123,11 +124,11 @@ tvOS 后台处理由系统择机调度且可中断。策略应为：只在当月
 
 ## 隐私与解耦
 
-- VPS 不持久化 M4A，不保存 Jellyfin URL、访问令牌或歌词。AI v1 原始行与 alignment evidence 只存在于 `/v1/refine` 请求内存中，返回后不写库。
+- VPS 不持久化 M4A，不保存 Jellyfin URL 或访问令牌。网页候选只存在当次请求内存；验证后的最终 AI Lyrics 按不可逆媒体指纹和 reconciliation version 写入 SQLite 缓存。
 - multipart 临时文件在请求 `finally` 中关闭，由系统删除；systemd 同时启用
   `PrivateTmp=true`。
 - 数据库只保存音频 SHA-256、不可逆媒体指纹、腾讯转写文字、时间戳和用量；
-  DeepSeek 纠正结果仅在 Apple TV 绑定中持久化。
+  Apple TV 仍持久化最终绑定，VPS 缓存可避免重复 DeepSeek/检索请求。
 - BabyPlayer 使用独立域名、目录、Linux 用户、systemd、SQLite 和 Bearer Token。
 - 腾讯 AppID/SecretId/SecretKey 和 DeepSeek API Key 只存在 `/opt/babyplayer-asr/.env`。
 - EnglishFlow 的数据库、鉴权、TTS、翻译和部署脚本不做任何修改。

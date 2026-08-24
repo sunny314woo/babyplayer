@@ -112,12 +112,12 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
    - 使用“提前/延后 0.1 秒或 0.5 秒”校准时间。
    - 在第一句开始时暂停，选择“把第一句对齐到当前位置”，一次消除 MP4 片头偏移。
 
-首次搜索会立即使用排名第 1 的普通歌词，不等腾讯 ASR 或 DeepSeek。ASR 大致确认同一首歌且确定性对齐成功后，先显示保留原歌词文本的“AI 校时歌词”；DeepSeek 稍后只做受证据约束的逐行文本修复。腾讯原始 transcript 不作为默认展示字幕。点选任一候选的当下即建立 manual lock，已在运行的 ASR/alignment/DeepSeek 都不能自动覆盖。
+首次搜索会立即使用排名第 1 的普通歌词，不等腾讯 ASR 或 DeepSeek。ASR 大致确认同一首歌且确定性对齐成功后，先显示“AI 校时歌词”；随后 VPS 的 D3 Lyrics Evidence Reconciler 读取已缓存的 ASR，审查最多 3 份候选，必要时只从限定儿歌来源检索新证据，再返回绑定 ASR word ranges 的最终歌词。腾讯原始 transcript 不作为默认展示字幕。点选任一候选的当下即建立 manual lock，已在运行的 ASR/alignment/DeepSeek 都不能自动覆盖。
 
 时间调整不限次数。每次提前或延后都在当前人工调整上累加；自动偏移和
 人工调整分开保存。每份歌词都有自己的调整值，切换和重启后会恢复。
 
-未配置 AI 歌词时，BabyPlayer 仍使用歌名、来源/版本、演唱者和歌曲段时长排序，并稳定默认绑定第 1 个。配置后使用渐进流程：T1 由腾讯 ASR word timestamps + 本地全局单调 alignment 生成 AI v1；T2 由 DeepSeek 对同一 AI Lyrics object 返回结构化逐行 repair。最终时间仍完全复制自 AI v1，v1/v2 共用 persistent identity。任一环失败都保留普通歌词或已完成的 AI v1。
+未配置 AI 歌词时，BabyPlayer 仍使用歌名、来源/版本、演唱者和歌曲段时长排序，并稳定默认绑定第 1 个。配置后使用渐进流程：T1 由腾讯 ASR word timestamps + 本地全局单调 alignment 生成可立即展示的 AI v1；T2 由 VPS 两阶段完成候选评估和最终证据重建。DeepSeek 只选择文本及 ASR word ranges，服务器验证后机械换算时间。D3 失败时会回退到原有逐行 repair 或 AI v1，不会丢失普通歌词。
 
 注意：删除 BabyPlayer App 会同时删除 Apple TV 上保存的歌词绑定与缓存；从 Xcode 覆盖安装通常会保留。
 
@@ -135,8 +135,7 @@ BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VP
 - Apple TV 把完整歌曲段 M4A 保存到 Application Support 下的本地音频库，不会自动淘汰；
   较长曲目可另有一份最长 120 秒的 ASR 识别前段。这份完整 M4A 可供后续“纯音频 +
   同步歌词”功能直接复用。
-- VPS 不保存音频、Jellyfin URL 或歌词。ASR 模块只缓存不可逆指纹、转写文字与时间戳；
-  DeepSeek 模块只在请求内存中临时处理 AI v1 原始行和对齐证据，返回不含时间戳的逐行 repair，不写入数据库。
+- VPS 不保存音频或 Jellyfin URL。ASR 模块缓存不可逆指纹、转写文字与时间戳；D3 另按指纹和 reconciliation version 缓存已验证的最终 AI Lyrics，不缓存网页或音频。
 - 服务端硬限制每个北京时间自然月 18,000 秒（5 小时）。达到上限后提示下月 1 日
   00:00 再次使用；已有缓存仍可继续匹配。
 - 家长设置可查看每首本地歌曲音频、识别状态、总占用、本月剩余时间，并可逐首或全部删除。
