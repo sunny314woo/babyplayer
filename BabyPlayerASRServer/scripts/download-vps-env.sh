@@ -4,15 +4,13 @@ set -Eeuo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 server_dir="$(cd "${script_dir}/.." && pwd)"
-remote_host="${1:-wisteria}"
+remote_host="${1:-hetzner}"
 remote_source="/opt/babyplayer-asr/.env"
-remote_export="/home/wisteria/.babyplayer-asr-env-export"
 local_env="${server_dir}/.env"
 local_download="$(mktemp "${server_dir}/.env.download.XXXXXX")"
 
 cleanup() {
   rm -f "${local_download}"
-  ssh -o BatchMode=yes "${remote_host}" "rm -f '${remote_export}'" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -21,10 +19,8 @@ if ! git -C "${server_dir}" check-ignore -q -- .env; then
   exit 1
 fi
 
-echo "VPS sudo authorization is required to read only ${remote_source}."
-ssh -t "${remote_host}" \
-  "sudo install -m 0600 -o wisteria -g wisteria '${remote_source}' '${remote_export}'"
-scp -q "${remote_host}:${remote_export}" "${local_download}"
+echo "Downloading ${remote_source} through SSH key authentication."
+scp -q "${remote_host}:${remote_source}" "${local_download}"
 
 [[ -s "${local_download}" ]] || {
   echo "Downloaded environment is empty." >&2
@@ -45,7 +41,6 @@ if [[ -f "${local_env}" ]]; then
 fi
 install -m 0600 "${local_download}" "${local_env}"
 rm -f "${local_download}"
-ssh -o BatchMode=yes "${remote_host}" "rm -f '${remote_export}'"
 trap - EXIT
 
 echo "Downloaded to BabyPlayerASRServer/.env (mode 0600, ignored by Git)."

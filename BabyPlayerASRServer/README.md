@@ -74,10 +74,10 @@ HTTP 429、错误码 `MONTHLY_ASR_LIMIT_REACHED` 和北京时间的 `next_availa
 bash BabyPlayerASRServer/scripts/download-vps-env.sh
 ```
 
-脚本会要求一次 VPS sudo 授权，将 `/opt/babyplayer-asr/.env` 下载为本地
-`BabyPlayerASRServer/.env`（权限 `0600`），验证必要配置项，并立即删除 VPS 上的临时
-副本。已有本地 `.env` 会先备份；`.env`、下载临时文件和备份文件均被 Git 忽略，脚本
-不会显示任何密钥内容。
+脚本默认使用本机 SSH 配置中的 `hetzner`（root 密钥登录），直接通过 SCP 将
+`/opt/babyplayer-asr/.env` 下载为本地 `BabyPlayerASRServer/.env`（权限 `0600`），并
+验证必要配置项。已有本地 `.env` 会先备份；`.env`、下载临时文件和备份文件均被 Git
+忽略，脚本不会显示任何密钥内容。也可以把其他 SSH host alias 作为第一个参数传入。
 
 把本目录上传到新的 release 目录后执行：
 
