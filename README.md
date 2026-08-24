@@ -125,7 +125,8 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
 
 声音分析服务与 EnglishFlow、翻译、TTS 和 Jellyfin 完全独立；实现与部署说明见
 [`BabyPlayerASRServer/README.md`](BabyPlayerASRServer/README.md)，详细边界见
-[`BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md`](BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md)。
+[`BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md`](BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md)。下一位 AI 若要把 VPS 歌词服务迁到 Mac 本地测试，应先完整阅读
+[`BabyPlayer_Project_Docs/AI_HANDOFF_LYRICS_LOCAL_SERVER.md`](BabyPlayer_Project_Docs/AI_HANDOFF_LYRICS_LOCAL_SERVER.md)。
 
 本地 Token 不直接写入 `Info.plist`。复制
 `Config/BabyPlayerSecrets.xcconfig.example` 为 `Config/BabyPlayerSecrets.xcconfig`，只在后者中填入
