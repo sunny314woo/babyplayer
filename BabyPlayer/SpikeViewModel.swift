@@ -69,6 +69,18 @@ enum BabyPlayerLyricsMode: String, CaseIterable, Identifiable {
     }
 }
 
+// 【MODIFIED】版本化的字幕默认策略：本次升级会把旧的“关闭”一次性迁移为英文，之后仍尊重用户手工关闭。
+enum BabyPlayerLyricsDefaultPolicy {
+    static func resolvedMode(
+        storedMode: BabyPlayerLyricsMode?,
+        hasAppliedEnabledByDefaultMigration: Bool
+    ) -> BabyPlayerLyricsMode {
+        if !hasAppliedEnabledByDefaultMigration { return .english }
+        guard let storedMode, storedMode.isCurrentlyAvailable else { return .english }
+        return storedMode
+    }
+}
+
 /// 一条播放队列项；URL 可能包含授权信息，因此只保存在内存中。
 struct BabyPlayerQueueItem: Identifiable {
     let id: String
@@ -194,6 +206,7 @@ final class SpikeViewModel: ObservableObject {
     private static let introSkipKey = "BabyPlayer.IntroSkipSeconds"
     private static let outroSkipKey = "BabyPlayer.OutroSkipSeconds"
     private static let lyricsModeKey = "BabyPlayer.LyricsMode"
+    private static let lyricsEnabledByDefaultMigrationKey = "BabyPlayer.LyricsEnabledByDefaultV1"
     private static let ratingsKey = "BabyPlayer.MediaRatings"
 
     init() {
@@ -207,10 +220,18 @@ final class SpikeViewModel: ObservableObject {
         if defaults.object(forKey: Self.outroSkipKey) != nil {
             outroSkipSeconds = max(0, defaults.integer(forKey: Self.outroSkipKey))
         }
-        if let rawLyricsMode = defaults.string(forKey: Self.lyricsModeKey),
-           let savedLyricsMode = BabyPlayerLyricsMode(rawValue: rawLyricsMode),
-           savedLyricsMode.isCurrentlyAvailable {
-            lyricsMode = savedLyricsMode
+        let savedLyricsMode = defaults.string(forKey: Self.lyricsModeKey)
+            .flatMap(BabyPlayerLyricsMode.init(rawValue:))
+        let hasAppliedLyricsMigration = defaults.bool(
+            forKey: Self.lyricsEnabledByDefaultMigrationKey
+        )
+        lyricsMode = BabyPlayerLyricsDefaultPolicy.resolvedMode(
+            storedMode: savedLyricsMode,
+            hasAppliedEnabledByDefaultMigration: hasAppliedLyricsMigration
+        )
+        if !hasAppliedLyricsMigration {
+            defaults.set(lyricsMode.rawValue, forKey: Self.lyricsModeKey)
+            defaults.set(true, forKey: Self.lyricsEnabledByDefaultMigrationKey)
         }
         if let storedRatings = defaults.dictionary(forKey: Self.ratingsKey) as? [String: String] {
             ratings = storedRatings.reduce(into: [:]) { result, entry in

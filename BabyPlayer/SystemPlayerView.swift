@@ -180,6 +180,31 @@ enum BabyPlayerManualAnalysisStatus: Equatable {
     }
 }
 
+// 【MODIFIED】把“再按上方向键收起播放控件”的判断与 AVKit 私有视图层级分开，便于回归测试。
+enum BabyPlayerPlaybackChromePolicy {
+    /// 只在系统播放控件已获得焦点、且没有子菜单时，把上方向键解释为收起。
+    static func shouldDismissControls(
+        pressType: UIPress.PressType,
+        playbackControlHasFocus: Bool,
+        hasPresentedMenu: Bool
+    ) -> Bool {
+        pressType == .upArrow && playbackControlHasFocus && !hasPresentedMenu
+    }
+
+    /// 控件被主动收起后，下一次方向输入先恢复 AVKit 控件，选择键仍直接播放/暂停。
+    static func shouldRestoreControls(
+        pressType: UIPress.PressType,
+        controlsWereExplicitlyDismissed: Bool
+    ) -> Bool {
+        guard controlsWereExplicitlyDismissed else { return false }
+        return [.upArrow, .downArrow, .leftArrow, .rightArrow].contains(pressType)
+    }
+}
+
+enum BabyPlayerAIOverlayPolicy {
+    static let adoptedResultDisplaySeconds: Double = 5
+}
+
 // 【MODIFIED】用纯内存 generation 使人工点击在任何 await 之前立即使后台自动结果失效。
 final class LyricsAutomationGenerationGuard: @unchecked Sendable {
     private let stateLock = NSLock()
@@ -302,6 +327,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var soundAnalysisTask: Task<Void, Never>?
     private var lyricsSaveTask: Task<Void, Never>?
     private var lyricsSelectionTask: Task<Void, Never>?
+    private var aiProgressHideTask: Task<Void, Never>?
     private var lyricLines: [TimedLyricLine] = []
     private var lyricPlayback: LyricsPlayback?
     private var lyricCandidates: [LyricsCandidate] = []
@@ -321,6 +347,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var lyricsLabel: UILabel?
     private var aiProgressContainer: UIView?
     private var aiProgressLabel: UILabel?
+    private var controlsWereExplicitlyDismissed = false
     private var preparedLyricsFingerprint: String?
     private var soundAnalysisFingerprint: String?
     private var isAdvancing = false
@@ -393,6 +420,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         Task { await BabyPlayerASRCoordinator.shared.cancelAll() }
         lyricsSelectionTask?.cancel()
         lyricsSelectionTask = nil
+        aiProgressHideTask?.cancel()
+        aiProgressHideTask = nil
         player?.pause()
         if let timeObserver, let player {
             player.removeTimeObserver(timeObserver)
@@ -416,7 +445,50 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             togglePlaybackFromCenterPress()
             return
         }
+
+        if let directionalPress = presses.first(where: {
+            [.upArrow, .downArrow, .leftArrow, .rightArrow].contains($0.type)
+        }) {
+            if BabyPlayerPlaybackChromePolicy.shouldRestoreControls(
+                pressType: directionalPress.type,
+                controlsWereExplicitlyDismissed: controlsWereExplicitlyDismissed
+            ) {
+                controlsWereExplicitlyDismissed = false
+                showsPlaybackControls = true
+                if aiProgressLabel?.text != nil {
+                    aiProgressContainer?.isHidden = false
+                }
+            } else if BabyPlayerPlaybackChromePolicy.shouldDismissControls(
+                pressType: directionalPress.type,
+                playbackControlHasFocus: playbackControlHasFocus(),
+                hasPresentedMenu: presentedViewController != nil
+            ) {
+                dismissPlaybackControlsImmediately()
+                return
+            }
+        }
         super.pressesBegan(presses, with: event)
+    }
+
+    /// 判断当前焦点是否属于 AVKit 播放控件；输出布尔值，不改变焦点。
+    private func playbackControlHasFocus() -> Bool {
+        guard let focusedItem = UIFocusSystem.focusSystem(for: view)?.focusedItem,
+              let focusedView = focusedItem as? UIView else { return false }
+        if focusedView === view { return false }
+        if let overlay = contentOverlayView,
+           focusedView === overlay || focusedView.isDescendant(of: overlay) {
+            return false
+        }
+        return focusedView.isDescendant(of: view)
+    }
+
+    /// 立即移除进度条和功能键焦点，同时保留底部字幕；下一次方向输入可重新唤起控件。
+    private func dismissPlaybackControlsImmediately() {
+        controlsWereExplicitlyDismissed = true
+        showsPlaybackControls = false
+        aiProgressContainer?.isHidden = true
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
     }
 
     /// 判断中间键是否应控制播放；输入当前焦点，不修改 UI。
@@ -655,18 +727,34 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     // 【MODIFIED】同步刷新菜单和播放画面，让遥控器点击后立即有可见反馈。
     /// 显示 AI 歌词阶段；输入为进度状态，输出 Void，会更新菜单和播放画面，不修改 repository。
     private func showAILyricsProgress(_ progress: BabyPlayerAILyricsProgress) {
+        aiProgressHideTask?.cancel()
+        aiProgressHideTask = nil
         soundAnalysisMessage = progress.menuTitle
         aiProgressLabel?.text = progress.overlayText
-        aiProgressContainer?.isHidden = false
+        aiProgressContainer?.isHidden = controlsWereExplicitlyDismissed
         updateLyricsTransportMenu()
     }
 
     /// 显示显式分析链结果；输入菜单标题与详情，输出 Void，只更新可见 UI 状态。
-    private func showManualAnalysisMessage(_ title: String, detail: String) {
+    private func showManualAnalysisMessage(
+        _ title: String,
+        detail: String,
+        autoHideAfterSeconds: Double? = nil
+    ) {
+        aiProgressHideTask?.cancel()
+        aiProgressHideTask = nil
         soundAnalysisMessage = title
         aiProgressLabel?.text = "AI 歌词\n\(detail)"
-        aiProgressContainer?.isHidden = false
+        aiProgressContainer?.isHidden = controlsWereExplicitlyDismissed
         updateLyricsTransportMenu()
+        guard let autoHideAfterSeconds, autoHideAfterSeconds > 0 else { return }
+        aiProgressHideTask = Task { [weak self] in
+            let nanoseconds = UInt64(autoHideAfterSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard let self, !Task.isCancelled else { return }
+            self.aiProgressContainer?.isHidden = true
+            self.aiProgressHideTask = nil
+        }
     }
 
     private func prepareLyrics(for item: BabyPlayerQueueItem, mode: BabyPlayerLyricsMode) {
@@ -690,6 +778,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             soundAnalysisTask = nil
             soundAnalysisFingerprint = nil
             lyricsSelectionTask?.cancel()
+            aiProgressHideTask?.cancel()
+            aiProgressHideTask = nil
             pendingLyricSelectionIdentifier = nil
             // 【MODIFIED】只有真正切歌才使旧 generation 失效；单曲循环保留 task 和 manual lock。
             lyricsAutomationGuard.resetForNewMedia()
@@ -723,7 +813,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
         lyricsTask = Task { [weak self] in
             guard let self else { return }
-            let storedPlayback = await BabyLyricsRepository.shared.storedLyrics(
+            let storedPlayback = await BabyLyricsRepository.shared.preferredStoredLyrics(
                 for: item.lyricsMedia
             )
             let storedAnalysis = await BabyLyricsRepository.shared.analysisBundle(
@@ -1476,7 +1566,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             if activated {
                 showManualAnalysisMessage(
                     "DeepSeek：已自动启用",
-                    detail: "ASR：已完成\nDeepSeek：已完成\n✓ 已自动设为这首视频的默认字幕"
+                    detail: "ASR：已完成\nDeepSeek：已完成\n✓ 已自动设为这首视频的默认字幕",
+                    autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
                 )
             }
             return activated
@@ -1569,7 +1660,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             guard activated else { return }
             self.showManualAnalysisMessage(
                 "已采用 \(source.displayName) 字幕",
-                detail: "当前字幕：\(result.source.displayName)\n以后打开这首视频将直接使用"
+                detail: "当前字幕：\(result.source.displayName)\n以后打开这首视频将直接使用",
+                autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
             )
         }
     }

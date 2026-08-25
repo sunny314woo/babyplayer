@@ -11,6 +11,7 @@
 //
 
 import Foundation
+import UIKit
 import XCTest
 @testable import BabyPlayer
 
@@ -43,6 +44,52 @@ final class LyricsAndASRTests: XCTestCase {
             BabyPlayerPlaybackTogglePolicy.action(timeControlStatus: .paused, rate: 0),
             .play
         )
+    }
+
+    /// 功能键排获得焦点时，再按上立即收起；子菜单内的上键仍供正常导航。
+    func testUpPressDismissesFocusedPlaybackChromeButNotPresentedMenu() {
+        XCTAssertTrue(BabyPlayerPlaybackChromePolicy.shouldDismissControls(
+            pressType: .upArrow,
+            playbackControlHasFocus: true,
+            hasPresentedMenu: false
+        ))
+        XCTAssertFalse(BabyPlayerPlaybackChromePolicy.shouldDismissControls(
+            pressType: .upArrow,
+            playbackControlHasFocus: true,
+            hasPresentedMenu: true
+        ))
+        XCTAssertFalse(BabyPlayerPlaybackChromePolicy.shouldDismissControls(
+            pressType: .downArrow,
+            playbackControlHasFocus: true,
+            hasPresentedMenu: false
+        ))
+        XCTAssertTrue(BabyPlayerPlaybackChromePolicy.shouldRestoreControls(
+            pressType: .upArrow,
+            controlsWereExplicitlyDismissed: true
+        ))
+    }
+
+    /// 本次升级默认开启英文字幕；迁移完成后仍保留用户后续的关闭选择。
+    func testLyricsDefaultPolicyEnablesOnceThenRespectsManualOff() {
+        XCTAssertEqual(
+            BabyPlayerLyricsDefaultPolicy.resolvedMode(
+                storedMode: .off,
+                hasAppliedEnabledByDefaultMigration: false
+            ),
+            .english
+        )
+        XCTAssertEqual(
+            BabyPlayerLyricsDefaultPolicy.resolvedMode(
+                storedMode: .off,
+                hasAppliedEnabledByDefaultMigration: true
+            ),
+            .off
+        )
+    }
+
+    /// AI 采用成功卡只短暂确认结果，不得在单曲循环中永久遮挡画面。
+    func testAdoptedAIOverlayUsesFiveSecondDisplayWindow() {
+        XCTAssertEqual(BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds, 5)
     }
 
     /// 【MODIFIED】ASR 已返回后的文件错误必须明确显示为保存失败，避免误判腾讯识别失败。
@@ -745,6 +792,39 @@ final class LyricsAndASRTests: XCTestCase {
         let reloadedBundle = await reloaded.analysisBundle(for: media)
         XCTAssertNotNil(reloadedBundle?.asrResult)
         XCTAssertNotNil(reloadedBundle?.deepSeekResult)
+    }
+
+    /// 有 DeepSeek 校准结果时，新进入播放页默认选 DeepSeek，即使上次退出前固定的是普通歌词。
+    func testDeepSeekIsPreferredOnPlaybackEntryWhenStoredOrdinaryLyricsAlsoExist() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let repository = makeRepository(storage)
+        let media = makeMedia()
+        let ordinary = makeCandidate(id: 1, title: "Ordinary", words: "ordinary lyric line")
+        let asr = makeCandidate(id: -10, title: "ASR", words: "raw transcript line")
+        let deepSeek = makeCandidate(id: -11, title: "DeepSeek", words: "calibrated lyric line")
+        let ordinaryPlayback = await repository.playback(
+            for: ordinary,
+            media: media,
+            selectionOrigin: .manual
+        )
+        _ = try await repository.confirm(ordinaryPlayback, for: media)
+        _ = try await repository.storeASRResult(
+            asr,
+            asrEvidenceHash: "same-evidence",
+            for: media
+        )
+        _ = try await repository.storeDeepSeekResult(
+            deepSeek,
+            asrEvidenceHash: "same-evidence",
+            for: media
+        )
+
+        let preferred = await repository.preferredStoredLyrics(for: media)
+
+        XCTAssertEqual(preferred?.candidateID, deepSeek.id)
+        XCTAssertEqual(preferred?.selectionOrigin, .asr)
+        XCTAssertEqual(preferred?.lines.map(\.text), deepSeek.lines.map(\.text))
     }
 
     // 【MODIFIED】重新 ASR 产生不同证据时，基于旧证据的 DeepSeek 结果不得继续可采用。

@@ -561,6 +561,18 @@ actor BabyLyricsRepository {
         binding(for: media).map(playback(from:))
     }
 
+    /// 读取进入播放页时的默认字幕；有效 DeepSeek 结果优先，否则回退当前 binding，不修改持久数据。
+    func preferredStoredLyrics(for media: LyricsMediaDescriptor) -> LyricsPlayback? {
+        if let deepSeek = analysisBundle(for: media)?.deepSeekResult {
+            return playback(
+                for: deepSeek.candidate,
+                media: media,
+                selectionOrigin: .asr
+            )
+        }
+        return storedLyrics(for: media)
+    }
+
     func resolvedLyrics(
         for media: LyricsMediaDescriptor,
         candidates: [LyricsCandidate]

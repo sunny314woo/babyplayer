@@ -17,7 +17,8 @@
 - [x] 修复 DeepSeek 乱序/重叠/无支持行导致整首 422，并自动回收模型遗漏的有声 ASR 词。
 - [x] 真实验收 Who、Baby Shark 和 Wheels；Wheels 开头无人声区零字幕，首句 22.45 秒。
 - [x] 将手工 ASR 入口串成 ASR → DeepSeek → 自动启用，增加播放页提示、失败回退与“后发手工选择优先”保护。
-- [x] Python 54 项和 tvOS 模拟器 55 项全部通过。
+- [x] 实现功能键排上键立即收起、字幕默认开启、DeepSeek 已有结果默认优先，以及采用成功卡 5 秒自动隐藏。
+- [x] Python 54 项和 tvOS 模拟器 58 项全部通过。
 - [ ] 建立 10–20 首人工标注回归集：每句文字/首尾、人声区间、段落类型和重复次数。
 - [ ] 用标注集 A/B 腾讯人声轨与 faster-whisper/WhisperX，评估第二 ASR/可信歌词强制对齐。
 - [ ] 统一 ASR SRT、Apple TV ASR 和 DeepSeek 的 canonical cue/分行器。
