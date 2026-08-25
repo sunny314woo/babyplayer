@@ -1603,6 +1603,16 @@ actor BabyPlayerASRCoordinator {
         )
     }
 
+    /// 只恢复服务器已完成的 DeepSeek 结果，不会触发新的付费分析。
+    func cachedReconciliation(
+        item: BabyPlayerQueueItem
+    ) async throws -> BabyPlayerLyricsReconciliationResult? {
+        try await BabyPlayerLyricsReconcilerClient().cachedReconciliation(
+            songTitle: item.lyricsMedia.searchTitle,
+            mediaFingerprint: item.lyricsMedia.asrFingerprint
+        )
+    }
+
     /// 取消指定媒体分析；输入为 fingerprint，无输出，会终止临时提取/上传并清理 registry。
     func cancel(mediaFingerprint: String) async {
         await taskRegistry.cancel(mediaFingerprint)

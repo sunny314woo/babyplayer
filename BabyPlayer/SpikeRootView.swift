@@ -50,7 +50,9 @@ struct SpikeRootView: View {
                 onRate: { itemID, rating in
                     model.setRating(rating, for: itemID)
                 },
-                ratingFor: model.rating(for:)
+                ratingFor: model.rating(for:),
+                onProgress: model.updatePlaybackResume,
+                onFinished: model.clearPlaybackResume
             )
                 .ignoresSafeArea()
         }

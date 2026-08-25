@@ -502,6 +502,58 @@ struct BabyPlayerLyricsReconcilerClient {
             throw BabyPlayerASRError.invalidResponse
         }
         let reconciled = try JSONDecoder().decode(LyricsReconciliationResponse.self, from: data)
+        return try makeResult(
+            reconciled,
+            songTitle: songTitle,
+            mediaFingerprint: mediaFingerprint,
+            ordinaryCandidates: ordinaryCandidates
+        )
+    }
+
+    /// 只读服务器已有 DeepSeek 结果；命中时不调用 ASR、搜索或大模型。
+    func cachedReconciliation(
+        songTitle: String,
+        mediaFingerprint: String
+    ) async throws -> BabyPlayerLyricsReconciliationResult? {
+        var components = URLComponents(
+            url: configuration.baseURL.appendingPathComponent("lyrics/cache"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [
+            URLQueryItem(name: "media_fingerprint", value: mediaFingerprint)
+        ]
+        guard let url = components?.url else { throw BabyPlayerASRError.invalidResponse }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(configuration.apiToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BabyPlayerASRError.invalidResponse
+        }
+        if http.statusCode == 404 { return nil }
+        guard (200...299).contains(http.statusCode) else {
+            if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
+                throw BabyPlayerASRError.server(envelope.detail.message ?? envelope.detail.code)
+            }
+            throw BabyPlayerASRError.invalidResponse
+        }
+        let reconciled = try JSONDecoder().decode(LyricsReconciliationResponse.self, from: data)
+        return try makeResult(
+            reconciled,
+            songTitle: songTitle,
+            mediaFingerprint: mediaFingerprint,
+            ordinaryCandidates: []
+        )
+    }
+
+    private func makeResult(
+        _ reconciled: LyricsReconciliationResponse,
+        songTitle: String,
+        mediaFingerprint: String,
+        ordinaryCandidates: [LyricsCandidate]
+    ) throws -> BabyPlayerLyricsReconciliationResult {
         guard reconciled.lines.count >= 2,
               (0.0...1.0).contains(reconciled.songMatchConfidence),
               (0.0...1.0).contains(reconciled.asrWordCoverage ?? 1),

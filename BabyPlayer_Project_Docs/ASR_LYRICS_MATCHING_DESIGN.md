@@ -44,9 +44,9 @@ ASR、DeepSeek 和普通歌词都可继续保留。DeepSeek 失败不会替换�
 
 ### 播放控件焦点
 
-- 进度条/功能键排有焦点时，再按上方向键立即收起 AVKit 控件与 AI 提示，只保留视频和字幕。
-- 方向键可再次唤起控件；子菜单已打开时，上键仍用于菜单内导航。
-- Apple 官方规范使用 Back/Menu 隐藏播放控件；BabyPlayer 因 Back 已承担退出播放，额外提供上键收起。
+- 2026-08-25 撤回“在顶排再按上键收起”的自定义拦截。实测中该拦截会在进度条显示时提前吞掉上键，导致无法到达歌词和 AI 按钮。
+- 现在所有方向键均交给 `AVPlayerViewController` 的原生焦点系统；Back/Menu 仍按产品约定退出播放。
+- 若未来重做“只收起控件不退出”，必须基于可验证的 AVKit 焦点状态，不再使用全局上键拦截。
 
 ## 三、两条执行路径
 
@@ -204,8 +204,10 @@ ASR、VAD 增量标注或更换候选都会得到新缓存键。2026-08-24 审�
 Apple TV 的歌词候选、绑定和分析副本实际保存在 App 私有 `Caches`，不是 Application Support，也
 不是永久音频库。tvOS 在空间不足且 App 未运行时可以清除缓存；卸载 App 会删除整个容器。
 
-Mac/VPS SQLite 保留可重建 ASR/DeepSeek 的服务端副本。当前家长人工选择和校时仍主要依赖 Apple TV
-本地数据；如果需要可靠长期保存，后续应同步到 Mac/VPS 或 iCloud。
+Mac/VPS SQLite 保留 ASR/DeepSeek 的服务端副本。当 Apple TV 本地绑定因换歌、退出播放页或
+tvOS 清理 Caches 而缺失时，客户端会通过只读 `/v1/lyrics/cache` 按媒体指纹拉回已有 DeepSeek
+结果。该路径不触发 ASR、网络歌词搜索或 DeepSeek，恢复后默认优先播放 DeepSeek 字幕。
+家长的纯本地校时偏移仍只存在 Apple TV。
 
 Release 只使用临时 M4A，完成后删除。Debug 开发过程目录可以显式保存完整提取音频和 JSON/SRT，
 该目录已被 Git 忽略，但需要限制访问和定期清理。
@@ -224,12 +226,14 @@ Release 只使用临时 M4A，完成后删除。Debug 开发过程目录可以�
 
 ## 九、当前验收状态
 
-- Python 服务端自动化测试：54 项通过。
-- tvOS 26.2 模拟器自动化测试：58 项通过。
+- Python 服务端自动化测试：55 项通过。
+- tvOS 模拟器自动化测试：60 项通过。
 - Baby Shark：417 个 ASR 词，首词 12.55 秒；DeepSeek 92 行，ASR 词覆盖 100%。
 - The Wheels On The Bus：191 个 ASR 词；用户确认开头旋律/汽车声/节奏无人声，最终首句从 22.45 秒开始。
   DeepSeek 32 行，ASR 词覆盖 99.45%，`BB/DD/Dee/E` 未进入最终字幕。
 - Who Took the Cookie?：175 个 ASR 词，0.50–120.35 秒；Web 证据 ID 修复后 DeepSeek 31 行成功。
+- I Am The Music Man（第 12 首）：混合对话和歌曲的 577.99 秒 ASR 结果已完成；
+  无普通歌词候选时 DeepSeek 以 `asr_only` 整理为 47 行，时间范围 3.63–566.39 秒。
 
 自动化测试证明接口、缓存和 UI 状态机能运行，不证明歌声识别质量已经通过。后续验收必须使用人工
 标注的歌曲集，分别统计纯音乐误报、歌词覆盖、重复副歌、尾段覆盖和时间误差。

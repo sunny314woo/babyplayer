@@ -145,6 +145,19 @@ class AsrRepository:
             ).fetchone()
         return json.loads(row["result_json"]) if row else None
 
+    def latest_cached_ai_lyrics(
+        self, subject_hash: str, fingerprint_hash: str
+    ):
+        """Read the newest completed D3 result for cache-only client recovery."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT result_json FROM ai_lyrics_cache
+                   WHERE subject_hash=? AND media_fingerprint_hash=?
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (subject_hash, fingerprint_hash),
+            ).fetchone()
+        return json.loads(row["result_json"]) if row else None
+
     def store_ai_lyrics(
         self,
         *,

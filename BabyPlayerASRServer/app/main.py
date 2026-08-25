@@ -3,7 +3,7 @@ import hmac
 import logging
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 
@@ -428,6 +428,25 @@ def create_app(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail={"code": "DEEPSEEK_UNAVAILABLE", "message": "AI 歌词重建暂时不可用"},
             )
+
+    @application.get(
+        "/v1/lyrics/cache", response_model=LyricsReconcileResponse
+    )
+    def cached_reconciled_lyrics(
+        media_fingerprint: str = Query(min_length=8, max_length=512),
+        subject_hash: str = Depends(require_babyplayer_token),
+    ) -> dict:
+        """Return only an existing result; never invoke ASR, web search, or DeepSeek."""
+        result = database.latest_cached_ai_lyrics(
+            subject_hash,
+            hashlib.sha256(media_fingerprint.strip().encode("utf-8")).hexdigest(),
+        )
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "AI_LYRICS_CACHE_NOT_FOUND"},
+            )
+        return {**result, "cache_hit": True}
 
     return application
 

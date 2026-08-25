@@ -1,6 +1,7 @@
 """Version D3 reusable lyrics evidence reconciler tests."""
 
 import json
+import hashlib
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -618,6 +619,63 @@ def test_d3_endpoint_requires_cached_asr_before_calling_deepseek(tmp_path) -> No
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "ASR_CACHE_REQUIRED"
+    assert model.assess_calls == 0
+
+
+def test_cache_endpoint_returns_saved_result_without_calling_deepseek(tmp_path) -> None:
+    config = replace(configured(tmp_path), deepseek_api_key="test-deepseek-key")
+    from app.database import AsrRepository
+
+    repository = AsrRepository(config.database_path)
+    repository.initialize()
+    media_fingerprint = "media-fingerprint-cache-0001"
+    result = {
+        "status": "completed",
+        "cache_hit": False,
+        "model": "deepseek-test",
+        "reconciliation_version": "d3-test",
+        "song_match_confidence": 0.8,
+        "primary_source": "asr_only",
+        "web_search_used": False,
+        "asr_word_coverage": 1.0,
+        "recovered_asr_word_count": 0,
+        "lines": [{
+            "text": "hello there",
+            "asr_word_start_index": 0,
+            "asr_word_end_index": 1,
+            "start_seconds": 1.0,
+            "end_seconds": 2.0,
+            "source": "asr_only",
+            "source_line_ids": [],
+            "confidence": 0.9,
+            "text_corrected": False,
+        }],
+        "discarded_lines": [],
+    }
+    repository.store_ai_lyrics(
+        subject_hash=hashlib.sha256(b"test-babyplayer-token").hexdigest(),
+        fingerprint_hash=hashlib.sha256(media_fingerprint.encode()).hexdigest(),
+        reconciliation_version="d3-test",
+        result=result,
+        now=NOW,
+    )
+    model = FakeD3Model()
+    client = TestClient(create_app(
+        config,
+        repository=repository,
+        provider_client=FakeProvider(),
+        reconciler_client=model,
+    ))
+
+    response = client.get(
+        "/v1/lyrics/cache",
+        headers={"Authorization": "Bearer test-babyplayer-token"},
+        params={"media_fingerprint": media_fingerprint},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cache_hit"] is True
+    assert response.json()["lines"][0]["text"] == "hello there"
     assert model.assess_calls == 0
 
 

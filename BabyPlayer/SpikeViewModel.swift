@@ -105,6 +105,40 @@ struct SpikePlaybackSelection: Identifiable {
     let introSkipSeconds: Double
     let outroSkipSeconds: Double
     let lyricsMode: BabyPlayerLyricsMode
+    /// 只用于会话首曲；自动切到后续曲目时始终从歌曲起点播放。
+    let startPositionSeconds: Double?
+}
+
+/// Apple TV 本地续播点；不包含带授权信息的播放 URL。
+struct BabyPlayerPlaybackResumeState: Codable, Equatable, Sendable {
+    let itemID: String
+    let positionSeconds: Double
+    let durationSeconds: Double?
+    let updatedAt: Date
+}
+
+enum BabyPlayerPlaybackResumePolicy {
+    static let minimumPositionSeconds = 3.0
+    static let completionToleranceSeconds = 5.0
+
+    /// 过早退出或已到片尾不作为“未播完”，避免首页永久占位。
+    static func resumablePosition(
+        elapsed: Double,
+        duration: Double?
+    ) -> Double? {
+        guard elapsed.isFinite, elapsed >= minimumPositionSeconds else { return nil }
+        if let duration, duration.isFinite, duration > 0,
+           elapsed >= duration - completionToleranceSeconds {
+            return nil
+        }
+        return elapsed
+    }
+
+    /// 未播完曲目置顶，其余顺序保持不变。
+    static func prioritizedIDs(_ ids: [String], resuming itemID: String?) -> [String] {
+        guard let itemID, ids.contains(itemID) else { return ids }
+        return [itemID] + ids.filter { $0 != itemID }
+    }
 }
 
 private struct StoredJellyfinCredentials: Codable {
@@ -183,6 +217,7 @@ final class SpikeViewModel: ObservableObject {
     @Published private(set) var mediaItems: [JellyfinMediaItem] = []
     @Published private(set) var isWorking = false
     @Published var activePlayback: SpikePlaybackSelection?
+    @Published private(set) var playbackResumeState: BabyPlayerPlaybackResumeState?
     @Published private(set) var ratings: [String: BabyPlayerRating] = [:]
     @Published var playbackTimerMinutes = 0 {
         didSet { UserDefaults.standard.set(playbackTimerMinutes, forKey: Self.playbackTimerKey) }
@@ -208,6 +243,7 @@ final class SpikeViewModel: ObservableObject {
     private static let lyricsModeKey = "BabyPlayer.LyricsMode"
     private static let lyricsEnabledByDefaultMigrationKey = "BabyPlayer.LyricsEnabledByDefaultV1"
     private static let ratingsKey = "BabyPlayer.MediaRatings"
+    private static let playbackResumeKey = "BabyPlayer.PlaybackResumeV1"
 
     init() {
         let defaults = UserDefaults.standard
@@ -240,6 +276,12 @@ final class SpikeViewModel: ObservableObject {
                 }
             }
         }
+        if let data = defaults.data(forKey: Self.playbackResumeKey) {
+            playbackResumeState = try? JSONDecoder().decode(
+                BabyPlayerPlaybackResumeState.self,
+                from: data
+            )
+        }
 
         guard let credentials = JellyfinCredentialStore.load() else { return }
         serverAddress = credentials.serverAddress
@@ -253,7 +295,12 @@ final class SpikeViewModel: ObservableObject {
 
     /// BabyPlayer 只读取 Jellyfin 的“音乐视频”库，因此首页无需再做伪分类。
     var filteredMediaItems: [JellyfinMediaItem] {
-        mediaItems.filter { rating(for: $0.id) != .blocked }
+        let visible = mediaItems.filter { rating(for: $0.id) != .blocked }
+        guard let resumeID = playbackResumeState?.itemID,
+              let current = visible.first(where: { $0.id == resumeID }) else {
+            return visible
+        }
+        return [current] + visible.filter { $0.id != resumeID }
     }
 
     /// 当前媒体库中被家长屏蔽的项目；只在家长设置中展示。
@@ -513,6 +560,46 @@ final class SpikeViewModel: ObservableObject {
         activePlayback = nil
     }
 
+    /// 保存当前未播完曲目；自然播完或靠近片尾时清除。
+    func updatePlaybackResume(
+        itemID: String,
+        elapsed: Double,
+        duration: Double?
+    ) {
+        guard let position = BabyPlayerPlaybackResumePolicy.resumablePosition(
+            elapsed: elapsed,
+            duration: duration
+        ) else {
+            if playbackResumeState?.itemID == itemID {
+                playbackResumeState = nil
+                UserDefaults.standard.removeObject(forKey: Self.playbackResumeKey)
+            }
+            return
+        }
+        // 每两秒一个持久点已足够精确，避免 0.5 秒回调频繁写入。
+        if let existing = playbackResumeState,
+           existing.itemID == itemID,
+           abs(existing.positionSeconds - position) < 2 {
+            return
+        }
+        let state = BabyPlayerPlaybackResumeState(
+            itemID: itemID,
+            positionSeconds: position,
+            durationSeconds: duration,
+            updatedAt: Date()
+        )
+        playbackResumeState = state
+        if let data = try? JSONEncoder().encode(state) {
+            UserDefaults.standard.set(data, forKey: Self.playbackResumeKey)
+        }
+    }
+
+    func clearPlaybackResume(for itemID: String) {
+        guard playbackResumeState?.itemID == itemID else { return }
+        playbackResumeState = nil
+        UserDefaults.standard.removeObject(forKey: Self.playbackResumeKey)
+    }
+
     func incrementPlaybackTimer() { playbackTimerMinutes = min(180, playbackTimerMinutes + 5) }
     func decrementPlaybackTimer() { playbackTimerMinutes = max(0, playbackTimerMinutes - 5) }
     func incrementIntroSkip() { introSkipSeconds = min(120, introSkipSeconds + 5) }
@@ -623,7 +710,10 @@ final class SpikeViewModel: ObservableObject {
             sessionDuration: playbackTimerMinutes == 0 ? nil : TimeInterval(playbackTimerMinutes * 60),
             introSkipSeconds: Double(introSkipSeconds),
             outroSkipSeconds: Double(outroSkipSeconds),
-            lyricsMode: lyricsMode
+            lyricsMode: lyricsMode,
+            startPositionSeconds: playbackResumeState.flatMap { state in
+                state.itemID == queue[queueStartIndex].id ? state.positionSeconds : nil
+            }
         )
     }
 

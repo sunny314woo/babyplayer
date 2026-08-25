@@ -111,3 +111,4 @@ def test_ai_lyrics_cache_is_versioned_and_replaced_atomically(tmp_path) -> None:
         now=NOW,
     )
     assert target.cached_ai_lyrics("subject", "f" * 64, "d3-v1") == second
+    assert target.latest_cached_ai_lyrics("subject", "f" * 64) == second

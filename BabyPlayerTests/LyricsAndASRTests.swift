@@ -46,26 +46,35 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
-    /// 功能键排获得焦点时，再按上立即收起；子菜单内的上键仍供正常导航。
-    func testUpPressDismissesFocusedPlaybackChromeButNotPresentedMenu() {
-        XCTAssertTrue(BabyPlayerPlaybackChromePolicy.shouldDismissControls(
-            pressType: .upArrow,
-            playbackControlHasFocus: true,
-            hasPresentedMenu: false
+    func testUnfinishedPlaybackMovesToFrontWithoutReorderingOthers() {
+        XCTAssertEqual(
+            BabyPlayerPlaybackResumePolicy.prioritizedIDs(
+                ["1", "2", "3", "4"],
+                resuming: "3"
+            ),
+            ["3", "1", "2", "4"]
+        )
+        XCTAssertEqual(
+            BabyPlayerPlaybackResumePolicy.prioritizedIDs(
+                ["1", "2", "3"],
+                resuming: nil
+            ),
+            ["1", "2", "3"]
+        )
+    }
+
+    func testResumePointIgnoresOpeningAndCompletedPlayback() {
+        XCTAssertNil(BabyPlayerPlaybackResumePolicy.resumablePosition(
+            elapsed: 2,
+            duration: 100
         ))
-        XCTAssertFalse(BabyPlayerPlaybackChromePolicy.shouldDismissControls(
-            pressType: .upArrow,
-            playbackControlHasFocus: true,
-            hasPresentedMenu: true
-        ))
-        XCTAssertFalse(BabyPlayerPlaybackChromePolicy.shouldDismissControls(
-            pressType: .downArrow,
-            playbackControlHasFocus: true,
-            hasPresentedMenu: false
-        ))
-        XCTAssertTrue(BabyPlayerPlaybackChromePolicy.shouldRestoreControls(
-            pressType: .upArrow,
-            controlsWereExplicitlyDismissed: true
+        XCTAssertEqual(BabyPlayerPlaybackResumePolicy.resumablePosition(
+            elapsed: 42,
+            duration: 100
+        ), 42)
+        XCTAssertNil(BabyPlayerPlaybackResumePolicy.resumablePosition(
+            elapsed: 96,
+            duration: 100
         ))
     }
 

@@ -17,8 +17,13 @@
 - [x] 修复 DeepSeek 乱序/重叠/无支持行导致整首 422，并自动回收模型遗漏的有声 ASR 词。
 - [x] 真实验收 Who、Baby Shark 和 Wheels；Wheels 开头无人声区零字幕，首句 22.45 秒。
 - [x] 将手工 ASR 入口串成 ASR → DeepSeek → 自动启用，增加播放页提示、失败回退与“后发手工选择优先”保护。
-- [x] 实现功能键排上键立即收起、字幕默认开启、DeepSeek 已有结果默认优先，以及采用成功卡 5 秒自动隐藏。
-- [x] Python 54 项和 tvOS 模拟器 58 项全部通过。
+- [x] 撤回有回归的“上键收起”拦截：方向键全部交回 AVKit 焦点系统，确保能选中歌词/AI 键；Back 仍负责退出播放。
+- [x] 字幕默认开启、DeepSeek 已有结果默认优先，以及采用成功卡 5 秒自动隐藏。
+- [x] AI 分析在换歌或返回 BabyPlayer 首页后继续；再回到该曲目时恢复进度/结果。
+- [x] Mac 端增加只读 DeepSeek 缓存恢复接口，tvOS 本地绑定未写完时可自动拉回并默认采用，不重跑 ASR/DeepSeek。
+- [x] 记录未播完曲目与时间点，首页列表将它置顶，其他顺序不变，再进入可继续播放。
+- [x] 第 12 首 `I Am The Music Man` 577.99 秒混合对话/歌曲完成 ASR 与 DeepSeek：47 行，3.63–566.39 秒，已保存 Mac 缓存。
+- [x] Python 55 项和 tvOS 模拟器 60 项全部通过。
 - [ ] 建立 10–20 首人工标注回归集：每句文字/首尾、人声区间、段落类型和重复次数。
 - [ ] 用标注集 A/B 腾讯人声轨与 faster-whisper/WhisperX，评估第二 ASR/可信歌词强制对齐。
 - [ ] 统一 ASR SRT、Apple TV ASR 和 DeepSeek 的 canonical cue/分行器。
