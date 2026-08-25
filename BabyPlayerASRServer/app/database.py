@@ -461,6 +461,32 @@ class AsrRepository:
                 ),
             )
 
+    def update_cached_segments(
+        self,
+        *,
+        subject_hash: str,
+        fingerprint_hash: str,
+        analysis_version: str,
+        segments: list[dict],
+        now: datetime,
+    ) -> None:
+        """Persist deterministic local quality metadata without spending ASR quota."""
+        timestamp = now.astimezone(timezone.utc).isoformat()
+        serialized = json.dumps(segments, ensure_ascii=False, separators=(",", ":"))
+        with self._transaction() as connection:
+            connection.execute(
+                """UPDATE asr_analysis_cache SET segments_json=?, updated_at=?
+                   WHERE subject_hash=? AND media_fingerprint_hash=?
+                     AND analysis_version=?""",
+                (
+                    serialized,
+                    timestamp,
+                    subject_hash,
+                    fingerprint_hash,
+                    analysis_version,
+                ),
+            )
+
     def release(self, operation_id: str, now: datetime) -> None:
         timestamp = now.astimezone(timezone.utc).isoformat()
         with self._transaction() as connection:

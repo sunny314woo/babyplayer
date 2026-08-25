@@ -11,6 +11,7 @@ from typing import Callable, Sequence
 from app.config import Settings
 from app.database import AsrRepository, Usage
 from app.tencent_asr import TencentAsrError
+from app.voice_activity import annotate_asr_segments, voice_activity_summary
 
 
 class AudioValidationError(Exception):
@@ -85,11 +86,16 @@ class AsrService:
             f"{config.local_asr_chunk_seconds:g}s-"
             f"{config.local_asr_chunk_overlap_seconds:g}s"
         )
+        source_shape = (
+            f"|source:{config.local_vocal_separation_version}"
+            if config.local_vocal_separation_enabled else ""
+        )
         # Cache identity changes when either the declared analysis algorithm or the
         # deterministic Mac chunk timeline changes. Existing whole-song v1 rows stay
         # intact but cannot mask the first complete chunked result.
         self.analysis_version = (
-            f"{config.analysis_version}|{config.asr_timeline_version}|{chunk_shape}"
+            f"{config.analysis_version}|{config.asr_timeline_version}"
+            f"{source_shape}|{chunk_shape}"
         )
         self._semaphore = threading.BoundedSemaphore(config.max_concurrency)
         self._provider_request_limiter = (
@@ -227,6 +233,8 @@ class AsrService:
         force_refresh: bool,
         now: datetime,
         media_content_sha256: str | None = None,
+        voice_activity=None,
+        audio_preprocessing: dict | None = None,
         on_chunk: Callable[[int, int], None] | None = None,
     ) -> dict:
         """Recognize local Mac chunks sequentially and persist one merged timeline."""
@@ -246,6 +254,13 @@ class AsrService:
         if cached and not force_refresh:
             cached_media_hash = cached.get("media_content_sha256")
             if not media_content_sha256 or cached_media_hash == media_content_sha256:
+                cached = self._enrich_voice_activity(
+                    cached,
+                    subject_hash=subject_hash,
+                    fingerprint_hash=fingerprint_hash,
+                    voice_activity=voice_activity,
+                    now=now,
+                )
                 return self._response(cached, cache_hit=True, now=now)
             if cached_media_hash is None:
                 self.repository.attach_media_content_hash(
@@ -256,6 +271,13 @@ class AsrService:
                     now=now,
                 )
                 cached["media_content_sha256"] = media_content_sha256
+                cached = self._enrich_voice_activity(
+                    cached,
+                    subject_hash=subject_hash,
+                    fingerprint_hash=fingerprint_hash,
+                    voice_activity=voice_activity,
+                    now=now,
+                )
                 return self._response(cached, cache_hit=True, now=now)
 
         identical = None if force_refresh else self.repository.alias_cached_audio(
@@ -267,6 +289,13 @@ class AsrService:
             now=now,
         )
         if identical:
+            identical = self._enrich_voice_activity(
+                identical,
+                subject_hash=subject_hash,
+                fingerprint_hash=fingerprint_hash,
+                voice_activity=voice_activity,
+                now=now,
+            )
             return self._response(identical, cache_hit=True, now=now)
 
         reserve_seconds = sum(
@@ -292,6 +321,13 @@ class AsrService:
         )
         if identical_after_claim:
             self.repository.release(operation_id, now)
+            identical_after_claim = self._enrich_voice_activity(
+                identical_after_claim,
+                subject_hash=subject_hash,
+                fingerprint_hash=fingerprint_hash,
+                voice_activity=voice_activity,
+                now=now,
+            )
             return self._response(identical_after_claim, cache_hit=True, now=now)
 
         acquired = self._semaphore.acquire(timeout=self.config.timeout_seconds)
@@ -322,6 +358,20 @@ class AsrService:
                 ordered_chunks,
                 recognitions,
                 duration_seconds=duration_seconds,
+            )
+            segments = annotate_asr_segments(
+                segments,
+                voice_activity,
+                minimum_suspicious_words=(
+                    self.config.local_voice_activity_minimum_suspicious_words
+                ),
+                maximum_low_activity_coverage=(
+                    self.config.local_voice_activity_maximum_low_coverage
+                ),
+            )
+            segments = annotate_audio_preprocessing(
+                segments,
+                audio_preprocessing,
             )
             billed_seconds = min(reserve_seconds, provider_billed_seconds)
             usage = self.repository.complete(
@@ -419,6 +469,37 @@ class AsrService:
             media_content_sha256=cached.get("media_content_sha256"),
             usage=usage,
         )
+
+    def _enrich_voice_activity(
+        self,
+        cached: dict,
+        *,
+        subject_hash: str,
+        fingerprint_hash: str,
+        voice_activity,
+        now: datetime,
+    ) -> dict:
+        if voice_activity is None:
+            return cached
+        annotated = annotate_asr_segments(
+            cached["segments"],
+            voice_activity,
+            minimum_suspicious_words=(
+                self.config.local_voice_activity_minimum_suspicious_words
+            ),
+            maximum_low_activity_coverage=(
+                self.config.local_voice_activity_maximum_low_coverage
+            ),
+        )
+        if annotated != cached["segments"]:
+            self.repository.update_cached_segments(
+                subject_hash=subject_hash,
+                fingerprint_hash=fingerprint_hash,
+                analysis_version=self.analysis_version,
+                segments=annotated,
+                now=now,
+            )
+        return {**cached, "segments": annotated}
 
 
 def merge_chunk_recognitions(
@@ -627,6 +708,38 @@ def fingerprint(value: str) -> str:
     return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()
 
 
+def annotate_audio_preprocessing(
+    segments: list[dict],
+    evidence: dict | None,
+) -> list[dict]:
+    """Persist non-secret local audio-source identity with the ASR timeline."""
+    if not evidence:
+        return segments
+    allowed = {
+        "source": str(evidence.get("source") or "")[:128],
+        "decode": str(evidence.get("decode") or "")[:128],
+        "separator": str(evidence.get("separator") or "")[:128] or None,
+        "model": str(evidence.get("model") or "")[:256] or None,
+        "vocal_coverage": evidence.get("vocal_coverage"),
+        "vocal_mean_probability": evidence.get("vocal_mean_probability"),
+    }
+    return [
+        {**segment, "audio_preprocessing": allowed}
+        for segment in segments
+    ]
+
+
+def audio_preprocessing_summary(segments: list[dict]) -> dict | None:
+    return next(
+        (
+            dict(segment["audio_preprocessing"])
+            for segment in segments
+            if isinstance(segment.get("audio_preprocessing"), dict)
+        ),
+        None,
+    )
+
+
 def response_payload(
     *, cache_hit: bool, engine_type: str, duration_seconds: float,
     transcript: str, segments: list[dict], audio_sha256: str | None,
@@ -640,6 +753,8 @@ def response_payload(
         "audio_duration_seconds": duration_seconds,
         "transcript": transcript,
         "segments": segments,
+        "voice_activity": voice_activity_summary(segments),
+        "audio_preprocessing": audio_preprocessing_summary(segments),
         "audio_sha256": audio_sha256,
         "media_content_sha256": media_content_sha256,
         "monthly_used_seconds": usage.used_seconds,

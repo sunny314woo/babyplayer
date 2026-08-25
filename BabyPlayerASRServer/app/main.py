@@ -35,6 +35,8 @@ from app.models import (
 )
 from app.service import AsrService, AudioValidationError, ServerBusyError
 from app.tencent_asr import TencentAsrError, TencentFlashAsrClient
+from app.voice_activity import SileroVoiceActivityDetector
+from app.vocal_separation import LocalVocalStemSeparator
 
 
 logger = logging.getLogger("babyplayer.api")
@@ -48,6 +50,8 @@ def create_app(
     reconciler_client=None,
     lyrics_retriever=None,
     local_media_extractor=None,
+    voice_activity_detector=None,
+    vocal_stem_separator=None,
 ) -> FastAPI:
     database = repository or AsrRepository(config.database_path)
     database.initialize()
@@ -65,7 +69,22 @@ def create_app(
         enabled=config.product_env != "production",
     )
     # 【MODIFIED】本地路径分析只在 Mac 开发环境使用，最终结果仍进入现有 SQLite 缓存。
-    resolved_local_extractor = local_media_extractor or LocalMediaAudioExtractor(config)
+    resolved_voice_activity_detector = voice_activity_detector
+    if resolved_voice_activity_detector is None and config.local_voice_activity_enabled:
+        resolved_voice_activity_detector = SileroVoiceActivityDetector(
+            threshold=config.local_voice_activity_threshold,
+        )
+    resolved_vocal_stem_separator = vocal_stem_separator
+    if (
+        resolved_vocal_stem_separator is None
+        and config.local_vocal_separation_enabled
+    ):
+        resolved_vocal_stem_separator = LocalVocalStemSeparator(config)
+    resolved_local_extractor = local_media_extractor or LocalMediaAudioExtractor(
+        config,
+        voice_activity_detector=resolved_voice_activity_detector,
+        vocal_stem_separator=resolved_vocal_stem_separator,
+    )
     local_jobs = LocalAnalysisJobManager(
         service=service,
         extractor=resolved_local_extractor,
@@ -149,6 +168,19 @@ def create_app(
             "lyrics_refiner_configured": config.lyrics_refiner_enabled,
             "monthly_limit_seconds": config.monthly_limit_seconds,
             "local_analysis_enabled": config.product_env != "production",
+            "voice_activity_configured": bool(
+                config.local_voice_activity_enabled
+                and SileroVoiceActivityDetector.available()
+            ),
+            "vocal_separation_configured": bool(
+                config.local_vocal_separation_enabled
+                and LocalVocalStemSeparator.available()
+            ),
+            "vocal_separation_model_ready": bool(
+                config.local_vocal_separation_enabled
+                and resolved_vocal_stem_separator is not None
+                and resolved_vocal_stem_separator.model_ready()
+            ),
         }
 
     @application.get("/v1/usage", response_model=UsageResponse)

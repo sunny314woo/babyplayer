@@ -3,7 +3,7 @@
 // BabyPlayer 歌词候选、本地绑定和时间偏移。
 // 当前主要功能：搜索与缓存候选、稳定默认绑定、每歌词独立校时及人工优先持久化。
 // 最近修改：2026-08-23 引入不依赖时间戳的 persistentIdentifier v2 和 v1 timing fallback。
-// 最近修改：2026-08-24 持久保留人工触发的 ASR/DeepSeek 结果，分析完成不再自动替换当前歌词。
+// 最近修改：2026-08-25 持久保留 ASR/DeepSeek 并列结果，由播放器在显式分析链成功后自动固定 DeepSeek。
 //
 
 import CryptoKit
@@ -197,7 +197,7 @@ struct StoredLyricsAnalysisResult: Codable, Sendable {
     let createdAt: Date
 }
 
-/// 一首媒体的 ASR/DeepSeek 并列结果；两者可同时保留，只有人工“采用”才会另外写入默认歌词 binding。
+/// 一首媒体的 ASR/DeepSeek 并列结果；两者可同时保留，是否写入默认 binding 由上层显式工作流决定。
 struct StoredLyricsAnalysisBundle: Codable, Sendable {
     let mediaID: String
     let mediaFingerprint: String
@@ -673,7 +673,7 @@ actor BabyLyricsRepository {
         return bundle
     }
 
-    /// 保存人工运行的 DeepSeek 结果；输入候选和所依赖 ASR 哈希，输出更新 bundle，不自动采用。
+    /// 保存 DeepSeek 结果；输入候选和所依赖 ASR 哈希，输出更新 bundle，本层不隐式修改 binding。
     @discardableResult
     func storeDeepSeekResult(
         _ candidate: LyricsCandidate,

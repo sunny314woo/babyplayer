@@ -14,6 +14,7 @@ from app.service import (
     merge_chunk_recognitions,
 )
 from app.tencent_asr import Recognition, TencentAsrError
+from app.voice_activity import VoiceActivityEvidence
 
 
 NOW = datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)
@@ -175,6 +176,69 @@ def test_chunked_service_calls_provider_sequentially_then_reuses_merged_cache(tm
     assert cached["cache_hit"] is True
     assert cached["segments"] == first["segments"]
     assert service.analysis_version.endswith("test-chunked-v1|60s-5s")
+
+
+def test_vocal_separation_pipeline_has_a_distinct_asr_cache_identity(tmp_path) -> None:
+    mixed = AsrService(
+        AsrRepository(str(tmp_path / "mixed.sqlite3")),
+        FakeChunkProvider(),
+        configured(tmp_path),
+    )
+    vocal_config = replace(
+        configured(tmp_path),
+        local_vocal_separation_enabled=True,
+        local_vocal_separation_version="separator-model-v2",
+    )
+    vocal = AsrService(
+        AsrRepository(str(tmp_path / "vocal.sqlite3")),
+        FakeChunkProvider(),
+        vocal_config,
+    )
+
+    assert mixed.analysis_version != vocal.analysis_version
+    assert "source:separator-model-v2" in vocal.analysis_version
+
+
+def test_cached_tencent_timeline_can_gain_vad_evidence_without_provider_charge(tmp_path) -> None:
+    config = configured(tmp_path)
+    repository = AsrRepository(config.database_path)
+    repository.initialize()
+    provider = FakeChunkProvider()
+    service = AsrService(repository, provider, config)
+    arguments = {
+        "subject_hash": "subject",
+        "media_fingerprint": "media-fingerprint-quality",
+        "duration_seconds": 157.184,
+        "audio": b"complete-song-audio-quality",
+        "chunks": chunks(),
+        "force_refresh": False,
+        "now": NOW,
+        "media_content_sha256": "source-video-quality-sha256",
+    }
+    first = service.analyze_chunked(
+        **arguments,
+        operation_id="operation-quality-1",
+    )
+    evidence = VoiceActivityEvidence(
+        detector="test-vad",
+        scope="mixed_audio_advisory",
+        threshold=0.15,
+        frame_seconds=1.0,
+        probabilities=(0.01,) * 158,
+        speech_intervals=(),
+    )
+    enriched = service.analyze_chunked(
+        **arguments,
+        operation_id="operation-quality-2",
+        voice_activity=evidence,
+    )
+
+    assert first["voice_activity"] is None
+    assert enriched["cache_hit"] is True
+    assert enriched["voice_activity"]["detector"] == "test-vad"
+    assert enriched["voice_activity"]["analyzed_word_count"] == 8
+    assert provider.calls == [b"chunk-0", b"chunk-1", b"chunk-2"]
+    assert repository.usage(config.monthly_limit_seconds, NOW).used_seconds == 168
 
 
 def test_chunked_service_reserves_overlap_before_any_provider_call(tmp_path) -> None:

@@ -23,6 +23,9 @@ RECONCILIATION_SYSTEM_PROMPT = """You are BabyPlayer's Lyrics Evidence Reconcile
 Reconstruct lyrics for the current audio using the song title, Tencent ASR transcript/indexed words,
 existing candidates, and any separately retrieved web candidates. ASR word timing is the only timing
 truth. Candidate timestamps are weak and must not control order. Never use memory to add lyrics.
+Each ASR word may include voice_activity_score, voice_activity_coverage, and quality_flags. These are
+conservative mixed-audio advisory signals, not absolute truth: candidate-supported sung words can
+survive low activity, but an ASR-only run flagged possible_instrumental_hallucination must be omitted.
 Choose wording supported by ASR or supplied candidate evidence; tolerate obvious ASR mishearing such
 as 'clap your heads' versus strongly supported 'Clap your hands'. Omit unsupported candidate lines.
 Preserve repeated performances at distinct ASR positions. Each final line must map to one contiguous,
@@ -35,6 +38,8 @@ Return JSON only:
 "discarded_lines":[]}.
 Always return discarded_lines as an empty array; do not enumerate rejected candidate lines.
 Keep source_line_ids minimal and include at most three identifiers per final line.
+For a web candidate, copy its exact source_line_id (for example web_1:retrieved_text);
+never invent line identifiers inside retrieved_text.
 The goal is the most faithful lyric for this audio, not the prettiest standard version."""
 
 

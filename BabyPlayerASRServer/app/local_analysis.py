@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +31,8 @@ from app.service import (
     ServerBusyError,
 )
 from app.tencent_asr import TencentAsrError
+from app.voice_activity import VoiceActivityEvidence
+from app.vocal_separation import VocalSeparationError
 
 
 logger = logging.getLogger("babyplayer.local_analysis")
@@ -47,6 +49,10 @@ class LocalMediaExtractionError(Exception):
     pass
 
 
+class LocalNoVocalsDetectedError(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class ExtractedAudio:
     data: bytes
@@ -54,6 +60,8 @@ class ExtractedAudio:
     voice_format: str = "m4a"
     media_content_sha256: str | None = None
     chunks: tuple[AsrAudioChunk, ...] = ()
+    voice_activity: VoiceActivityEvidence | None = None
+    audio_preprocessing: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -95,10 +103,19 @@ def plan_audio_chunks(
 
 
 class LocalMediaAudioExtractor:
-    """只从白名单目录读取源媒体，并输出腾讯 ASR 可接收的单声道 M4A。"""
+    """Decode once to lossless PCM, then create all ASR inputs from one source."""
 
-    def __init__(self, config: Settings) -> None:
+    def __init__(
+        self,
+        config: Settings,
+        *,
+        voice_activity_detector=None,
+        vocal_stem_separator=None,
+    ) -> None:
         self.config = config
+        self.voice_activity_detector = voice_activity_detector
+        self.vocal_stem_separator = vocal_stem_separator
+        self.uses_vocal_separation = vocal_stem_separator is not None
         self.roots = tuple(
             Path(value).expanduser().resolve()
             for value in config.local_media_roots
@@ -124,19 +141,91 @@ class LocalMediaAudioExtractor:
             raise LocalMediaExtractionError("Mac 未找到可用的 FFmpeg")
 
         with tempfile.TemporaryDirectory(prefix="babyplayer-asr-") as directory:
-            output = Path(directory) / "analysis.m4a"
+            temporary_root = Path(directory)
+            lossless_mix = temporary_root / "source-mix.wav"
             command = [
                 str(ffmpeg),
                 "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                "-ss", f"{request.song_start_seconds:.3f}",
                 "-i", str(source),
+                # Output-side seek decodes to the requested point instead of starting
+                # at the nearest video keyframe, which keeps the lyric timeline stable.
+                "-ss", f"{request.song_start_seconds:.3f}",
                 "-t", f"{duration:.3f}",
+                "-vn", "-ac", "2", "-ar", "44100",
+                "-c:a", "pcm_s16le",
+                str(lossless_mix),
+            ]
+            self._run_ffmpeg(
+                command,
+                lossless_mix,
+                error_message="Mac 无法从该视频提取音频",
+            )
+
+            asr_source = lossless_mix
+            audio_preprocessing = {
+                "source": "lossless_mixed_audio",
+                "decode": "pcm_s16le_44100_stereo",
+            }
+            if self.vocal_stem_separator is not None:
+                separated = self.vocal_stem_separator.separate(
+                    lossless_mix,
+                    output_directory=temporary_root / "separated",
+                    expected_duration_seconds=duration,
+                )
+                asr_source = separated.path
+                audio_preprocessing = {
+                    "source": "vocal_stem",
+                    "decode": "pcm_s16le_44100_stereo",
+                    "separator": separated.separator,
+                    "model": separated.model,
+                }
+
+            voice_activity = None
+            if self.voice_activity_detector is not None:
+                try:
+                    voice_activity = self.voice_activity_detector.analyze(
+                        asr_source.read_bytes(),
+                        duration_seconds=duration,
+                    )
+                    if self.vocal_stem_separator is not None:
+                        voice_activity = replace(
+                            voice_activity,
+                            scope="vocal_stem_gate",
+                        )
+                    metrics = _voice_activity_metrics(voice_activity, duration)
+                    audio_preprocessing.update(metrics)
+                    if (
+                        self.vocal_stem_separator is not None
+                        and metrics["vocal_coverage"]
+                        < self.config.local_minimum_vocal_coverage
+                        and metrics["vocal_mean_probability"]
+                        < self.config.local_minimum_vocal_mean_probability
+                    ):
+                        raise LocalNoVocalsDetectedError(
+                            "未检测到足够人声，已停止 ASR 以避免生成幻觉字幕"
+                        )
+                except LocalNoVocalsDetectedError:
+                    raise
+                except Exception as exc:
+                    # VAD is a quality signal, never a reason to lose an otherwise valid ASR.
+                    logger.warning(
+                        "Local voice activity analysis unavailable error_type=%s",
+                        type(exc).__name__,
+                    )
+            output = temporary_root / "analysis.m4a"
+            complete_command = [
+                str(ffmpeg),
+                "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "-i", str(asr_source),
                 "-vn", "-ac", "1", "-ar", "16000",
                 "-c:a", "aac", "-b:a", "64k",
                 str(output),
             ]
-            self._run_ffmpeg(command, output, error_message="Mac 无法从该视频提取音频")
-
+            self._run_ffmpeg(
+                complete_command,
+                output,
+                error_message="Mac 无法生成完整 ASR 音频",
+            )
             audio = output.read_bytes()
             if not audio or len(audio) > self.config.max_audio_bytes * len(windows):
                 raise LocalMediaExtractionError("提取后的音频大小超过当前限制")
@@ -147,7 +236,7 @@ class LocalMediaAudioExtractor:
                     str(ffmpeg),
                     "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                     "-ss", f"{window.offset_seconds:.3f}",
-                    "-i", str(output),
+                    "-i", str(asr_source),
                     "-t", f"{window.duration_seconds:.3f}",
                     "-vn", "-ac", "1", "-ar", "16000",
                     "-c:a", "aac", "-b:a", "64k",
@@ -172,6 +261,8 @@ class LocalMediaAudioExtractor:
                 duration_seconds=duration,
                 media_content_sha256=media_content_sha256,
                 chunks=tuple(chunks),
+                voice_activity=voice_activity,
+                audio_preprocessing=audio_preprocessing,
             )
 
     def _run_ffmpeg(
@@ -225,6 +316,25 @@ def _sha256_file(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _voice_activity_metrics(
+    evidence: VoiceActivityEvidence,
+    duration_seconds: float,
+) -> dict[str, float]:
+    speech_seconds = sum(
+        max(0.0, end - start) for start, end in evidence.speech_intervals
+    )
+    mean_probability = (
+        sum(evidence.probabilities) / len(evidence.probabilities)
+        if evidence.probabilities else 0.0
+    )
+    return {
+        "vocal_coverage": round(
+            min(1.0, speech_seconds / max(0.001, duration_seconds)), 4
+        ),
+        "vocal_mean_probability": round(mean_probability, 4),
+    }
 
 
 class LocalAnalysisJobManager:
@@ -296,7 +406,12 @@ class LocalAnalysisJobManager:
     ) -> None:
         self._work_slots.acquire()
         try:
-            self._update(job_id, status="extracting", message="Mac 正在从原视频提取音频")
+            extraction_message = (
+                "Mac 正在提取音频并分离人声"
+                if getattr(self.extractor, "uses_vocal_separation", False)
+                else "Mac 正在从原视频提取音频"
+            )
+            self._update(job_id, status="extracting", message=extraction_message)
             extracted = self.extractor.extract(request)
             self._update(job_id, status="recognizing", message="腾讯 ASR 正在识别")
             if extracted.chunks:
@@ -310,6 +425,8 @@ class LocalAnalysisJobManager:
                     force_refresh=request.force_refresh,
                     now=datetime.now(timezone.utc),
                     media_content_sha256=extracted.media_content_sha256,
+                    voice_activity=extracted.voice_activity,
+                    audio_preprocessing=extracted.audio_preprocessing,
                     on_chunk=lambda index, total: self._update(
                         job_id,
                         status="recognizing",
@@ -380,6 +497,10 @@ def _friendly_error(exc: Exception) -> tuple[str, str]:
         return "LOCAL_MEDIA_INVALID", str(exc)
     if isinstance(exc, LocalMediaExtractionError):
         return "LOCAL_AUDIO_EXTRACTION_FAILED", str(exc)
+    if isinstance(exc, VocalSeparationError):
+        return "LOCAL_VOCAL_SEPARATION_FAILED", str(exc)
+    if isinstance(exc, LocalNoVocalsDetectedError):
+        return "NO_VOCALS_DETECTED", str(exc)
     if isinstance(exc, MonthlyLimitReachedError):
         return "MONTHLY_ASR_LIMIT_REACHED", "本月声音分析额度已用完"
     if isinstance(exc, RateLimitReachedError):
@@ -403,6 +524,7 @@ __all__ = [
     "LocalAnalysisJobManager",
     "LocalMediaAudioExtractor",
     "LocalMediaExtractionError",
+    "LocalNoVocalsDetectedError",
     "LocalMediaValidationError",
     "plan_audio_chunks",
 ]

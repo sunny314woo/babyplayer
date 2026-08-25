@@ -36,10 +36,35 @@ class DevelopmentArtifactWriter:
             "media_title": media_title,
             "force_refresh": force_refresh,
             "audio_bytes": len(audio),
+            "audio_preprocessing": response.get("audio_preprocessing"),
         })
         self._write_bytes(folder / audio_file_name, audio)
         self._write_json(folder / "asr_raw.json", response)
         self._write_text(folder / "asr.srt", self._segments_srt(response.get("segments") or []))
+        self._write_text(
+            folder / "asr_quality_filtered.srt",
+            self._quality_filtered_segments_srt(response.get("segments") or []),
+        )
+        self._write_json(folder / "voice_activity.json", {
+            "summary": response.get("voice_activity"),
+            "flagged_words": [
+                {
+                    "text": word.get("text"),
+                    "start_seconds": word.get("start_seconds"),
+                    "end_seconds": word.get("end_seconds"),
+                    "voice_activity_score": word.get("voice_activity_score"),
+                    "voice_activity_coverage": word.get("voice_activity_coverage"),
+                    "quality_flags": word.get("quality_flags") or [],
+                }
+                for segment in response.get("segments") or []
+                for word in segment.get("words") or []
+                if word.get("quality_flags")
+            ],
+        })
+        self._write_json(
+            folder / "audio_preprocessing.json",
+            response.get("audio_preprocessing"),
+        )
 
     def store_deepseek(
         self,
@@ -71,6 +96,36 @@ class DevelopmentArtifactWriter:
             (segment.get("start_seconds"), segment.get("end_seconds"), segment.get("text"))
             for segment in segments
         ]
+        return DevelopmentArtifactWriter._srt(entries)
+
+    @staticmethod
+    def _quality_filtered_segments_srt(segments: list[dict]) -> str:
+        entries = []
+        for segment in segments:
+            raw_words = segment.get("words") or []
+            visible_words = [
+                word for word in raw_words
+                if "possible_instrumental_hallucination"
+                not in (word.get("quality_flags") or [])
+            ]
+            if raw_words and not visible_words:
+                continue
+            if visible_words:
+                entries.append((
+                    visible_words[0].get("start_seconds"),
+                    visible_words[-1].get("end_seconds"),
+                    " ".join(
+                        str(word.get("text") or "").strip()
+                        for word in visible_words
+                        if str(word.get("text") or "").strip()
+                    ),
+                ))
+            else:
+                entries.append((
+                    segment.get("start_seconds"),
+                    segment.get("end_seconds"),
+                    segment.get("text"),
+                ))
         return DevelopmentArtifactWriter._srt(entries)
 
     @staticmethod

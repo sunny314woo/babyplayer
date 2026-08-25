@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Local Mac quality path. Silero VAD is bundled; no Whisper transcription model is needed.
+faster-whisper==1.2.1
+audio-separator[cpu]==0.44.5

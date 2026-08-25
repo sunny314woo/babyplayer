@@ -207,6 +207,155 @@ def test_reconciler_cache_is_invalidated_when_asr_timeline_version_changes() -> 
     assert repository.store_calls == 2
 
 
+def test_reconciler_cache_is_bound_to_actual_asr_timeline_and_candidates() -> None:
+    repository = MemoryRepository()
+    first_model = FakeD3Model()
+    target = service(repository, first_model, FakeRetriever())
+    target.reconcile(
+        subject_hash="subject", request=request(), asr_analysis=asr_analysis(), now=NOW
+    )
+
+    changed_timeline = asr_analysis()
+    changed_timeline["segments"][0]["words"][0]["start_seconds"] = 0.5
+    timeline_model = FakeD3Model()
+    timeline_result = service(repository, timeline_model, FakeRetriever()).reconcile(
+        subject_hash="subject",
+        request=request(),
+        asr_analysis=changed_timeline,
+        now=NOW,
+    )
+    candidate_model = FakeD3Model()
+    candidate_result = service(repository, candidate_model, FakeRetriever()).reconcile(
+        subject_hash="subject",
+        request=request(("Twinkle little star", "How I wonder what you are")),
+        asr_analysis=changed_timeline,
+        now=NOW,
+    )
+
+    assert timeline_result["cache_hit"] is False
+    assert candidate_result["cache_hit"] is False
+    assert timeline_model.reconcile_calls == 1
+    assert candidate_model.reconcile_calls == 1
+    assert repository.store_calls == 3
+
+
+def test_reconciler_drops_asr_only_line_flagged_as_instrumental_hallucination() -> None:
+    analysis = asr_analysis()
+    for word in analysis["segments"][0]["words"][:3]:
+        word["voice_activity_score"] = 0.01
+        word["voice_activity_coverage"] = 0.0
+        word["quality_flags"] = ["possible_instrumental_hallucination"]
+    result = {
+        "song_match_confidence": 0.86,
+        "primary_source": "asr_only",
+        "lines": [
+            {
+                "text": "twinkle twinkle little",
+                "asr_word_start_index": 0,
+                "asr_word_end_index": 2,
+                "source": "asr_only",
+                "source_line_ids": [],
+                "confidence": 0.4,
+                "text_corrected": False,
+            },
+            {
+                "text": "star how",
+                "asr_word_start_index": 3,
+                "asr_word_end_index": 4,
+                "source": "asr_only",
+                "source_line_ids": [],
+                "confidence": 0.8,
+                "text_corrected": False,
+            },
+            {
+                "text": "I wonder what you are",
+                "asr_word_start_index": 5,
+                "asr_word_end_index": 9,
+                "source": "asr_only",
+                "source_line_ids": [],
+                "confidence": 0.8,
+                "text_corrected": False,
+            },
+        ],
+        "discarded_lines": [],
+    }
+    empty_request = LyricsReconcileRequest.model_validate({
+        "media_fingerprint": "media-fingerprint-0001",
+        "song_title": "Twinkle Twinkle Little Star",
+        "candidates": [],
+    })
+
+    reconciled = service(
+        MemoryRepository(), FakeD3Model(result=result), FakeRetriever([])
+    ).reconcile(
+        subject_hash="subject",
+        request=empty_request,
+        asr_analysis=analysis,
+        now=NOW,
+    )
+
+    assert [line["text"] for line in reconciled["lines"]] == [
+        "star how", "I wonder what you are"
+    ]
+    assert reconciled["discarded_lines"] == [{
+        "source_line_id": None,
+        "text": "twinkle twinkle little",
+        "reason": "no_audio_evidence",
+    }]
+    assert reconciled["asr_word_coverage"] == 1.0
+    assert reconciled["recovered_asr_word_count"] == 0
+
+
+def test_reconciler_restores_voice_supported_words_omitted_by_model() -> None:
+    result = {
+        "song_match_confidence": 0.86,
+        "primary_source": "asr_only",
+        "lines": [
+            {
+                "text": "twinkle twinkle little star",
+                "asr_word_start_index": 0,
+                "asr_word_end_index": 3,
+                "source": "asr_only",
+                "source_line_ids": [],
+                "confidence": 0.8,
+                "text_corrected": False,
+            },
+            {
+                "text": "wonder what you are",
+                "asr_word_start_index": 6,
+                "asr_word_end_index": 9,
+                "source": "asr_only",
+                "source_line_ids": [],
+                "confidence": 0.8,
+                "text_corrected": False,
+            },
+        ],
+        "discarded_lines": [],
+    }
+    empty_request = LyricsReconcileRequest.model_validate({
+        "media_fingerprint": "media-fingerprint-0001",
+        "song_title": "Twinkle Twinkle Little Star",
+        "candidates": [],
+    })
+
+    reconciled = service(
+        MemoryRepository(), FakeD3Model(result=result), FakeRetriever([])
+    ).reconcile(
+        subject_hash="subject",
+        request=empty_request,
+        asr_analysis=asr_analysis(),
+        now=NOW,
+    )
+
+    assert [line["text"] for line in reconciled["lines"]] == [
+        "twinkle twinkle little star",
+        "how I",
+        "wonder what you are",
+    ]
+    assert reconciled["asr_word_coverage"] == 1.0
+    assert reconciled["recovered_asr_word_count"] == 2
+
+
 def test_reconciler_searches_when_all_existing_candidates_are_weak() -> None:
     web = RetrievedLyricsEvidence(
         candidate_id="web_1",
@@ -257,6 +406,60 @@ def test_reconciler_searches_when_all_existing_candidates_are_weak() -> None:
     assert retriever.calls == 1
     assert reconciled["web_search_used"] is True
     assert reconciled["primary_source"] == "web_1"
+
+
+def test_reconciler_normalizes_unstable_web_line_labels_to_bounded_evidence() -> None:
+    web = RetrievedLyricsEvidence(
+        candidate_id="web_1",
+        source="supersimple.com",
+        url="https://supersimple.com/song/twinkle-twinkle-little-star/",
+        text="Twinkle, twinkle, little star\nHow I wonder what you are",
+    )
+    result = {
+        "song_match_confidence": 0.92,
+        "primary_source": "web_1",
+        "lines": [
+            {
+                "text": "Twinkle, twinkle, little star",
+                "asr_word_start_index": 0,
+                "asr_word_end_index": 3,
+                "source": "web_1",
+                "source_line_ids": ["web_1:invented_line_7"],
+                "confidence": 0.95,
+                "text_corrected": True,
+            },
+            {
+                "text": "How I wonder what you are",
+                "asr_word_start_index": 4,
+                "asr_word_end_index": 9,
+                "source": "web_1",
+                "source_line_ids": ["web_1:retrieved_text"],
+                "confidence": 0.94,
+                "text_corrected": True,
+            },
+        ],
+        "discarded_lines": [],
+    }
+    empty_request = LyricsReconcileRequest.model_validate({
+        "media_fingerprint": "media-fingerprint-0001",
+        "song_title": "Twinkle Twinkle Little Star",
+        "candidates": [],
+    })
+
+    reconciled = service(
+        MemoryRepository(),
+        FakeD3Model(result=result),
+        FakeRetriever([web]),
+    ).reconcile(
+        subject_hash="subject",
+        request=empty_request,
+        asr_analysis=asr_analysis(),
+        now=NOW,
+    )
+
+    assert reconciled["lines"][0]["source_line_ids"] == [
+        "web_1:retrieved_text"
+    ]
 
 
 def test_reconciler_can_build_asr_only_timeline_without_downloaded_lyrics() -> None:
@@ -310,16 +513,54 @@ def test_reconciler_can_build_asr_only_timeline_without_downloaded_lyrics() -> N
     assert [line["end_seconds"] for line in reconciled["lines"]] == [2.0, 4.1]
 
 
-def test_reconciler_rejects_model_generated_timestamps_or_nonmonotonic_ranges() -> None:
+def test_reconciler_normalizes_overlapping_model_ranges_and_recovers_gap() -> None:
     invalid = FakeD3Model().result
     invalid["lines"][1]["asr_word_start_index"] = 2
     invalid["lines"][1]["asr_word_end_index"] = 5
     target = service(MemoryRepository(), FakeD3Model(result=invalid), FakeRetriever())
 
-    with pytest.raises(LyricsReconciliationError, match="monotonic"):
+    reconciled = target.reconcile(
+        subject_hash="subject", request=request(), asr_analysis=asr_analysis(), now=NOW
+    )
+
+    assert [line["asr_word_start_index"] for line in reconciled["lines"]] == [0, 4]
+    assert reconciled["recovered_asr_word_count"] == 6
+    assert reconciled["asr_word_coverage"] == 1.0
+    assert reconciled["discarded_lines"] == [{
+        "source_line_id": None,
+        "text": "How I wonder what you are",
+        "reason": "duplicate_error",
+    }]
+
+
+def test_reconciler_still_rejects_out_of_bounds_model_range() -> None:
+    invalid = FakeD3Model().result
+    invalid["lines"][1]["asr_word_end_index"] = 10
+    target = service(MemoryRepository(), FakeD3Model(result=invalid), FakeRetriever())
+
+    with pytest.raises(LyricsReconciliationError, match="bounded"):
         target.reconcile(
             subject_hash="subject", request=request(), asr_analysis=asr_analysis(), now=NOW
         )
+
+
+def test_reconciler_replaces_unsupported_model_text_with_bounded_asr() -> None:
+    result = FakeD3Model().result
+    result["lines"][0]["text"] = "Completely invented purple dinosaur"
+    target = service(MemoryRepository(), FakeD3Model(result=result), FakeRetriever())
+
+    reconciled = target.reconcile(
+        subject_hash="subject", request=request(), asr_analysis=asr_analysis(), now=NOW
+    )
+
+    assert reconciled["lines"][0]["text"] == "twinkle twinkle little star"
+    assert reconciled["recovered_asr_word_count"] == 4
+    assert reconciled["asr_word_coverage"] == 1.0
+    assert reconciled["discarded_lines"] == [{
+        "source_line_id": None,
+        "text": "Completely invented purple dinosaur",
+        "reason": "unsupported",
+    }]
 
 
 def test_deepseek_d3_client_uses_separate_assessment_and_reconciliation_prompts() -> None:

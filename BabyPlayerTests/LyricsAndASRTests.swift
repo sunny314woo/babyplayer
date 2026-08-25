@@ -55,6 +55,107 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
+    /// 本地服务未启动时明确提示 Mac 8011，不再让 -1004 看起来像腾讯识别失败。
+    func testASRConnectionErrorIdentifiesUnavailableLocalService() {
+        let message = BabyPlayerAnalysisErrorPresentation.message(
+            URLError(.cannotConnectToHost),
+            fallback: "ASR 处理失败"
+        )
+
+        XCTAssertTrue(message.contains("无法连接声音分析服务"))
+        XCTAssertTrue(message.contains("-1004"))
+        XCTAssertTrue(message.contains("8011"))
+    }
+
+    func testASRTimeoutErrorProvidesNetworkRecoveryAction() {
+        let message = BabyPlayerAnalysisErrorPresentation.message(
+            URLError(.timedOut),
+            fallback: "ASR 处理失败"
+        )
+
+        XCTAssertTrue(message.contains("连接超时"))
+        XCTAssertTrue(message.contains("同一网络"))
+    }
+
+    /// 连续低人声词组不进入原始 ASR 字幕，但独立低活动演唱仍保留。
+    func testRawASRCandidateSuppressesOnlyFlaggedInstrumentalPhrase() throws {
+        let suspiciousFlags = ["low_voice_activity", "possible_instrumental_hallucination"]
+        let analysis = BabyPlayerASRAnalysis(
+            status: "completed",
+            cacheHit: false,
+            provider: "tencent_flash_asr",
+            engineType: "16k_en",
+            audioDurationSeconds: 8,
+            transcript: "thank you for Bear hello",
+            segments: [BabyPlayerASRSegment(
+                text: "thank you for Bear hello",
+                startSeconds: 0,
+                endSeconds: 6,
+                words: [
+                    BabyPlayerASRWord(
+                        text: "thank", startSeconds: 0, endSeconds: 0.4,
+                        voiceActivityScore: 0.01, voiceActivityCoverage: 0,
+                        qualityFlags: suspiciousFlags
+                    ),
+                    BabyPlayerASRWord(
+                        text: "you", startSeconds: 0.5, endSeconds: 0.8,
+                        voiceActivityScore: 0.01, voiceActivityCoverage: 0,
+                        qualityFlags: suspiciousFlags
+                    ),
+                    BabyPlayerASRWord(
+                        text: "for", startSeconds: 0.9, endSeconds: 1.2,
+                        voiceActivityScore: 0.01, voiceActivityCoverage: 0,
+                        qualityFlags: suspiciousFlags
+                    ),
+                    BabyPlayerASRWord(
+                        text: "Bear", startSeconds: 3, endSeconds: 3.5,
+                        voiceActivityScore: 0.01, voiceActivityCoverage: 0,
+                        qualityFlags: ["low_voice_activity"]
+                    ),
+                    BabyPlayerASRWord(
+                        text: "hello", startSeconds: 5, endSeconds: 5.5,
+                        voiceActivityScore: 0.9, voiceActivityCoverage: 1,
+                        qualityFlags: []
+                    )
+                ]
+            )],
+            monthlyUsedSeconds: 8,
+            monthlyReservedSeconds: 0,
+            monthlyLimitSeconds: 18_000,
+            audioContentHash: nil,
+            mediaContentHash: nil
+        )
+
+        let displayedText = try analysis.lyricsCandidate(
+            title: "Quality Test",
+            mediaFingerprint: "quality-test-fingerprint"
+        ).lines.map(\.text).joined(separator: " ")
+
+        XCTAssertFalse(displayedText.contains("thank"))
+        XCTAssertTrue(displayedText.contains("Bear"))
+        XCTAssertTrue(displayedText.contains("hello"))
+    }
+
+    func testASRVoiceActivityMetadataSurvivesServerJSONDecoding() throws {
+        let original = BabyPlayerASRWord(
+            text: "ghost",
+            startSeconds: 1,
+            endSeconds: 1.5,
+            voiceActivityScore: 0.02,
+            voiceActivityCoverage: 0,
+            qualityFlags: ["possible_instrumental_hallucination"]
+        )
+
+        let decoded = try JSONDecoder().decode(
+            BabyPlayerASRWord.self,
+            from: JSONEncoder().encode(original)
+        )
+
+        XCTAssertEqual(decoded.voiceActivityScore, 0.02)
+        XCTAssertEqual(decoded.voiceActivityCoverage, 0)
+        XCTAssertTrue(decoded.isPossibleInstrumentalHallucination)
+    }
+
     /// 腾讯长 segment 必须按词级时间拆成电视可读短行，不能把一分钟文字铺满屏幕。
     func testRawASRCandidateSplitsLongTencentSegmentForTVReadability() throws {
         let words = (0..<25).map {
@@ -488,14 +589,14 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
-    /// 验证完成卡包含用户可见的三个里程碑；输入为 completed 状态，输出文案断言，不修改状态。
+    /// 验证完成卡同时告知用户 DeepSeek 已自动启用；输入为 completed 状态，输出文案断言。
     // 【MODIFIED】防止 AI 按钮再次只高亮而没有播放画面反馈。
     func testAIProgressCompletionShowsAllVisibleMilestones() {
         let text = BabyPlayerAILyricsProgress.completed.overlayText
 
         XCTAssertTrue(text.contains("语音识别已经完成"))
         XCTAssertTrue(text.contains("时间轴已重新完成对齐"))
-        XCTAssertTrue(text.contains("字幕内容已完成对齐"))
+        XCTAssertTrue(text.contains("DeepSeek 字幕已自动启用"))
     }
 
     /// 验证单曲重试使用封顶退避；输入为连续失败次数，输出时间序列，不修改状态。
@@ -537,6 +638,22 @@ final class LyricsAndASRTests: XCTestCase {
 
         XCTAssertTrue(guardState.isManuallyLocked)
         XCTAssertFalse(guardState.permitsAutomaticResult(startedAt: automaticGeneration))
+    }
+
+    /// 验证显式点击 ASR/DeepSeek 可以替换旧手工字幕，但处理期间更新的手工选择仍然优先。
+    func testExplicitAnalysisWorkflowAllowsAutoActivationUntilANewerManualChoice() {
+        let guardState = LyricsAutomationGenerationGuard()
+        _ = guardState.resetForNewMedia()
+        guardState.lockManually()
+
+        let workflowGeneration = guardState.beginExplicitAnalysisWorkflow()
+
+        XCTAssertFalse(guardState.isManuallyLocked)
+        XCTAssertTrue(guardState.permitsAutomaticResult(startedAt: workflowGeneration))
+
+        guardState.lockManually()
+
+        XCTAssertFalse(guardState.permitsAutomaticResult(startedAt: workflowGeneration))
     }
 
     // 【MODIFIED】普通候选可默认显示，但未经家长固定不得永久绑定。
@@ -1193,7 +1310,7 @@ final class LyricsAndASRTests: XCTestCase {
                 httpVersion: "HTTP/1.1",
                 headerFields: ["Content-Type": "application/json"]
             )!
-            let payload = Data(#"{"status":"completed","cache_hit":false,"model":"deepseek-v4-flash","reconciliation_version":"babyplayer-lyrics-d3-v1","song_match_confidence":0.94,"primary_source":"candidate_1","web_search_used":false,"lines":[{"text":"Twinkle, twinkle, little star","asr_word_start_index":0,"asr_word_end_index":3,"start_seconds":0.4,"end_seconds":2.0,"source":"candidate_1","source_line_ids":["candidate_1:line_0"],"confidence":0.96,"text_corrected":true},{"text":"How I wonder what you are","asr_word_start_index":4,"asr_word_end_index":9,"start_seconds":2.2,"end_seconds":4.1,"source":"candidate_1","source_line_ids":["candidate_1:line_1"],"confidence":0.95,"text_corrected":false}],"discarded_lines":[]}"#.utf8)
+            let payload = Data(#"{"status":"completed","cache_hit":false,"model":"deepseek-v4-flash","reconciliation_version":"babyplayer-lyrics-d3-v1","song_match_confidence":0.94,"primary_source":"candidate_1","web_search_used":false,"asr_word_coverage":0.98,"recovered_asr_word_count":2,"lines":[{"text":"Twinkle, twinkle, little star","asr_word_start_index":0,"asr_word_end_index":3,"start_seconds":0.4,"end_seconds":2.0,"source":"candidate_1","source_line_ids":["candidate_1:line_0"],"confidence":0.96,"text_corrected":true},{"text":"How I wonder what you are","asr_word_start_index":4,"asr_word_end_index":9,"start_seconds":2.2,"end_seconds":4.1,"source":"candidate_1","source_line_ids":["candidate_1:line_1"],"confidence":0.95,"text_corrected":false}],"discarded_lines":[]}"#.utf8)
             return (response, payload)
         }
         defer { BabyPlayerMockURLProtocol.setHandler(nil) }
@@ -1231,6 +1348,8 @@ final class LyricsAndASRTests: XCTestCase {
         ])
         XCTAssertEqual(result.confidence, 0.94)
         XCTAssertFalse(result.webSearchUsed)
+        XCTAssertEqual(result.asrWordCoverage, 0.98)
+        XCTAssertEqual(result.recoveredAsrWordCount, 2)
     }
 
     /// 没有下载歌词时仍会发送歌曲名和空候选列表，由 Mac 用已缓存 ASR 整理时间线。
@@ -1268,6 +1387,8 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(result.candidate.lines.map(\.time), [1.0, 3.5])
         XCTAssertEqual(result.candidate.providerName, "AI 证据歌词")
         XCTAssertEqual(result.confidence, 0.86)
+        XCTAssertEqual(result.asrWordCoverage, 1)
+        XCTAssertEqual(result.recoveredAsrWordCount, 0)
     }
 
     /// 验证全局单调 alignment 会跳过孤立的重复前奏；输入是含额外首句的重复副歌，输出是连续完整副歌的时间轴，不修改状态。

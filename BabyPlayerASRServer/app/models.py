@@ -16,6 +16,9 @@ class AsrWord(BaseModel):
     text: str
     start_seconds: float
     end_seconds: float
+    voice_activity_score: float | None = Field(default=None, ge=0, le=1)
+    voice_activity_coverage: float | None = Field(default=None, ge=0, le=1)
+    quality_flags: list[str] = Field(default_factory=list, max_length=8)
 
 
 class AsrSegment(BaseModel):
@@ -23,6 +26,28 @@ class AsrSegment(BaseModel):
     start_seconds: float
     end_seconds: float
     words: list[AsrWord] = Field(default_factory=list)
+    voice_activity_detector: str | None = Field(default=None, max_length=128)
+    voice_activity_scope: str | None = Field(default=None, max_length=128)
+    quality_flags: list[str] = Field(default_factory=list, max_length=8)
+    audio_preprocessing: dict | None = None
+
+
+class VoiceActivitySummary(BaseModel):
+    status: Literal["advisory"]
+    detector: str = Field(min_length=1, max_length=128)
+    scope: str = Field(min_length=1, max_length=128)
+    analyzed_word_count: int = Field(ge=0, le=20_000)
+    low_activity_word_count: int = Field(ge=0, le=20_000)
+    suspicious_word_count: int = Field(ge=0, le=20_000)
+
+
+class AudioPreprocessingSummary(BaseModel):
+    source: str = Field(min_length=1, max_length=128)
+    decode: str = Field(min_length=1, max_length=128)
+    separator: str | None = Field(default=None, max_length=128)
+    model: str | None = Field(default=None, max_length=256)
+    vocal_coverage: float | None = Field(default=None, ge=0, le=1)
+    vocal_mean_probability: float | None = Field(default=None, ge=0, le=1)
 
 
 class AsrAnalysisResponse(BaseModel):
@@ -38,6 +63,8 @@ class AsrAnalysisResponse(BaseModel):
     monthly_limit_seconds: int
     audio_sha256: str | None = None
     media_content_sha256: str | None = None
+    voice_activity: VoiceActivitySummary | None = None
+    audio_preprocessing: AudioPreprocessingSummary | None = None
 
 
 class UsageResponse(BaseModel):
@@ -207,5 +234,7 @@ class LyricsReconcileResponse(BaseModel):
     song_match_confidence: float = Field(ge=0, le=1)
     primary_source: str = Field(min_length=1, max_length=128)
     web_search_used: bool
+    asr_word_coverage: float = Field(default=1.0, ge=0, le=1)
+    recovered_asr_word_count: int = Field(default=0, ge=0, le=20_000)
     lines: list[LyricsReconciledLine]
     discarded_lines: list[LyricsDiscardedLine] = Field(default_factory=list)

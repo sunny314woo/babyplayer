@@ -1,5 +1,28 @@
 # BabyPlayer — Current Tasks
 
+> 历史说明：本文件记录项目最早期的 Phase 1 Spike，已不再代表 2026-08-24 的当前任务。
+> 当前智能歌词/自动字幕状态和后续顺序见
+> [《智能歌词与自动字幕现状审查》](SMART_LYRICS_AUTO_SUBTITLE_AUDIT_2026-08-24.md)；
+> Mac 本地分析接力见 [AI_HANDOFF_LYRICS_LOCAL_SERVER.md](AI_HANDOFF_LYRICS_LOCAL_SERVER.md)。
+
+## 2026-08-25 智能歌词当前任务
+
+本节比下方历史 Phase 1 Spike 优先。
+
+- [x] 修复 Mac `8011` 服务退出导致的 Apple TV `-1004`，用 LaunchAgent 登录启动和异常自恢复。
+- [x] 修复 D3 缓存未绑定实际 ASR/VAD/候选证据的问题。
+- [x] 修复 Web 候选行 ID 不稳定导致 ASR 成功但 DeepSeek 422。
+- [x] 实现一次 PCM/WAV 解码、Audio Separator 人声分离、vocals-stem VAD 和整首无人声门控。
+- [x] 过滤 vocals stem 中 `BB/DD/Dee/E` 类弱短乐器残留，保留 `He he`、`Bear` 等真实短词。
+- [x] 修复 DeepSeek 乱序/重叠/无支持行导致整首 422，并自动回收模型遗漏的有声 ASR 词。
+- [x] 真实验收 Who、Baby Shark 和 Wheels；Wheels 开头无人声区零字幕，首句 22.45 秒。
+- [x] 将手工 ASR 入口串成 ASR → DeepSeek → 自动启用，增加播放页提示、失败回退与“后发手工选择优先”保护。
+- [x] Python 54 项和 tvOS 模拟器 55 项全部通过。
+- [ ] 建立 10–20 首人工标注回归集：每句文字/首尾、人声区间、段落类型和重复次数。
+- [ ] 用标注集 A/B 腾讯人声轨与 faster-whisper/WhisperX，评估第二 ASR/可信歌词强制对齐。
+- [ ] 统一 ASR SRT、Apple TV ASR 和 DeepSeek 的 canonical cue/分行器。
+- [ ] 将尾段人声、重复副歌数量、时间误差和错词率变为自动验收指标，英文稳定后再生成双语字幕。
+
 ## 当前阶段
 
 **Phase 1：最小技术 Spike**

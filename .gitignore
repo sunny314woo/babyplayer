@@ -10,6 +10,7 @@ build/
 *.ipa
 BabyPlayerASRServer/babyplayer-asr.local.sqlite3*
 BabyPlayerASRServer/LyricsTestOutputs/
+BabyPlayerASRServer/.cache/
 
 # Local-only tvOS build secret. The committed example contains placeholders only.
 Config/BabyPlayerSecrets.xcconfig

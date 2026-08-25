@@ -6,7 +6,7 @@
 // 最近修改：2026-08-23 让远程 MP4 先加载音轨再导出，并将片头片尾边界安全裁剪到真实媒体时长。
 // 最近修改：2026-08-23 为 tvOS 不能直接导出的 Jellyfin 网络 MP4 增加低优先级临时下载回退。
 // 最近修改：2026-08-23 取消完整 M4A 前置与长期音频库，改用可复用的临时 ASR 分段、全局时间戳合并和首段早停。
-// 最近修改：2026-08-24 拆分人工 ASR 与 DeepSeek 阶段，并允许 Debug 安全访问 Mac 局域网服务。
+// 最近修改：2026-08-25 保持 ASR 与 DeepSeek 能独立调用，由播放器将显式 ASR 操作串成自动后续链。
 // 最近修改：2026-08-24 本地调试改为提交 Mac 异步任务，不再由 Apple TV 导出和上传整首 M4A。
 //
 
@@ -24,11 +24,21 @@ struct BabyPlayerASRWord: Codable, Sendable {
     let text: String
     let startSeconds: Double
     let endSeconds: Double
+    var voiceActivityScore: Double? = nil
+    var voiceActivityCoverage: Double? = nil
+    var qualityFlags: [String]? = nil
 
     enum CodingKeys: String, CodingKey {
         case text
         case startSeconds = "start_seconds"
         case endSeconds = "end_seconds"
+        case voiceActivityScore = "voice_activity_score"
+        case voiceActivityCoverage = "voice_activity_coverage"
+        case qualityFlags = "quality_flags"
+    }
+
+    var isPossibleInstrumentalHallucination: Bool {
+        qualityFlags?.contains("possible_instrumental_hallucination") == true
     }
 }
 
@@ -37,11 +47,33 @@ struct BabyPlayerASRSegment: Codable, Sendable {
     let startSeconds: Double
     let endSeconds: Double
     let words: [BabyPlayerASRWord]
+    var voiceActivityDetector: String? = nil
+    var voiceActivityScope: String? = nil
+    var qualityFlags: [String]? = nil
 
     enum CodingKeys: String, CodingKey {
         case text, words
         case startSeconds = "start_seconds"
         case endSeconds = "end_seconds"
+        case voiceActivityDetector = "voice_activity_detector"
+        case voiceActivityScope = "voice_activity_scope"
+        case qualityFlags = "quality_flags"
+    }
+}
+
+struct BabyPlayerVoiceActivitySummary: Codable, Sendable {
+    let status: String
+    let detector: String
+    let scope: String
+    let analyzedWordCount: Int
+    let lowActivityWordCount: Int
+    let suspiciousWordCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case status, detector, scope
+        case analyzedWordCount = "analyzed_word_count"
+        case lowActivityWordCount = "low_activity_word_count"
+        case suspiciousWordCount = "suspicious_word_count"
     }
 }
 
@@ -58,6 +90,7 @@ struct BabyPlayerASRAnalysis: Codable, Sendable {
     let monthlyLimitSeconds: Int
     let audioContentHash: String?
     let mediaContentHash: String?
+    var voiceActivity: BabyPlayerVoiceActivitySummary? = nil
 
     enum CodingKeys: String, CodingKey {
         case status, provider, transcript, segments
@@ -69,12 +102,15 @@ struct BabyPlayerASRAnalysis: Codable, Sendable {
         case monthlyLimitSeconds = "monthly_limit_seconds"
         case audioContentHash = "audio_sha256"
         case mediaContentHash = "media_content_sha256"
+        case voiceActivity = "voice_activity"
     }
 
     /// 返回可用于版本关联的 ASR 证据哈希；源文件相同但词时间线改变时也必须变化。
     var evidenceHash: String {
         let words = segments.flatMap(\.words).map {
-            "\($0.text)|\(String(format: "%.3f", $0.startSeconds))|\(String(format: "%.3f", $0.endSeconds))"
+            let activity = $0.voiceActivityScore.map { String(format: "%.4f", $0) } ?? ""
+            let flags = ($0.qualityFlags ?? []).sorted().joined(separator: ",")
+            return "\($0.text)|\(String(format: "%.3f", $0.startSeconds))|\(String(format: "%.3f", $0.endSeconds))|\(activity)|\(flags)"
         }.joined(separator: "\n")
         let raw = [
             "babyplayer-asr-evidence-v2",
@@ -112,6 +148,7 @@ struct BabyPlayerASRAnalysis: Codable, Sendable {
         let providerWords = segment.words.filter {
             !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && $0.endSeconds >= $0.startSeconds
+                && !$0.isPossibleInstrumentalHallucination
         }
         let words: [BabyPlayerASRWord]
         if providerWords.isEmpty {
@@ -1464,7 +1501,7 @@ actor BabyPlayerASRCoordinator {
     // 保留 STEP 1 已存在的 registry 类型与测试供以后优化；MVP 生产分析不复用跨循环任务。
     private let taskRegistry = BabyPlayerASRTaskRegistry()
 
-    // 【MODIFIED】ASR 和 DeepSeek 是两个人工操作，任一方都不得隐式触发另一方。
+    // 【MODIFIED】Coordinator 保持 ASR/DeepSeek 两个可测试的独立阶段；是否串行由上层用户工作流明确决定。
     /// 只执行腾讯 ASR；输入当前媒体、强制刷新与阶段回调，输出原始 ASR 结果，不匹配候选或调用 DeepSeek。
     func recognize(
         item: BabyPlayerQueueItem,

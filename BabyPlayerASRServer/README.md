@@ -6,10 +6,16 @@ Jellyfin 完全解耦。它可以部署在同一台 VPS，但使用独立目录�
 
 ## 当前开发状态
 
-当前为个人内测的最小闭环：只有一台 Apple TV 使用这台 VPS，不提供用户系统、登录、
-订阅、支付、家庭共享或多租户功能。接口和数据库仍保留独立 Bearer Token 边界，未来
-增加逐设备 Token 或配对码时，可以在不影响腾讯 ASR、DeepSeek 校正和本地歌词逻辑的
-前提下扩展。
+当前为个人内测的最小闭环：只有一台 Apple TV 使用，不提供用户系统、登录、订阅、支付、
+家庭共享或多租户功能。开发验证和 Release 使用两条不同路径：
+
+| 场景 | Apple TV 提交内容 | 音频处理位置 | 服务地址 |
+| --- | --- | --- | --- |
+| Debug + 局域网 HTTP | Jellyfin 本机 Path、指纹、歌曲范围 | Mac 读取白名单内原视频，60 秒分片、重叠 5 秒 | Mac `:8011/v1` |
+| Release + HTTPS | Apple TV 临时导出的整首 M4A | Apple TV 导出，VPS 接收一次上传 | 生产 VPS `/v1` |
+
+Debug 只有在 HTTP Base URL 下才使用 `/v1/local-analysis/jobs`；Release 始终关闭这个客户端路径。
+因此 Mac 真机验证通过不等于 VPS 上传路径已经验证通过。
 
 ```text
 /opt/babyplayer-asr                 独立程序与 .env
@@ -19,13 +25,22 @@ babyplayer-asr.service              独立 systemd 服务
 player.wisteriasoftware.uk          独立子域名
 ```
 
-同一 BabyPlayer 服务进程内有三个边界清晰的模块：
+同一 BabyPlayer 服务进程内有四个边界清晰的模块：
 
 - ASR 模块保护腾讯密钥、执行每月 18,000 秒硬上限，并缓存腾讯返回的转写文字和时间戳。
 - 兼容歌词修复模块保留原 `/v1/refine` limited-repair contract，供新 D3 链路失败时回退。
 - D3 Lyrics Evidence Reconciler 从服务端缓存读取 ASR，两阶段调用 DeepSeek 完成候选审查和最终 word-range 映射；必要时通过独立限域检索器获取新的候选证据。
+- 非 production 的 Mac 本地任务模块只读取 `LOCAL_MEDIA_ROOTS` 白名单内文件，计算原视频
+  SHA-256、提取音频、分片并把进度保存在内存任务表中。
 
-服务不下载 Jellyfin 视频、不保存音频。网页候选只存在于当次请求内存；最终通过服务端验证的 AI Lyrics 会按媒体指纹和 reconciliation version 写入 SQLite 缓存。
+生产 `/v1/analyze` 服务不下载 Jellyfin 视频，也不持久化上传音频。Mac 开发任务会直接读取
+Jellyfin 本机 Path；如果显式启用过程文件，会把提取音频、ASR/DeepSeek JSON 和 SRT 保存到
+本机调试目录。网页候选只存在于当次请求内存；最终通过服务端验证的 AI Lyrics 会写入 SQLite。
+
+当前 D3 缓存键已同时绑定媒体指纹、reconciliation version、ASR 算法版本、
+实际 ASR word timeline/VAD 标记哈希和候选歌词哈希。同一算法版本下强制重跑 ASR
+或更换候选后，普通 DeepSeek 请求也不会再复用旧 word ranges。历史根因和审查见
+[`../BabyPlayer_Project_Docs/SMART_LYRICS_AUTO_SUBTITLE_AUDIT_2026-08-24.md`](../BabyPlayer_Project_Docs/SMART_LYRICS_AUTO_SUBTITLE_AUDIT_2026-08-24.md)。
 
 ## 本地运行
 
@@ -33,17 +48,88 @@ player.wisteriasoftware.uk          独立子域名
 cd BabyPlayerASRServer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-local-quality.txt
+.venv/bin/audio-separator -m Kim_Vocal_2.onnx \
+  --model_file_dir .cache/audio-separator-models --download_model_only
 cp .env.example .env
 uvicorn app.main:app --host 127.0.0.1 --port 8011
 ```
 
+`Kim_Vocal_2.onnx` 约 66.8 MB，只保存在已被 Git 忽略的
+`.cache/audio-separator-models/`。不要将模型、`.env`、SQLite 或开发输出提交到 Git。
+
 占位符未替换时 `/health` 正常，但 `provider_configured=false` 和/或
-`lyrics_refiner_configured=false`，对应接口返回 503，不会调用腾讯或 DeepSeek。运行测试：
+`lyrics_refiner_configured=false`，对应接口返回 503，不会调用腾讯或 DeepSeek。
+
+运行测试时不要让本机 `.env` 的生产 `DATABASE_PATH` 污染测试。使用临时 SQLite：
 
 ```bash
-python -m pytest -q -p no:cacheprovider
+TEST_DATABASE_DIR="$(mktemp -d)"
+DATABASE_PATH="$TEST_DATABASE_DIR/test.sqlite3" PRODUCT_ENV=test \
+  python -m pytest -q -p no:cacheprovider
 ```
+
+当前结果：54 项通过。测试目录只包含本次 SQLite，可在完成后删除。
+
+### Mac 本地开发
+
+推荐首次配置后将服务安装为当前 Mac 用户的 LaunchAgent：
+
+```bash
+cd BabyPlayerASRServer
+./scripts/install-local-development-service.sh
+launchctl print gui/$(id -u)/uk.wisteriasoftware.babyplayer-asr-local
+curl --fail http://127.0.0.1:8011/health
+```
+
+安装脚本不会复制或显示 `.env`；LaunchAgent 仍通过项目内的
+`start-local-development.sh` 加载本地配置。它会在用户登录时启动，进程异常退出后自动拉起；
+日志保存在 `~/Library/Logs/BabyPlayerASR/`。只需临时前台调试时，可改用：
+
+```bash
+BabyPlayerASRServer/scripts/start-local-development.sh
+```
+
+本地 `.env` 至少需要正确设置 `LOCAL_MEDIA_ROOTS`、`LOCAL_FFMPEG_PATH`、本地数据库和开发
+过程目录。`PRODUCT_ENV=production` 会关闭本地 Path 接口；生产部署必须使用精确的
+`production`，不要使用容易误拼的自定义名称。
+
+Apple TV 提示 `-1004` 表示连不上 Mac 服务，不是腾讯 ASR 识别拒绝。先检查
+`launchctl print`、Mac 的 `8011` 健康接口和 Apple TV 的 Debug Base URL；Mac DHCP 地址
+变化后，还需同步更新被 Git 忽略的 `Config/BabyPlayerSecrets.xcconfig`。
+
+### Mac 人声分离与活动质量层
+
+Mac Debug 默认执行以下路径：
+
+```text
+原视频歌曲范围
+  → 一次精确 seek 并解码为 44.1 kHz PCM/WAV
+  → python-audio-separator 0.44.5 + Kim_Vocal_2.onnx 提取 vocals stem
+  → faster-whisper 内置 Silero VAD v6 分析人声轨
+  → 从同一无损人声轨独立编码腾讯 60/5 分片
+```
+
+这一路径不下载 Whisper 转写模型。`/health` 应同时显示
+`voice_activity_configured=true`、`vocal_separation_configured=true` 和
+`vocal_separation_model_ready=true`。任一项为 false 都应先修复本机依赖，不要继续消耗腾讯额度。
+
+具体规则：
+
+- 人声覆盖率低于 0.03 且平均概率低于 0.05 时，返回 `NO_VOCALS_DETECTED`，不调腾讯。
+- 每个 ASR word 保存 `voice_activity_score`、`voice_activity_coverage` 和 `quality_flags`；
+  整体响应另存 `audio_preprocessing`。
+- 连续至少 3 个词同时低于 0.15 分数且活动覆盖低于 0.25 时，标为
+  `possible_instrumental_hallucination`。
+- vocals stem 仍可泄漏短促音高；弱分数、短覆盖的 `BB/DD/Dee/E` 类残留会被额外标记，
+  `He he`、`Bear` 和常见短词不会因此被删除。
+- Apple TV 原始 ASR 字幕隐藏无声学依据的风险词；DeepSeek 也不能把它们作为 ASR-only 歌词。
+- 开发输出保留 `asr.srt`、`asr_quality_filtered.srt`、`voice_activity.json`、
+  `audio_preprocessing.json` 和 DeepSeek `ai.srt`。
+
+Apple Silicon 分离一首 2–3 分钟儿歌需约 1–2 分钟，峰值内存约 5–6 GB；模型加载后会保留在进程中供后续歌曲复用。
+LaunchAgent 必须使用 `ProcessType=Interactive`，否则这台 Mac 上的 CoreML 可被 Background QoS 降速约一个数量级。
+这是 Mac 播放前离线质量路径，不可在 Apple TV 上本地运行，也尚未部署到 VPS Release 路径。
 
 ## API
 
@@ -52,7 +138,9 @@ python -m pytest -q -p no:cacheprovider
 - `GET /v1/cache?media_fingerprint=...`：读取已有转写，缓存命中不消耗额度。
 - `POST /v1/analyze`：上传 M4A/AAC/MP3；BabyPlayer 实际固定使用 M4A。
 - `POST /v1/refine`：接收 `original_lines` 及其 `aligned_words`、ASR transcript 和集中计算的 evidence；返回 `line_identifier / original_text / suggested_text / should_modify / evidence / confidence`。响应 contract 不存在时间戳字段。
-- `POST /v1/lyrics/reconcile`：D3 主接口。Apple TV 只传 `media_fingerprint`/`song_title`/最多 3 份候选；服务器读取 ASR 缓存，必要时限域检索，验证 DeepSeek 返回的 ASR word ranges 后生成最终时间。`force_refresh=true` 可忽略 AI Lyrics 缓存重新分析。
+- `POST /v1/lyrics/reconcile`：D3 主接口。Apple TV 只传 `media_fingerprint`/`song_title`/最多 3 份候选；服务器读取 ASR 缓存，必要时限域检索，验证 DeepSeek 返回的 ASR word ranges 后生成最终时间。乱序/重叠/无支持模型行被确定性舍弃，未覆盖但有人声证据的 ASR 词会自动回收。响应包含 `asr_word_coverage` 和 `recovered_asr_word_count`。`force_refresh=true` 可忽略 AI Lyrics 缓存重新分析。
+- `POST /v1/local-analysis/jobs`：仅非 production。提交 Jellyfin 本机 Path 和歌曲范围，立即返回可轮询的 job ID；不接收 Apple TV 音频。
+- `GET /v1/local-analysis/jobs/{job_id}`：仅非 production。读取提取、识别、完成或失败状态。当前 Apple TV UI 会把识别阶段统一显示为 1/1，不会显示 Mac 内部真实分片序号。
 
 D3 的可复用边界：
 
@@ -126,3 +214,15 @@ sudo bash /opt/babyplayer-asr/scripts/configure-babyplayer-token.sh
 
 腾讯云后付费仍应保持关闭。服务内 5 小时硬上限是第一道保护，腾讯控制台关闭后付费是
 第二道保护。
+
+## 当前质量与运维限制
+
+- 当前是完整文件批处理，不是实时字幕：提取、全部腾讯分片和 DeepSeek 都完成后才返回最终结果。
+- 腾讯仍使用通用英文 `16k_en`；Mac 已有人声分离和 vocals-stem VAD，但还没有歌声专用活动检测、
+  腾讯真实词置信度或第二 ASR 回退。
+- Mac 已改为一次 PCM/WAV 解码，每个分片都从同一无损人声轨编码。
+- DeepSeek 遗漏的有声 ASR 词现会自动回收；但尾段实际人声、重复副歌数量和词时间误差仍需人工标注集验收。
+- `LyricsTestOutputs` 包含完整音频和歌词内容，虽已被 Git 忽略，仍需定期清理并限制本机访问。
+- 本地 job 只保存在当前进程内存；服务重启后 Apple TV 不能继续轮询旧 job，但已完成的 SQLite
+  ASR 缓存仍可按指纹查询。
+- SQLite 和共享 Bearer Token 只适合当前个人部署。公开分发前需要逐设备 Token、任务持久化和权限隔离。

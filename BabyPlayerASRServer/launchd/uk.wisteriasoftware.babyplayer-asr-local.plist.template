@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>uk.wisteriasoftware.babyplayer-asr-local</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__START_SCRIPT__</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__SERVER_DIR__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <!-- This is a user-visible, on-demand subtitle service. Background QoS
+         throttles CoreML source separation by roughly an order of magnitude. -->
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>__STDOUT_LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__STDERR_LOG__</string>
+</dict>
+</plist>

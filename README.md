@@ -112,12 +112,26 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
    - 使用“提前/延后 0.1 秒或 0.5 秒”校准时间。
    - 在第一句开始时暂停，选择“把第一句对齐到当前位置”，一次消除 MP4 片头偏移。
 
-首次搜索会立即使用排名第 1 的普通歌词，不等腾讯 ASR 或 DeepSeek。ASR 大致确认同一首歌且确定性对齐成功后，先显示“AI 校时歌词”；随后 VPS 的 D3 Lyrics Evidence Reconciler 读取已缓存的 ASR，审查最多 3 份候选，必要时只从限定儿歌来源检索新证据，再返回绑定 ASR word ranges 的最终歌词。腾讯原始 transcript 不作为默认展示字幕。点选任一候选的当下即建立 manual lock，已在运行的 ASR/alignment/DeepSeek 都不能自动覆盖。
+首次搜索会使用排名第 1 的普通歌词。当前版本不会在播放、搜索、单曲循环或重新进入播放器时
+擅自调用腾讯 ASR 或 DeepSeek。只有家长在“歌词分析”中明确点击后，才会启动分析链。
+
+需要声音分析时，在独立的“歌词分析”菜单人工执行：
+
+1. `ASR 识别歌词`：读取缓存或运行腾讯 ASR；ASR 成功后自动进入 DeepSeek，DeepSeek 成功后直接启用为这首视频的默认字幕；
+2. `DeepSeek 校准歌词`：保留分阶段手工入口；已有 ASR 时可单独重跑，成功后也会自动启用；
+3. `采用腾讯 ASR 字幕` / `采用 DeepSeek 校准字幕`：仍然保留，可随时手工 A/B 切换已保存结果。
+
+播放画面左上方会显示 ASR、DeepSeek 和自动启用结果。ASR 失败时不进入
+DeepSeek；DeepSeek 失败时保留当前字幕和已生成的 ASR，可以手动重试或采用 ASR。
+如果分析期间家长又手动选了其他字幕，较新的手工选择优先，DeepSeek 只保存不覆盖。
+
+ASR、DeepSeek 和固定的普通歌词可以共存并反复切换。DeepSeek 只选择文字和 ASR word ranges，
+最终时间由服务器机械换算；ASR 没有识别到的演唱目前不能由 DeepSeek 恢复。
 
 时间调整不限次数。每次提前或延后都在当前人工调整上累加；自动偏移和
 人工调整分开保存。每份歌词都有自己的调整值，切换和重启后会恢复。
 
-未配置 AI 歌词时，BabyPlayer 仍使用歌名、来源/版本、演唱者和歌曲段时长排序，并稳定默认绑定第 1 个。配置后使用渐进流程：T1 由腾讯 ASR word timestamps + 本地全局单调 alignment 生成可立即展示的 AI v1；T2 由 VPS 两阶段完成候选评估和最终证据重建。DeepSeek 只选择文本及 ASR word ranges，服务器验证后机械换算时间。D3 失败时会回退到原有逐行 repair 或 AI v1，不会丢失普通歌词。
+未配置声音分析服务时，普通歌词搜索、人工固定和时间调整仍可独立使用。
 
 注意：删除 BabyPlayer App 会同时删除 Apple TV 上保存的歌词绑定与缓存；从 Xcode 覆盖安装通常会保留。
 
@@ -125,7 +139,10 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
 
 声音分析服务与 EnglishFlow、翻译、TTS 和 Jellyfin 完全独立；实现与部署说明见
 [`BabyPlayerASRServer/README.md`](BabyPlayerASRServer/README.md)，详细边界见
-[`BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md`](BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md)。下一位 AI 若要把 VPS 歌词服务迁到 Mac 本地测试，应先完整阅读
+[`BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md`](BabyPlayer_Project_Docs/ASR_LYRICS_MATCHING_DESIGN.md)。
+当前质量问题、代码审查、竞品/开源项目对比和后续路线见
+[`BabyPlayer_Project_Docs/SMART_LYRICS_AUTO_SUBTITLE_AUDIT_2026-08-24.md`](BabyPlayer_Project_Docs/SMART_LYRICS_AUTO_SUBTITLE_AUDIT_2026-08-24.md)。
+下一位 AI 接手 Mac 本地测试前还应完整阅读
 [`BabyPlayer_Project_Docs/AI_HANDOFF_LYRICS_LOCAL_SERVER.md`](BabyPlayer_Project_Docs/AI_HANDOFF_LYRICS_LOCAL_SERVER.md)。
 
 本地 Token 不直接写入 `Info.plist`。复制
@@ -133,14 +150,28 @@ Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实
 BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VPS 的
 `/opt/babyplayer-asr/.env`，不进入 Apple TV 安装包。
 
-- Apple TV 把完整歌曲段 M4A 保存到 Application Support 下的本地音频库，不会自动淘汰；
-  较长曲目可另有一份最长 120 秒的 ASR 识别前段。这份完整 M4A 可供后续“纯音频 +
-  同步歌词”功能直接复用。
-- VPS 不保存音频或 Jellyfin URL。ASR 模块缓存不可逆指纹、转写文字与时间戳；D3 另按指纹和 reconciliation version 缓存已验证的最终 AI Lyrics，不缓存网页或音频。
+- Debug 真机连接局域网 Mac HTTP 服务时，Apple TV 只提交 Jellyfin 本机路径；Mac 读取白名单内
+  的原视频，一次解码 PCM/WAV，用 Audio Separator 提取人声并在人声轨上跑 VAD，然后按
+  60 秒、重叠 5 秒从无损人声轨生成分片。Release 默认连接 VPS HTTPS，由 Apple TV
+  临时提取并上传整首 M4A；两条路径需要分别验证。
+- Mac Debug 建议一次运行 `BabyPlayerASRServer/scripts/install-local-development-service.sh`，
+  让 `8011` 服务随登录启动并在异常退出后自动恢复。Apple TV 的 `-1004` 表示无法连接
+  该 Mac 服务，应先检查 `8011`、局域网和 Debug Base URL，而不是重跑腾讯 ASR。
+- Apple TV 不建立永久音频库。Release 提取的音频是临时文件；歌词候选、绑定和分析副本保存在
+  tvOS 私有 Caches，空间不足时系统可能清除。Mac/VPS 缓存才是可重建结果的来源。
+- VPS 不保存上传音频或 Jellyfin URL。ASR 模块缓存不可逆指纹、转写文字与时间戳；D3 缓存最终
+  AI Lyrics。D3 缓存现已绑定实际 ASR word timeline/VAD 标记和候选内容哈希，
+  不会再把旧 word ranges 套到新证据上。
+- D3 现会按 ASR 时间确定性归一化模型乱序/重叠行，并自动回收 DeepSeek 漏掉但有人声证据的 ASR 词。
+  这能防止副歌被 LLM 默默删除，但 ASR 本身完全没识别的演唱仍无法凭空生成时间。
+- Wheels 最新实测已按用户真值把前奏旋律、汽车声和节奏视为无人声；ASR 质量过滤和
+  DeepSeek 的首句都从实际开唱的 22.45 秒开始。
 - 服务端硬限制每个北京时间自然月 18,000 秒（5 小时）。达到上限后提示下月 1 日
   00:00 再次使用；已有缓存仍可继续匹配。
-- 家长设置可查看每首本地歌曲音频、识别状态、总占用、本月剩余时间，并可逐首或全部删除。
 - 腾讯云后付费应保持关闭。
+
+本地开发模式可在 `BabyPlayerASRServer/LyricsTestOutputs/` 保存完整提取音频、ASR/DeepSeek JSON
+和 SRT。该目录已被 Git 忽略，但包含媒体和歌词内容，只应用于受控调试并定期清理。
 
 ### 内置 Super Simple Songs 曲目库
 
@@ -200,7 +231,8 @@ BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VP
 ### 某首歌没有歌词或歌词不正确
 
 在该视频的播放页打开“字幕与歌词”，先看最多 3 个同步候选和可选本地歌本；不合适时
-选择“重新搜索歌词”。声音核验置信度不足时不会自动切换，家长选对后会永久绑定。
+选择“重新搜索歌词”。如果需要声音分析，点一次“ASR 识别歌词”；DeepSeek 成功后会自动切换并保存绑定。tvOS Caches
+属于可清理存储，如果系统删除缓存，可从 Mac/VPS 重新生成，但当前人工绑定仍可能需要重新选择。
 
 ## 当前要求
 

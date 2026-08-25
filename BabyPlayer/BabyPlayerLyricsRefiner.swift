@@ -417,6 +417,8 @@ private struct LyricsReconciliationResponse: Decodable {
     let songMatchConfidence: Double
     let primarySource: String
     let webSearchUsed: Bool
+    let asrWordCoverage: Double?
+    let recoveredAsrWordCount: Int?
     let lines: [Line]
 
     enum CodingKeys: String, CodingKey {
@@ -426,6 +428,8 @@ private struct LyricsReconciliationResponse: Decodable {
         case songMatchConfidence = "song_match_confidence"
         case primarySource = "primary_source"
         case webSearchUsed = "web_search_used"
+        case asrWordCoverage = "asr_word_coverage"
+        case recoveredAsrWordCount = "recovered_asr_word_count"
     }
 }
 
@@ -434,6 +438,8 @@ struct BabyPlayerLyricsReconciliationResult: Sendable {
     let confidence: Double
     let cacheHit: Bool
     let webSearchUsed: Bool
+    let asrWordCoverage: Double
+    let recoveredAsrWordCount: Int
 }
 
 /// D3 API 只上传标题和最多三份候选；ASR 和时间轴由 VPS 缓存与验证。
@@ -497,7 +503,9 @@ struct BabyPlayerLyricsReconcilerClient {
         }
         let reconciled = try JSONDecoder().decode(LyricsReconciliationResponse.self, from: data)
         guard reconciled.lines.count >= 2,
-              (0.0...1.0).contains(reconciled.songMatchConfidence) else {
+              (0.0...1.0).contains(reconciled.songMatchConfidence),
+              (0.0...1.0).contains(reconciled.asrWordCoverage ?? 1),
+              (reconciled.recoveredAsrWordCount ?? 0) >= 0 else {
             throw BabyPlayerASRError.server("AI 歌词重建证据不足")
         }
         var previousEnd = -1
@@ -538,7 +546,9 @@ struct BabyPlayerLyricsReconcilerClient {
             candidate: candidate,
             confidence: reconciled.songMatchConfidence,
             cacheHit: reconciled.cacheHit,
-            webSearchUsed: reconciled.webSearchUsed
+            webSearchUsed: reconciled.webSearchUsed,
+            asrWordCoverage: reconciled.asrWordCoverage ?? 1,
+            recoveredAsrWordCount: reconciled.recoveredAsrWordCount ?? 0
         )
     }
 }

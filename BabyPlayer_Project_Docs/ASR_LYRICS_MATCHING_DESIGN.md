@@ -1,137 +1,239 @@
-# BabyPlayer 声音识别与歌词匹配详细设计
+# BabyPlayer 声音识别与歌词匹配当前设计
 
-更新时间：2026-08-23
+更新时间：2026-08-25
+状态：描述当前已经实现的个人内测版本，不是未来设想
 
-## 当前开发状态（个人内测）
+完整质量审查、实测数据、竞品/开源项目分析与改进路线见
+[《智能歌词与自动字幕现状审查》](SMART_LYRICS_AUTO_SUBTITLE_AUDIT_2026-08-24.md)。
 
-当前版本只服务这台个人 Apple TV 和这台个人 VPS，目标是先完成最小可用闭环：
+## 一、系统目标和边界
 
-- Apple TV 从 Jellyfin MP4 提取并永久保留本地 M4A；
-- 独立域名 `player.wisteriasoftware.uk` 下的 VPS 负责腾讯 ASR、缓存、额度和
-  Version D3 Lyrics Evidence Reconciler；
-- 歌词搜索、候选比较、绑定、时间偏移和持久化都在 Apple TV 本地完成；
-- 当前不实现用户注册、登录、订阅、支付、家庭共享或多租户隔离；
-- 服务器仍保留独立 Bearer Token 边界，未来公开分发时可替换为逐设备配对 Token，
-  不需要重写 ASR/歌词模块。
+BabyPlayer 为 Jellyfin 中的固定儿歌视频提供三类可以共存的歌词：
 
-腾讯云 SecretId/SecretKey、DeepSeek API Key 只放 VPS；Apple TV 只需要调用
-`/v1` 接口的独立 BabyPlayer Bearer Token。当前服务健康检查已确认两个云端提供方
-均已配置，未把任何云端 Secret 放入工程或提交到 Git。
+1. LRCLIB 或内置已授权曲目提供的普通歌词；
+2. 腾讯 ASR 返回的原始词时间线，经 Apple TV 可读性分行后形成的 ASR 字幕；
+3. DeepSeek 使用 ASR word ranges 和普通歌词证据重建的校准字幕。
 
-## 结论
+当前只服务个人 Apple TV，不实现用户注册、订阅、支付、家庭共享或多租户。腾讯和 DeepSeek
+密钥只在服务端；Apple TV 只持有独立 BabyPlayer Bearer Token。
 
-声音识别采用“Apple TV 本地分析 + 独立 VPS 腾讯 ASR 代理”。Jellyfin 只提供 MP4
-媒体流，不运行分析，不安装插件；EnglishFlow Account Server、翻译与 TTS 不参与。
+当前不是实时字幕，也不是普通播放时的后台自动分析。家长点击一次 `ASR 识别歌词`
+后，系统会自动完成 ASR → DeepSeek → 启用 DeepSeek 字幕。普通播放、歌词搜索、单曲循环和
+重新进入播放器仍不会自动调用云服务。
+
+## 二、用户操作契约
+
+### 普通歌词
+
+- 搜索最多 3 份同步歌词候选，可额外使用 1 份内置纯文本歌词。
+- 家长可以固定普通歌词、提前/延后校时或把第一句对齐到当前位置。
+- 已固定的普通歌词不会在普通播放时被覆盖；家长明确发起 ASR 链即表示同意在成功后替换。
+
+### 歌词分析
+
+1. `ASR 识别歌词`：读取缓存或运行腾讯 ASR，成功后自动续跑 DeepSeek，再自动启用 DeepSeek 结果。
+2. `重新 ASR 识别`：强制重跑腾讯 ASR 与后续 DeepSeek，可能重新计费。
+3. `DeepSeek 校准歌词`：必须已经有 ASR；可单独重跑，成功后自动启用。
+4. `重新 DeepSeek 校准`：忽略服务端 AI 缓存重新运行，成功后自动启用。
+5. `采用腾讯 ASR 字幕` / `采用 DeepSeek 校准字幕`：保留手工切换和 A/B 入口。
+
+ASR、DeepSeek 和普通歌词都可继续保留。DeepSeek 失败不会替换当前字幕；分析期间的更新手工选择
+优先于自动启用。播放画面左上方持续显示阶段与最终启用结果。
+
+## 三、两条执行路径
+
+### 3.1 Debug + Mac HTTP 本地分析
+
+Swift 只有在 `DEBUG` 且 Base URL 是 HTTP 时才启用 Mac 本地任务：
 
 ```text
-Jellyfin MP4
-    │ 局域网播放地址
-    ▼
-Apple TV / AVFoundation
-    ├── 导出完整歌曲段为 M4A（AAC）
-    ├── 持久保存到本地歌曲音频库
-    ├── 较长曲目另导出最长 120 秒 ASR 前段
-    └── 先查本地转写/绑定缓存
-              │ 未命中
-              ▼
-BabyPlayer 独立 VPS（8011）
-    ├── 独立 Bearer Token
-    ├── 5 小时/月硬上限
-    ├── ASR 模块：转写结果缓存
-    ├── 歌词修复模块：只处理 AI v1 的结构化逐行 repair
-    └── 临时上传关闭即删除
-              │
-              ▼
-腾讯录音文件识别极速版（16k_en）
-    └── 文字 + 句/词时间戳
-              │
-              ▼
 Apple TV
-    ├── T0：立即显示第 1 份普通歌词
-    ├── T1：同歌置信度 + 全局单调 alignment 生成 AI 校时歌词 v1
-    ├── T2：VPS 读取 ASR 缓存，DeepSeek 审查最多 3 份候选
-    ├── 候选都弱时由 VPS 限域检索，新结果仍须与 ASR 比较
-    ├── DeepSeek 返回 ASR word ranges，服务器换算/验证时间
-    └── 手动选择永远优先且不会被自动结果覆盖
+  └── POST /v1/local-analysis/jobs
+        media_path + fingerprint + title + song window
+                 │
+                 ▼
+Mac 本地服务
+  ├── 校验 media_path 位于 LOCAL_MEDIA_ROOTS
+  ├── 计算完整原视频 SHA-256
+  ├── FFmpeg 一次精确 seek，解码歌曲范围为 44.1 kHz PCM/WAV
+  ├── Audio Separator + Kim Vocal 2 生成 vocals stem
+  ├── Silero VAD 在 vocals stem 上生成人声证据；整首无人声则停止
+  ├── 从无损人声轨独立编码 60 秒分片、相邻重叠 5 秒
+  ├── 顺序调用腾讯 Flash ASR
+  ├── 合并为全局 words/segments，添加词级 VAD/幻觉标记
+  └── SQLite 缓存 ASR + 音频预处理摘要并返回
 ```
 
-## Apple TV 的职责
+Apple TV 只轮询 job，不上传音频。当前 UI 把所有 recognizing 状态显示为 1/1；Mac 内部虽然知道
+分片 1/3、2/3、3/3，但没有把该序号展示到电视。
 
-1. 使用 `AVAssetExportSession` 和 `AVAssetExportPresetAppleM4A` 从 MP4 导出 M4A。
-2. 优先使用 Jellyfin 章节；否则从家长设置的统一片头时间开始。
-3. 完整歌曲段存在 Application Support 下，不设自动淘汰上限，仅家长可删除。
-4. 单次 ASR 最长使用前 120 秒；较长曲目另保留识别前段，不截断完整本地音频。
-5. 把 M4A、媒体指纹、大小、提取时间、识别状态写入本地音频库清单。
-6. 本地集中计算 normalized text、ordered phrase、标题、coverage 和时间顺序证据；通过后用全局单调 alignment 立即生成 AI v1，再把 v1 原始行和对齐证据临时发给歌词 repair 模块。
-7. 家长的手动绑定与多次校时拥有最高优先级。
+### 3.2 Release + VPS HTTPS 上传
 
-Apple TV 原生导出 M4A，不额外引入 MP3 编码器。腾讯极速版支持 M4A/AAC，因此没有
-必要为了 MP3 增加复杂度。
+Release 始终关闭 Mac 本地任务：
 
-## 家长设置：歌曲音频缓存
+```text
+Apple TV
+  ├── 尝试从 Jellyfin 媒体临时导出整首 M4A
+  ├── 远程 MP4 无法直接导出时，可能临时下载完整源视频
+  ├── POST /v1/analyze 上传整首 M4A
+  └── 成功或失败后删除临时音频
+                 │
+                 ▼
+VPS
+  └── 单次调用腾讯并缓存结果
+```
 
-列表每行显示：曲目名、大小、导出日期、音频时长、识别状态、当前绑定。提供：
+Release 路径没有复用 Mac 的 60/5 分片任务。两个路径的网络、音频处理、超时和失败模式不同，必须
+分别验收。
 
-- 重新分析；
-- 删除单首缓存；
-- 删除全部缓存；
-- 查看总占用和本月 ASR 剩余时间。
+## 四、ASR 处理
 
-本地音频库不设自动容量淘汰。它是后续“纯音频 + 同步歌词”的源资产，只有家长在
-设置中删除单曲或清空时才移除。删除 M4A 不删除最终歌词绑定或 VPS 的 ASR 转写缓存。
+### 4.1 腾讯请求
 
-## 渐进式 AI Lyrics 生成
+当前使用腾讯录音文件识别极速版：
 
-页面先稳定绑定第 1 份普通歌词。腾讯 ASR 只提供句/词时间戳和噪声 transcript。本地的 `sameSongConfidence` 使用五类命名证据和集中阈值，不要求 ASR 逐字匹配。证据足够时，动态规划在整首歌上完成全局单调对齐，保留原歌词文本并产生 AI v1。
+- `engine_type=16k_en`；
+- `word_info=1`，要求词级时间戳；
+- `first_channel_only=1`；
+- 不过滤标点、语气词或脏词；
+- 每个分片顺序调用，受服务端 rolling-minute 限速器保护。
 
-DeepSeek V4 Flash 使用两阶段非思考 JSON contract：先评估现有候选并返回 `need_web_search`，再根据 ASR、原候选和可选检索证据返回最终文本及 `asr_word_start_index/asr_word_end_index`。服务端校验范围单调、不重叠、不越界且文本受 ASR/候选支持，再机械生成时间。原 `/v1/refine` 只作兼容回退。
+腾讯返回模型仍只提供当前链路可用的文本和时间，没有可信的腾讯词置信度或 no-speech probability。
+但服务器现会为每个 ASR word 附加 vocals-stem `voice_activity_score`、
+`voice_activity_coverage` 和 `quality_flags`，并保存人声分离模型/版本、人声覆盖和平均概率。
 
-本地确定性同歌证据包括：
+### 4.2 60/5 分片合并
 
-- normalized text similarity；
-- ordered token/phrase similarity；
-- 标题/文件名 similarity；
-- ASR 对原歌词的 coverage；
-- sentence/word timestamps 的顺序合理性。
+- 每个词先加分片全局 offset。
+- 相邻分片重叠区域以重叠中点划分唯一所有者。
+- 只在不同分片、标准化文字相同且原始时间范围真实重叠时删除边界重复词。
+- 不会因为副歌文字重复就全局去重。
+- 输出整理为全局单调、不重叠的 segments/words。
 
-声音分析未完成前稳定显示第 1 个候选。用户点击任一候选时，内存 manual lock 和 generation 在任何 `await repository` 之前同步生效；后续 ASR/alignment/DeepSeek 可更新 AI candidate，但不再自动覆盖。
+服务端现在只对原视频做一次 PCM/WAV 解码。VAD、整首过程 M4A 和各腾讯分片都从同一条
+无损人声轨生成，不再存在“AAC 转 AAC”二次有损编码。
 
-每份歌词分别保存 `autoOffset + manualAdjustment = effectiveOffset`。提前/延后操作只累加
-`manualAdjustment`，自动重校时不覆盖人工调整。
+### 4.3 Apple TV ASR 分行
 
-## 生成时机与月底策略
+腾讯可能把整分钟放在一个 segment。Apple TV 使用词时间线重新分行：
 
-默认在当前曲目播放缓冲稳定后异步生成，完成前使用第 1 份网络歌词，不阻塞视频。
-最终结果和完整 M4A 都在 Apple TV 保留，下次直接使用。
+- 最多 6 个词；
+- 最多 30 个字符；
+- 最长 3.2 秒；
+- 词间停顿达到 0.65 秒时换行；
+- 强标点后换行。
 
-月底预生成应是家长明确开启的机会任务，而不是保证在最后一天零点执行的定时任务。
-tvOS 后台处理由系统择机调度且可中断。策略应为：只在当月最后一天、播放器空闲、网络合适、
-剩余额度高于保留值时串行处理未生成曲目；每首仍先查服务端缓存，收到系统取消后立即停止。
-本策略不应默认打开，以免在家长不知情时消耗额度。
+没有 word timeline 时，会把 segment 文本按时间均匀分配。这只能避免长文本铺满屏幕，不代表合成
+词时间准确。
 
-## 额度与错误
+## 五、DeepSeek D3 处理
 
-- 服务端按北京时间自然月保存 `used_seconds + reserved_seconds`。
-- 硬上限固定为 `18,000` 秒，即 5 小时。
-- 请求开始前原子预留时长；并发请求也不能穿透上限。
-- 只有腾讯成功返回后才把预留转为已用；失败会释放预留。
-- 缓存命中不调用腾讯、不消耗额度。
-- 达到上限返回 HTTP 429、`MONTHLY_ASR_LIMIT_REACHED` 和下月 1 日 00:00
-  （Asia/Shanghai）的 `next_available_at`。
-- Apple TV 显示：“本月声音分析额度已用完，可于 9 月 1 日 00:00 再次使用”。
+### 5.1 输入
 
-腾讯控制台关闭后付费仍必须保持；这是云端第二道硬保护。
+Apple TV 只上传：
 
-## 隐私与解耦
+- media fingerprint；
+- song title；
+- 最多 3 份普通歌词候选。
 
-- VPS 不持久化 M4A，不保存 Jellyfin URL 或访问令牌。网页候选只存在当次请求内存；验证后的最终 AI Lyrics 按不可逆媒体指纹和 reconciliation version 写入 SQLite 缓存。
-- multipart 临时文件在请求 `finally` 中关闭，由系统删除；systemd 同时启用
-  `PrivateTmp=true`。
-- 数据库只保存音频 SHA-256、不可逆媒体指纹、腾讯转写文字、时间戳和用量；
-  Apple TV 仍持久化最终绑定，VPS 缓存可避免重复 DeepSeek/检索请求。
-- BabyPlayer 使用独立域名、目录、Linux 用户、systemd、SQLite 和 Bearer Token。
-- 腾讯 AppID/SecretId/SecretKey 和 DeepSeek API Key 只存在 `/opt/babyplayer-asr/.env`。
-- EnglishFlow 的数据库、鉴权、TTS、翻译和部署脚本不做任何修改。
+ASR/AI candidate 因为带有 `identityAnchor`，会被 Swift 明确过滤。服务器从 SQLite 自己读取对应
+ASR transcript 和 indexed words。因此 DeepSeek 字幕不是把 Apple TV ASR 行直接转换一遍。
 
-当前独立 Bearer Token 适合这台个人 Apple TV 的私有部署；如果未来公开分发 App，应升级
-为一次性配对码签发的逐设备 Token，不能把一个共享 Token 放进公开安装包。
+### 5.2 两阶段模型调用
+
+1. 第一阶段比较候选与 ASR，返回候选分数和是否需要 Web 搜索。
+2. 第二阶段使用 ASR、普通候选和可选限域 Web 证据，返回最终行文字与连续 ASR word range。
+
+模型不返回时间戳。服务器用每行首词和末词的时间机械生成开始/结束。
+
+### 5.3 当前服务器校验和恢复
+
+服务器已经校验：
+
+- 2–300 行；
+- 每行文字非空；
+- ASR 索引为整数且不越界；模型乱序行按 ASR 开始索引排序；
+- 每行少于 100 个 ASR 词；
+- source 和 source line ID 合法；
+- 最终文字至少得到 ASR 或候选的最低 token support。
+- Web 候选使用稳定合成 `candidate_id:retrieved_text`，模型不稳定行名只能归一化到当次真实 Web 证据。
+- 重叠模型行和无文字证据行被舍弃，不会让整首返回 422。
+- 所有未覆盖、非伴奏幻觉的 ASR 词会确定性补成 ASR-only 行；模型不能再默默删除副歌。
+- 响应返回 `asr_word_coverage` 和 `recovered_asr_word_count`。
+
+服务器当前没有校验：
+
+- 第一/最后人声覆盖；
+- 最大无字幕空洞；
+- verse/chorus 重复次数；
+- 纯音乐区是否有人声；
+- Apple TV 可读性分行；
+- 模型自报 `song_match_confidence` 是否与客观指标一致。
+
+Swift 只检查 `song_match_confidence` 位于 0 到 1，没有最低接受阈值。
+
+## 六、缓存与证据版本
+
+### ASR 缓存
+
+ASR 表按 subject、media fingerprint 和 analysis version 保存，同时记录音频 SHA-256、原视频
+SHA-256、转写和 segments。当前 Mac 分片版本包含基础版本、timeline version 和 60/5 形状，避免
+旧整首算法遮住新算法。
+
+### DeepSeek 缓存
+
+AI Lyrics 表当前按 subject、media fingerprint 和以下字符串保存：
+
+```text
+reconciliation_version|asr:analysis_version|evidence:sha256(actual_asr_words+vad+candidates)
+```
+
+证据哈希包含实际 word 文本/时间、人声活动分数/标记和当次候选内容。强制重跑
+ASR、VAD 增量标注或更换候选都会得到新缓存键。2026-08-24 审查发现的 P0 已修复。
+
+## 七、存储与恢复
+
+Apple TV 的歌词候选、绑定和分析副本实际保存在 App 私有 `Caches`，不是 Application Support，也
+不是永久音频库。tvOS 在空间不足且 App 未运行时可以清除缓存；卸载 App 会删除整个容器。
+
+Mac/VPS SQLite 保留可重建 ASR/DeepSeek 的服务端副本。当前家长人工选择和校时仍主要依赖 Apple TV
+本地数据；如果需要可靠长期保存，后续应同步到 Mac/VPS 或 iCloud。
+
+Release 只使用临时 M4A，完成后删除。Debug 开发过程目录可以显式保存完整提取音频和 JSON/SRT，
+该目录已被 Git 忽略，但需要限制访问和定期清理。
+
+## 八、额度、安全和隐私
+
+- 服务端按北京时间自然月硬限制 18,000 秒。
+- 新请求先原子预留；腾讯成功后结算，失败释放或结算已实际完成的分片。
+- 缓存命中不调用腾讯。
+- 腾讯控制台后付费应继续关闭。
+- `/v1/*` 使用独立 Bearer Token；`/health` 不返回密钥。
+- Mac 本地 Path 接口在 `PRODUCT_ENV == production` 时返回 404，并且只读取白名单目录。
+- 生产必须精确设置 `PRODUCT_ENV=production`，避免环境名误拼导致本地接口开放。
+- `.env`、私密 xcconfig、本地 SQLite、过程音频和测试输出都不得提交 Git。
+- 当前共享 Token 只适合个人部署；公开分发必须升级为逐设备配对 Token。
+
+## 九、当前验收状态
+
+- Python 服务端自动化测试：54 项通过。
+- tvOS 26.2 模拟器自动化测试：55 项通过。
+- Baby Shark：417 个 ASR 词，首词 12.55 秒；DeepSeek 92 行，ASR 词覆盖 100%。
+- The Wheels On The Bus：191 个 ASR 词；用户确认开头旋律/汽车声/节奏无人声，最终首句从 22.45 秒开始。
+  DeepSeek 32 行，ASR 词覆盖 99.45%，`BB/DD/Dee/E` 未进入最终字幕。
+- Who Took the Cookie?：175 个 ASR 词，0.50–120.35 秒；Web 证据 ID 修复后 DeepSeek 31 行成功。
+
+自动化测试证明接口、缓存和 UI 状态机能运行，不证明歌声识别质量已经通过。后续验收必须使用人工
+标注的歌曲集，分别统计纯音乐误报、歌词覆盖、重复副歌、尾段覆盖和时间误差。
+
+## 十、下一步
+
+按以下顺序执行，不先继续堆叠提示词：
+
+1. 建立 10–20 首人工标注回归集和质量指标；当前三首只是起始样本。
+2. 已完成：DeepSeek 缓存绑定实际 ASR/VAD/候选证据，客户端 evidence hash 也包含质量标记。
+3. 统一 ASR SRT、电视 ASR 和 DeepSeek 的 canonical cue/分行结构。
+4. 已完成有声 ASR 空洞回收；继续增加尾段人声和重复段落的真值门槛。
+5. 已完成 PCM/WAV、vocals stem 和 stem VAD 主链路；继续以 faster-whisper/WhisperX 作为第二 ASR/强制对齐 A/B。
+6. 可信歌词优先使用歌声强制对齐；DeepSeek 退回到文字校正和翻译角色。
+7. 英文字幕通过质量门槛后再生成共用 cue ID 的双语字幕。

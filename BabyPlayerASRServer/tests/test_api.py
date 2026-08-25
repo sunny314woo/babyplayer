@@ -183,7 +183,9 @@ def test_local_development_writes_asr_process_files(tmp_path) -> None:
     folder = next(output.iterdir())
     assert (folder / "uploaded_audio.m4a").read_bytes() == b"audio"
     assert "twinkle twinkle" in (folder / "asr.srt").read_text()
+    assert "twinkle twinkle" in (folder / "asr_quality_filtered.srt").read_text()
     assert (folder / "asr_raw.json").is_file()
+    assert (folder / "voice_activity.json").is_file()
     assert "test-babyplayer-token" not in (folder / "request.json").read_text()
 
 

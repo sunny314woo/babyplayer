@@ -88,6 +88,40 @@ class Settings:
     local_asr_chunk_overlap_seconds: float = float(
         os.getenv("LOCAL_ASR_CHUNK_OVERLAP_SECONDS", "5")
     )
+    # Local quality path: one lossless decode -> vocal stem -> VAD and Tencent chunks.
+    # Production remains opt-in because it cannot read the Mac media paths.
+    local_vocal_separation_enabled: bool = _boolean(
+        "LOCAL_VOCAL_SEPARATION_ENABLED", False
+    )
+    local_vocal_separation_model: str = os.getenv(
+        "LOCAL_VOCAL_SEPARATION_MODEL", "Kim_Vocal_2.onnx"
+    )
+    local_vocal_separation_model_directory: str = os.getenv(
+        "LOCAL_VOCAL_SEPARATION_MODEL_DIRECTORY",
+        str(BASE_DIR / ".cache" / "audio-separator-models"),
+    )
+    local_vocal_separation_version: str = os.getenv(
+        "LOCAL_VOCAL_SEPARATION_VERSION",
+        "python-audio-separator-0.44.5-kim-vocal-2-v1",
+    )
+    local_minimum_vocal_coverage: float = float(
+        os.getenv("LOCAL_MINIMUM_VOCAL_COVERAGE", "0.03")
+    )
+    local_minimum_vocal_mean_probability: float = float(
+        os.getenv("LOCAL_MINIMUM_VOCAL_MEAN_PROBABILITY", "0.05")
+    )
+    local_voice_activity_enabled: bool = _boolean(
+        "LOCAL_VOICE_ACTIVITY_ENABLED", False
+    )
+    local_voice_activity_threshold: float = float(
+        os.getenv("LOCAL_VOICE_ACTIVITY_THRESHOLD", "0.15")
+    )
+    local_voice_activity_minimum_suspicious_words: int = int(
+        os.getenv("LOCAL_VOICE_ACTIVITY_MINIMUM_SUSPICIOUS_WORDS", "3")
+    )
+    local_voice_activity_maximum_low_coverage: float = float(
+        os.getenv("LOCAL_VOICE_ACTIVITY_MAXIMUM_LOW_COVERAGE", "0.25")
+    )
 
     @property
     def auth_enabled(self) -> bool:
