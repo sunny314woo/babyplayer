@@ -48,6 +48,31 @@ class AudioPreprocessingSummary(BaseModel):
     model: str | None = Field(default=None, max_length=256)
     vocal_coverage: float | None = Field(default=None, ge=0, le=1)
     vocal_mean_probability: float | None = Field(default=None, ge=0, le=1)
+    planner_version: str | None = Field(default=None, max_length=128)
+    planner_status: str | None = Field(default=None, max_length=64)
+    planner_fallback_reason: str | None = Field(default=None, max_length=128)
+    media_duration_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    analysis_duration_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    raw_vocal_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    planned_asr_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    saved_asr_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    asr_window_count: int | None = Field(default=None, ge=0, le=10_000)
+    smart_intro_end_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    smart_outro_start_seconds: float | None = Field(default=None, ge=0, le=86_400)
+
+
+class VoiceWindowPlanSummary(BaseModel):
+    planner_version: str = Field(min_length=1, max_length=128)
+    planner_status: str = Field(min_length=1, max_length=64)
+    fallback_reason: str | None = Field(default=None, max_length=128)
+    media_duration_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    analysis_duration_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    raw_vocal_seconds: float = Field(ge=0, le=86_400)
+    planned_asr_seconds: float = Field(ge=0, le=86_400)
+    saved_asr_seconds: float = Field(ge=0, le=86_400)
+    asr_window_count: int = Field(ge=0, le=10_000)
+    smart_intro_end_seconds: float | None = Field(default=None, ge=0, le=86_400)
+    smart_outro_start_seconds: float | None = Field(default=None, ge=0, le=86_400)
 
 
 class AsrAnalysisResponse(BaseModel):
@@ -65,6 +90,7 @@ class AsrAnalysisResponse(BaseModel):
     media_content_sha256: str | None = None
     voice_activity: VoiceActivitySummary | None = None
     audio_preprocessing: AudioPreprocessingSummary | None = None
+    voice_window_plan: VoiceWindowPlanSummary | None = None
 
 
 class UsageResponse(BaseModel):

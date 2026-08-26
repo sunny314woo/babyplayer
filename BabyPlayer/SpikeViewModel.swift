@@ -69,6 +69,114 @@ enum BabyPlayerLyricsMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum BabyPlayerSmartSkipDefaultPolicy {
+    /// 新安装和升级后的首次读取都默认开启；一旦家长保存选择，始终尊重该选择。
+    static func resolvedValue(storedValue: Bool?) -> Bool {
+        storedValue ?? true
+    }
+}
+
+/// 将服务端候选收缩为播放器可采用的边界；不修改歌词的媒体时间轴。
+enum BabyPlayerSmartSkipBoundaryPolicy {
+    static let minimumSkipSeconds = 3.0
+    static let minimumPlayableBodySeconds = 10.0
+
+    static func storedBoundary(
+        from plan: BabyPlayerVoiceWindowPlan?,
+        expectedMediaDuration: Double?
+    ) -> StoredSmartPlaybackBoundary? {
+        guard let plan,
+              plan.fallbackReason == nil,
+              plan.plannerStatus == "sparse" || plan.plannerStatus == "full_coverage",
+              let duration = plan.mediaDurationSeconds,
+              duration.isFinite,
+              duration > minimumPlayableBodySeconds else { return nil }
+        return validatedStoredBoundary(
+            StoredSmartPlaybackBoundary(
+                introEndSeconds: plan.smartIntroEndSeconds,
+                outroStartSeconds: plan.smartOutroStartSeconds,
+                mediaDurationSeconds: duration,
+                plannerVersion: plan.plannerVersion,
+                createdAt: Date()
+            ),
+            expectedMediaDuration: expectedMediaDuration
+        )
+    }
+
+    /// 重新采用持久边界前校验媒体时长，防止同一 Jellyfin ID 被替换后沿用旧跳点。
+    static func validatedStoredBoundary(
+        _ boundary: StoredSmartPlaybackBoundary?,
+        expectedMediaDuration: Double?
+    ) -> StoredSmartPlaybackBoundary? {
+        guard let boundary else { return nil }
+        let duration = boundary.mediaDurationSeconds
+        guard duration.isFinite, duration > minimumPlayableBodySeconds else { return nil }
+        if let expectedMediaDuration,
+           expectedMediaDuration.isFinite,
+           expectedMediaDuration > 0 {
+            let tolerance = max(2, expectedMediaDuration * 0.02)
+            guard abs(duration - expectedMediaDuration) <= tolerance else { return nil }
+        }
+        let intro = boundary.introEndSeconds.flatMap { value -> Double? in
+            guard value.isFinite,
+                  value >= minimumSkipSeconds,
+                  value <= duration - minimumPlayableBodySeconds else { return nil }
+            return value
+        }
+        let outro = boundary.outroStartSeconds.flatMap { value -> Double? in
+            guard value.isFinite,
+                  value >= minimumPlayableBodySeconds,
+                  duration - value >= minimumSkipSeconds else { return nil }
+            return value
+        }
+        if let intro, let outro, outro - intro < minimumPlayableBodySeconds {
+            return nil
+        }
+        guard intro != nil || outro != nil else { return nil }
+        return StoredSmartPlaybackBoundary(
+            introEndSeconds: intro,
+            outroStartSeconds: outro,
+            mediaDurationSeconds: duration,
+            plannerVersion: boundary.plannerVersion,
+            createdAt: boundary.createdAt
+        )
+    }
+}
+
+/// 播放边界只负责选优先级，不参与歌词选择、歌词偏移或 ASR 时间戳换算。
+enum BabyPlayerPlaybackBoundaryPolicy {
+    static func introTarget(
+        chapter: Double?,
+        smart: Double?,
+        smartEnabled: Bool,
+        manualSkipSeconds: Double,
+        resumeTarget: Double?
+    ) -> Double {
+        let automatic = chapter ?? (smartEnabled ? smart : nil) ?? positive(manualSkipSeconds)
+        return max(automatic ?? 0, resumeTarget ?? 0)
+    }
+
+    static func outroTarget(
+        chapter: Double?,
+        smart: Double?,
+        smartEnabled: Bool,
+        manualSkipSeconds: Double,
+        duration: Double?
+    ) -> Double? {
+        if let chapter { return chapter }
+        if smartEnabled, let smart { return smart }
+        guard let manual = positive(manualSkipSeconds),
+              let duration,
+              duration.isFinite,
+              duration > manual else { return nil }
+        return duration - manual
+    }
+
+    private static func positive(_ value: Double) -> Double? {
+        value.isFinite && value > 0 ? value : nil
+    }
+}
+
 // 【MODIFIED】版本化的字幕默认策略：本次升级会把旧的“关闭”一次性迁移为英文，之后仍尊重用户手工关闭。
 enum BabyPlayerLyricsDefaultPolicy {
     static func resolvedMode(
@@ -91,6 +199,8 @@ struct BabyPlayerQueueItem: Identifiable {
     let localMediaPath: String?
     let chapterIntroEndSeconds: Double?
     let chapterOutroStartSeconds: Double?
+    var smartIntroEndSeconds: Double?
+    var smartOutroStartSeconds: Double?
 }
 
 /// 交给系统播放器的完整会话设置。
@@ -104,6 +214,7 @@ struct SpikePlaybackSelection: Identifiable {
     let sessionDuration: TimeInterval?
     let introSkipSeconds: Double
     let outroSkipSeconds: Double
+    let smartSkipEnabled: Bool
     let lyricsMode: BabyPlayerLyricsMode
     /// 只用于会话首曲；自动切到后续曲目时始终从歌曲起点播放。
     let startPositionSeconds: Double?
@@ -228,6 +339,9 @@ final class SpikeViewModel: ObservableObject {
     @Published var outroSkipSeconds = 0 {
         didSet { UserDefaults.standard.set(outroSkipSeconds, forKey: Self.outroSkipKey) }
     }
+    @Published var smartSkipEnabled = true {
+        didSet { UserDefaults.standard.set(smartSkipEnabled, forKey: Self.smartSkipEnabledKey) }
+    }
     @Published var lyricsMode: BabyPlayerLyricsMode = .english {
         didSet { UserDefaults.standard.set(lyricsMode.rawValue, forKey: Self.lyricsModeKey) }
     }
@@ -236,10 +350,12 @@ final class SpikeViewModel: ObservableObject {
     private var accessToken: String?
     private var operationTask: Task<Void, Never>?
     private var coverPrewarmTask: Task<Void, Never>?
+    private var playbackPreparationTask: Task<Void, Never>?
 
     private static let playbackTimerKey = "BabyPlayer.PlaybackTimerMinutes"
     private static let introSkipKey = "BabyPlayer.IntroSkipSeconds"
     private static let outroSkipKey = "BabyPlayer.OutroSkipSeconds"
+    private static let smartSkipEnabledKey = "BabyPlayer.SmartSkipEnabledV1"
     private static let lyricsModeKey = "BabyPlayer.LyricsMode"
     private static let lyricsEnabledByDefaultMigrationKey = "BabyPlayer.LyricsEnabledByDefaultV1"
     private static let ratingsKey = "BabyPlayer.MediaRatings"
@@ -255,6 +371,14 @@ final class SpikeViewModel: ObservableObject {
         }
         if defaults.object(forKey: Self.outroSkipKey) != nil {
             outroSkipSeconds = max(0, defaults.integer(forKey: Self.outroSkipKey))
+        }
+        smartSkipEnabled = BabyPlayerSmartSkipDefaultPolicy.resolvedValue(
+            storedValue: defaults.object(forKey: Self.smartSkipEnabledKey) == nil
+                ? nil
+                : defaults.bool(forKey: Self.smartSkipEnabledKey)
+        )
+        if defaults.object(forKey: Self.smartSkipEnabledKey) == nil {
+            defaults.set(smartSkipEnabled, forKey: Self.smartSkipEnabledKey)
         }
         let savedLyricsMode = defaults.string(forKey: Self.lyricsModeKey)
             .flatMap(BabyPlayerLyricsMode.init(rawValue:))
@@ -474,6 +598,7 @@ final class SpikeViewModel: ObservableObject {
     func clearPairing() {
         operationTask?.cancel()
         coverPrewarmTask?.cancel()
+        playbackPreparationTask?.cancel()
         operationTask = nil
         JellyfinCredentialStore.delete()
         authenticatedUserID = nil
@@ -648,14 +773,37 @@ final class SpikeViewModel: ObservableObject {
         startIndex: Int,
         behaviorOverride: BabyPlayerPlaybackBehavior? = nil
     ) {
+        playbackPreparationTask?.cancel()
+        playbackPreparationTask = Task { [weak self] in
+            await self?.prepareAndPresentPlayback(
+                items: items,
+                startIndex: startIndex,
+                behaviorOverride: behaviorOverride
+            )
+        }
+    }
+
+    private func prepareAndPresentPlayback(
+        items: [JellyfinMediaItem],
+        startIndex: Int,
+        behaviorOverride: BabyPlayerPlaybackBehavior?
+    ) async {
         guard let accessToken,
               let client = try? makeClient() else {
             startRePairing()
             return
         }
 
-        let queue = items.compactMap { item -> BabyPlayerQueueItem? in
-            guard let url = try? client.directPlaybackURL(for: item, accessToken: accessToken) else { return nil }
+        var preparedItems: [(
+            item: JellyfinMediaItem,
+            url: URL,
+            lyricsMedia: LyricsMediaDescriptor,
+            chapterIntro: Double?,
+            chapterOutro: Double?
+        )] = []
+        for item in items {
+            guard !Task.isCancelled else { return }
+            guard let url = try? client.directPlaybackURL(for: item, accessToken: accessToken) else { continue }
             let markers = chapterMarkers(for: item)
             let duration = item.runTimeTicks.map { Double($0) / 10_000_000 }
             let inferredSongStart = markers.introEnd
@@ -666,18 +814,36 @@ final class SpikeViewModel: ObservableObject {
                         ? total - Double(outroSkipSeconds)
                         : nil
                 }
+            let lyricsMedia = Self.lyricsDescriptor(
+                from: item,
+                songStartSeconds: inferredSongStart,
+                songEndSeconds: inferredSongEnd
+            )
+            preparedItems.append((item, url, lyricsMedia, markers.introEnd, markers.outroStart))
+        }
+        let storedSmartBoundaries = smartSkipEnabled
+            ? await BabyLyricsRepository.shared.smartPlaybackBoundaries(
+                for: preparedItems
+                    .filter { $0.chapterIntro == nil || $0.chapterOutro == nil }
+                    .map { $0.lyricsMedia }
+            )
+            : [:]
+        guard !Task.isCancelled else { return }
+        let queue = preparedItems.map { prepared in
+            let storedSmartBoundary = BabyPlayerSmartSkipBoundaryPolicy.validatedStoredBoundary(
+                storedSmartBoundaries[prepared.item.id],
+                expectedMediaDuration: prepared.lyricsMedia.durationSeconds
+            )
             return BabyPlayerQueueItem(
-                id: item.id,
-                title: item.name,
-                url: url,
-                lyricsMedia: Self.lyricsDescriptor(
-                    from: item,
-                    songStartSeconds: inferredSongStart,
-                    songEndSeconds: inferredSongEnd
-                ),
-                localMediaPath: item.path,
-                chapterIntroEndSeconds: markers.introEnd,
-                chapterOutroStartSeconds: markers.outroStart
+                id: prepared.item.id,
+                title: prepared.item.name,
+                url: prepared.url,
+                lyricsMedia: prepared.lyricsMedia,
+                localMediaPath: prepared.item.path,
+                chapterIntroEndSeconds: prepared.chapterIntro,
+                chapterOutroStartSeconds: prepared.chapterOutro,
+                smartIntroEndSeconds: storedSmartBoundary?.introEndSeconds,
+                smartOutroStartSeconds: storedSmartBoundary?.outroStartSeconds
             )
         }
         guard !queue.isEmpty else {
@@ -710,6 +876,7 @@ final class SpikeViewModel: ObservableObject {
             sessionDuration: playbackTimerMinutes == 0 ? nil : TimeInterval(playbackTimerMinutes * 60),
             introSkipSeconds: Double(introSkipSeconds),
             outroSkipSeconds: Double(outroSkipSeconds),
+            smartSkipEnabled: smartSkipEnabled,
             lyricsMode: lyricsMode,
             startPositionSeconds: playbackResumeState.flatMap { state in
                 state.itemID == queue[queueStartIndex].id ? state.positionSeconds : nil

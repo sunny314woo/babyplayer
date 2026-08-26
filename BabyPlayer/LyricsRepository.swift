@@ -197,6 +197,15 @@ struct StoredLyricsAnalysisResult: Codable, Sendable {
     let createdAt: Date
 }
 
+/// 声音分析给播放器的保守边界；独立于歌词候选和歌词偏移持久化。
+struct StoredSmartPlaybackBoundary: Codable, Equatable, Sendable {
+    let introEndSeconds: Double?
+    let outroStartSeconds: Double?
+    let mediaDurationSeconds: Double
+    let plannerVersion: String
+    let createdAt: Date
+}
+
 /// 一首媒体的 ASR/DeepSeek 并列结果；两者可同时保留，是否写入默认 binding 由上层显式工作流决定。
 struct StoredLyricsAnalysisBundle: Codable, Sendable {
     let mediaID: String
@@ -206,6 +215,7 @@ struct StoredLyricsAnalysisBundle: Codable, Sendable {
     var pinnedOrdinaryPlayback: LyricsPlayback?
     var asrResult: StoredLyricsAnalysisResult?
     var deepSeekResult: StoredLyricsAnalysisResult?
+    var smartPlaybackBoundary: StoredSmartPlaybackBoundary?
     var updatedAt: Date
 
     func result(for source: LyricsAnalysisSource) -> StoredLyricsAnalysisResult? {
@@ -650,6 +660,7 @@ actor BabyLyricsRepository {
                 pinnedOrdinaryPlayback: fallback.pinnedOrdinaryPlayback,
                 asrResult: fallback.asrResult,
                 deepSeekResult: fallback.deepSeekResult,
+                smartPlaybackBoundary: fallback.smartPlaybackBoundary,
                 updatedAt: Date()
             )
             try? saveAnalysisBundleToDisk(migrated)
@@ -660,11 +671,35 @@ actor BabyLyricsRepository {
         return nil
     }
 
+    /// 一次读取播放队列的智能边界，避免打开大列表时为每首媒体重复扫描分析目录。
+    func smartPlaybackBoundaries(
+        for mediaItems: [LyricsMediaDescriptor]
+    ) -> [String: StoredSmartPlaybackBoundary] {
+        guard !mediaItems.isEmpty,
+              let storedBundles = try? loadAllAnalysisBundles() else { return [:] }
+        var result: [String: StoredSmartPlaybackBoundary] = [:]
+        for media in mediaItems {
+            let fingerprint = mediaFingerprint(for: media)
+            let legacyFingerprint = legacyMediaFingerprint(for: media)
+            let match = storedBundles.first { stored in
+                stored.mediaID == media.id
+                    || (media.mediaSourceID.map { $0 == stored.mediaSourceID } ?? false)
+                    || stored.mediaFingerprint == fingerprint
+                    || stored.mediaFingerprint == legacyFingerprint
+            }
+            if let boundary = match?.smartPlaybackBoundary {
+                result[media.id] = boundary
+            }
+        }
+        return result
+    }
+
     /// 保存人工运行的 ASR 结果；新证据会使基于旧 ASR 的 DeepSeek 结果过期，不修改当前歌词。
     @discardableResult
     func storeASRResult(
         _ candidate: LyricsCandidate,
         asrEvidenceHash: String,
+        smartPlaybackBoundary: StoredSmartPlaybackBoundary? = nil,
         for media: LyricsMediaDescriptor
     ) throws -> StoredLyricsAnalysisBundle {
         var bundle = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
@@ -679,6 +714,8 @@ actor BabyLyricsRepository {
             bundle.deepSeekResult = nil
         }
         bundle.asrResult = result
+        // 边界和本次 ASR 使用同一份媒体证据；缺失或不可信时清掉旧值，避免沿用过期跳点。
+        bundle.smartPlaybackBoundary = smartPlaybackBoundary
         bundle.updatedAt = Date()
         try saveAnalysisBundleToDisk(bundle)
         analysisMemoryCache[media.id] = bundle
@@ -1406,6 +1443,7 @@ actor BabyLyricsRepository {
             pinnedOrdinaryPlayback: nil,
             asrResult: nil,
             deepSeekResult: nil,
+            smartPlaybackBoundary: nil,
             updatedAt: Date()
         )
     }

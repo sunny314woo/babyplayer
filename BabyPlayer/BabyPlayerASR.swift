@@ -77,6 +77,34 @@ struct BabyPlayerVoiceActivitySummary: Codable, Sendable {
     }
 }
 
+struct BabyPlayerVoiceWindowPlan: Codable, Sendable {
+    let plannerVersion: String
+    let plannerStatus: String
+    let fallbackReason: String?
+    let mediaDurationSeconds: Double?
+    let analysisDurationSeconds: Double?
+    let rawVocalSeconds: Double
+    let plannedASRSeconds: Double
+    let savedASRSeconds: Double
+    let asrWindowCount: Int
+    let smartIntroEndSeconds: Double?
+    let smartOutroStartSeconds: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case plannerVersion = "planner_version"
+        case plannerStatus = "planner_status"
+        case fallbackReason = "fallback_reason"
+        case mediaDurationSeconds = "media_duration_seconds"
+        case analysisDurationSeconds = "analysis_duration_seconds"
+        case rawVocalSeconds = "raw_vocal_seconds"
+        case plannedASRSeconds = "planned_asr_seconds"
+        case savedASRSeconds = "saved_asr_seconds"
+        case asrWindowCount = "asr_window_count"
+        case smartIntroEndSeconds = "smart_intro_end_seconds"
+        case smartOutroStartSeconds = "smart_outro_start_seconds"
+    }
+}
+
 struct BabyPlayerASRAnalysis: Codable, Sendable {
     let status: String
     let cacheHit: Bool
@@ -91,6 +119,7 @@ struct BabyPlayerASRAnalysis: Codable, Sendable {
     let audioContentHash: String?
     let mediaContentHash: String?
     var voiceActivity: BabyPlayerVoiceActivitySummary? = nil
+    var voiceWindowPlan: BabyPlayerVoiceWindowPlan? = nil
 
     enum CodingKeys: String, CodingKey {
         case status, provider, transcript, segments
@@ -103,6 +132,7 @@ struct BabyPlayerASRAnalysis: Codable, Sendable {
         case audioContentHash = "audio_sha256"
         case mediaContentHash = "media_content_sha256"
         case voiceActivity = "voice_activity"
+        case voiceWindowPlan = "voice_window_plan"
     }
 
     /// 返回可用于版本关联的 ASR 证据哈希；源文件相同但词时间线改变时也必须变化。

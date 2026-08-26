@@ -145,6 +145,28 @@ def test_merge_offsets_words_deduplicates_only_overlap_and_keeps_real_repeats() 
     assert segments[-1]["end_seconds"] <= 157.184
 
 
+def test_sparse_gap_keeps_later_provider_timestamp_on_original_timeline() -> None:
+    sparse_chunks = (
+        AsrAudioChunk(0, 13.5, 33.0, b"window-a"),
+        AsrAudioChunk(1, 58.5, 30.0, b"window-b"),
+    )
+    transcript, segments = merge_chunk_recognitions(
+        sparse_chunks,
+        (
+            recognition(33.0, [("first", 2.0, 2.5)]),
+            recognition(30.0, [("later", 3.2, 3.7)]),
+        ),
+        duration_seconds=120,
+    )
+    words = [word for segment in segments for word in segment["words"]]
+
+    assert transcript == "first later"
+    assert words[0]["start_seconds"] == pytest.approx(15.5)
+    assert words[1]["start_seconds"] == pytest.approx(61.7)
+    assert words[1]["end_seconds"] == pytest.approx(62.2)
+    assert segments[0]["end_seconds"] < segments[1]["start_seconds"]
+
+
 def test_chunked_service_calls_provider_sequentially_then_reuses_merged_cache(tmp_path) -> None:
     config = configured(tmp_path)
     repository = AsrRepository(config.database_path)

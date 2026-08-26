@@ -32,6 +32,11 @@ from app.service import (
 )
 from app.tencent_asr import TencentAsrError
 from app.voice_activity import VoiceActivityEvidence
+from app.voice_window_planner import (
+    VoiceWindow,
+    VoiceWindowPlanner,
+    VoiceWindowPlannerConfig,
+)
 from app.vocal_separation import VocalSeparationError
 
 
@@ -69,10 +74,19 @@ class AudioChunkWindow:
     index: int
     offset_seconds: float
     duration_seconds: float
+    source_offset_seconds: float | None = None
 
     @property
     def end_seconds(self) -> float:
         return self.offset_seconds + self.duration_seconds
+
+    @property
+    def source_start_seconds(self) -> float:
+        return (
+            self.offset_seconds
+            if self.source_offset_seconds is None
+            else self.source_offset_seconds
+        )
 
 
 def plan_audio_chunks(
@@ -102,6 +116,39 @@ def plan_audio_chunks(
     return tuple(windows)
 
 
+def plan_audio_chunks_for_windows(
+    windows: tuple[VoiceWindow, ...],
+    *,
+    timeline_start_seconds: float,
+    timeline_end_seconds: float,
+    chunk_seconds: float,
+    overlap_seconds: float,
+) -> tuple[AudioChunkWindow, ...]:
+    """Reuse fixed chunking inside sparse windows while preserving timeline gaps."""
+    if timeline_end_seconds <= timeline_start_seconds:
+        raise LocalMediaValidationError("歌曲时长无效")
+    chunks = []
+    for window in windows:
+        start = max(timeline_start_seconds, window.start_seconds)
+        end = min(timeline_end_seconds, window.end_seconds)
+        if end <= start:
+            continue
+        local_chunks = plan_audio_chunks(
+            end - start,
+            chunk_seconds=chunk_seconds,
+            overlap_seconds=overlap_seconds,
+        )
+        for local in local_chunks:
+            source_start = start + local.offset_seconds
+            chunks.append(AudioChunkWindow(
+                index=len(chunks),
+                offset_seconds=source_start - timeline_start_seconds,
+                duration_seconds=local.duration_seconds,
+                source_offset_seconds=source_start,
+            ))
+    return tuple(chunks)
+
+
 class LocalMediaAudioExtractor:
     """Decode once to lossless PCM, then create all ASR inputs from one source."""
 
@@ -111,10 +158,46 @@ class LocalMediaAudioExtractor:
         *,
         voice_activity_detector=None,
         vocal_stem_separator=None,
+        voice_window_planner=None,
     ) -> None:
         self.config = config
         self.voice_activity_detector = voice_activity_detector
         self.vocal_stem_separator = vocal_stem_separator
+        self.voice_window_planner = voice_window_planner
+        if self.voice_window_planner is None and config.local_sparse_asr_enabled:
+            self.voice_window_planner = VoiceWindowPlanner(
+                VoiceWindowPlannerConfig(
+                    minimum_speech_seconds=(
+                        config.local_voice_window_minimum_speech_seconds
+                    ),
+                    merge_gap_seconds=config.local_voice_window_merge_gap_seconds,
+                    padding_before_seconds=(
+                        config.local_voice_window_padding_before_seconds
+                    ),
+                    padding_after_seconds=(
+                        config.local_voice_window_padding_after_seconds
+                    ),
+                    stable_body_gap_seconds=(
+                        config.local_voice_window_stable_body_gap_seconds
+                    ),
+                    stable_body_minimum_span_seconds=(
+                        config.local_voice_window_stable_body_minimum_span_seconds
+                    ),
+                    stable_body_minimum_speech_seconds=(
+                        config.local_voice_window_stable_body_minimum_speech_seconds
+                    ),
+                    stable_body_minimum_density=(
+                        config.local_voice_window_stable_body_minimum_density
+                    ),
+                    boundary_safety_seconds=(
+                        config.local_voice_window_boundary_safety_seconds
+                    ),
+                    minimum_skip_seconds=(
+                        config.local_voice_window_minimum_skip_seconds
+                    ),
+                    maximum_window_count=config.local_voice_window_maximum_count,
+                )
+            )
         self.uses_vocal_separation = vocal_stem_separator is not None
         self.roots = tuple(
             Path(value).expanduser().resolve()
@@ -124,17 +207,10 @@ class LocalMediaAudioExtractor:
     def extract(self, request: LocalAnalysisJobRequest) -> ExtractedAudio:
         source = self._validated_source(request.media_path)
         media_content_sha256 = _sha256_file(source)
-        duration = request.analysis_duration_seconds
-        windows = plan_audio_chunks(
-            duration,
-            chunk_seconds=self.config.local_asr_chunk_seconds,
-            overlap_seconds=self.config.local_asr_chunk_overlap_seconds,
-        )
-        if any(
-            window.duration_seconds > self.config.max_audio_seconds
-            for window in windows
-        ):
-            raise LocalMediaValidationError("Mac ASR 分片超过腾讯单次时长上限")
+        media_duration = request.duration_seconds
+        timeline_start = request.song_start_seconds
+        timeline_end = request.song_end_seconds or media_duration
+        duration = timeline_end - timeline_start
 
         ffmpeg = Path(self.config.local_ffmpeg_path).expanduser()
         if not ffmpeg.is_file():
@@ -147,10 +223,10 @@ class LocalMediaAudioExtractor:
                 str(ffmpeg),
                 "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                 "-i", str(source),
-                # Output-side seek decodes to the requested point instead of starting
-                # at the nearest video keyframe, which keeps the lyric timeline stable.
-                "-ss", f"{request.song_start_seconds:.3f}",
-                "-t", f"{duration:.3f}",
+                # VAD must see the complete media timeline. Playback/manual skip
+                # boundaries are applied only when provider chunks are planned.
+                "-ss", "0.000",
+                "-t", f"{media_duration:.3f}",
                 "-vn", "-ac", "2", "-ar", "44100",
                 "-c:a", "pcm_s16le",
                 str(lossless_mix),
@@ -170,7 +246,7 @@ class LocalMediaAudioExtractor:
                 separated = self.vocal_stem_separator.separate(
                     lossless_mix,
                     output_directory=temporary_root / "separated",
-                    expected_duration_seconds=duration,
+                    expected_duration_seconds=media_duration,
                 )
                 asr_source = separated.path
                 audio_preprocessing = {
@@ -185,14 +261,16 @@ class LocalMediaAudioExtractor:
                 try:
                     voice_activity = self.voice_activity_detector.analyze(
                         asr_source.read_bytes(),
-                        duration_seconds=duration,
+                        duration_seconds=media_duration,
                     )
+                    if voice_activity.frame_seconds <= 0:
+                        raise RuntimeError("voice activity frame duration is invalid")
                     if self.vocal_stem_separator is not None:
                         voice_activity = replace(
                             voice_activity,
                             scope="vocal_stem_gate",
                         )
-                    metrics = _voice_activity_metrics(voice_activity, duration)
+                    metrics = _voice_activity_metrics(voice_activity, media_duration)
                     audio_preprocessing.update(metrics)
                     if (
                         self.vocal_stem_separator is not None
@@ -208,15 +286,107 @@ class LocalMediaAudioExtractor:
                     raise
                 except Exception as exc:
                     # VAD is a quality signal, never a reason to lose an otherwise valid ASR.
+                    voice_activity = None
                     logger.warning(
                         "Local voice activity analysis unavailable error_type=%s",
                         type(exc).__name__,
                     )
+
+            provider_windows = (VoiceWindow(timeline_start, timeline_end),)
+            if voice_activity is not None and self.voice_window_planner is not None:
+                try:
+                    plan = self.voice_window_planner.plan(
+                        media_duration_seconds=media_duration,
+                        evidence=voice_activity,
+                    )
+                    clipped = _clip_voice_windows(
+                        plan.asr_windows,
+                        start_seconds=timeline_start,
+                        end_seconds=timeline_end,
+                    )
+                    plan_diagnostics = plan.diagnostics()
+                    if plan.planner_status != "fallback" and clipped:
+                        provider_windows = clipped
+                        planned_seconds = sum(
+                            value.duration_seconds for value in clipped
+                        )
+                        plan_diagnostics.update({
+                            "planned_asr_seconds": round(planned_seconds, 3),
+                            "saved_asr_seconds": round(
+                                max(0.0, duration - planned_seconds), 3
+                            ),
+                            "asr_window_count": len(clipped),
+                            "analysis_duration_seconds": round(duration, 3),
+                        })
+                    else:
+                        plan_diagnostics.update({
+                            "planner_status": "fallback",
+                            "planner_fallback_reason": (
+                                plan.fallback_reason
+                                or "no_window_inside_analysis_boundary"
+                            ),
+                            "planned_asr_seconds": round(duration, 3),
+                            "saved_asr_seconds": 0.0,
+                            "asr_window_count": 1,
+                            "analysis_duration_seconds": round(duration, 3),
+                        })
+                    audio_preprocessing.update(plan_diagnostics)
+                except Exception as exc:
+                    # Planning is quota optimization only. Preserve the complete
+                    # ASR path whenever its output is unavailable or suspicious.
+                    logger.warning(
+                        "Voice window planning unavailable error_type=%s",
+                        type(exc).__name__,
+                    )
+                    audio_preprocessing.update({
+                        "planner_status": "fallback",
+                        "planner_fallback_reason": "planner_exception",
+                        "media_duration_seconds": round(media_duration, 3),
+                        "analysis_duration_seconds": round(duration, 3),
+                        "planned_asr_seconds": round(duration, 3),
+                        "saved_asr_seconds": 0.0,
+                        "asr_window_count": 1,
+                        "smart_intro_end_seconds": None,
+                        "smart_outro_start_seconds": None,
+                    })
+
+            windows = plan_audio_chunks_for_windows(
+                provider_windows,
+                timeline_start_seconds=timeline_start,
+                timeline_end_seconds=timeline_end,
+                chunk_seconds=self.config.local_asr_chunk_seconds,
+                overlap_seconds=self.config.local_asr_chunk_overlap_seconds,
+            )
+            if not windows:
+                # This should be unreachable after clipping, but quota optimization
+                # must never make lyrics unavailable.
+                windows = plan_audio_chunks_for_windows(
+                    (VoiceWindow(timeline_start, timeline_end),),
+                    timeline_start_seconds=timeline_start,
+                    timeline_end_seconds=timeline_end,
+                    chunk_seconds=self.config.local_asr_chunk_seconds,
+                    overlap_seconds=self.config.local_asr_chunk_overlap_seconds,
+                )
+                audio_preprocessing.update({
+                    "planner_status": "fallback",
+                    "planner_fallback_reason": "empty_chunk_plan",
+                    "planned_asr_seconds": round(duration, 3),
+                    "saved_asr_seconds": 0.0,
+                    "asr_window_count": 1,
+                })
+            if any(
+                window.duration_seconds > self.config.max_audio_seconds
+                for window in windows
+            ):
+                raise LocalMediaValidationError("Mac ASR 分片超过腾讯单次时长上限")
+
             output = temporary_root / "analysis.m4a"
             complete_command = [
                 str(ffmpeg),
                 "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "-ss", f"{timeline_start:.3f}",
                 "-i", str(asr_source),
+                "-t", f"{duration:.3f}",
                 "-vn", "-ac", "1", "-ar", "16000",
                 "-c:a", "aac", "-b:a", "64k",
                 str(output),
@@ -235,7 +405,7 @@ class LocalMediaAudioExtractor:
                 chunk_command = [
                     str(ffmpeg),
                     "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                    "-ss", f"{window.offset_seconds:.3f}",
+                    "-ss", f"{window.source_start_seconds:.3f}",
                     "-i", str(asr_source),
                     "-t", f"{window.duration_seconds:.3f}",
                     "-vn", "-ac", "1", "-ar", "16000",
@@ -261,7 +431,11 @@ class LocalMediaAudioExtractor:
                 duration_seconds=duration,
                 media_content_sha256=media_content_sha256,
                 chunks=tuple(chunks),
-                voice_activity=voice_activity,
+                voice_activity=_voice_activity_for_timeline(
+                    voice_activity,
+                    start_seconds=timeline_start,
+                    end_seconds=timeline_end,
+                ),
                 audio_preprocessing=audio_preprocessing,
             )
 
@@ -335,6 +509,59 @@ def _voice_activity_metrics(
         ),
         "vocal_mean_probability": round(mean_probability, 4),
     }
+
+
+def _clip_voice_windows(
+    windows: tuple[VoiceWindow, ...],
+    *,
+    start_seconds: float,
+    end_seconds: float,
+) -> tuple[VoiceWindow, ...]:
+    clipped = []
+    for window in windows:
+        start = max(start_seconds, window.start_seconds)
+        end = min(end_seconds, window.end_seconds)
+        if end > start:
+            clipped.append(VoiceWindow(start, end))
+    return tuple(clipped)
+
+
+def _voice_activity_for_timeline(
+    evidence: VoiceActivityEvidence | None,
+    *,
+    start_seconds: float,
+    end_seconds: float,
+) -> VoiceActivityEvidence | None:
+    """Translate complete-media VAD evidence onto the existing song-relative timeline."""
+    if evidence is None:
+        return None
+    duration = max(0.0, end_seconds - start_seconds)
+    frame_count = max(0, int((duration / evidence.frame_seconds) + 0.999_999))
+    probabilities = []
+    for index in range(frame_count):
+        media_time = start_seconds + index * evidence.frame_seconds
+        source_index = int(media_time / evidence.frame_seconds)
+        if 0 <= source_index < len(evidence.probabilities):
+            probabilities.append(evidence.probabilities[source_index])
+        else:
+            probabilities.append(0.0)
+    intervals = []
+    for raw_start, raw_end in evidence.speech_intervals:
+        clipped_start = max(start_seconds, raw_start)
+        clipped_end = min(end_seconds, raw_end)
+        if clipped_end > clipped_start:
+            intervals.append((
+                clipped_start - start_seconds,
+                clipped_end - start_seconds,
+            ))
+    return VoiceActivityEvidence(
+        detector=evidence.detector,
+        scope=evidence.scope,
+        threshold=evidence.threshold,
+        frame_seconds=evidence.frame_seconds,
+        probabilities=tuple(probabilities),
+        speech_intervals=tuple(intervals),
+    )
 
 
 class LocalAnalysisJobManager:
@@ -527,4 +754,5 @@ __all__ = [
     "LocalNoVocalsDetectedError",
     "LocalMediaValidationError",
     "plan_audio_chunks",
+    "plan_audio_chunks_for_windows",
 ]

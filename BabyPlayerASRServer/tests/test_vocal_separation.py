@@ -141,6 +141,22 @@ class FakeVoiceActivityDetector:
         )
 
 
+class IntervalVoiceActivityDetector:
+    def __init__(self, intervals):
+        self.intervals = tuple(intervals)
+
+    def analyze(self, audio, *, duration_seconds):
+        assert audio.startswith(b"RIFF")
+        return VoiceActivityEvidence(
+            detector="fake-vad",
+            scope="mixed_audio_advisory",
+            threshold=0.15,
+            frame_seconds=1,
+            probabilities=(0.8,) * max(1, int(duration_seconds)),
+            speech_intervals=self.intervals,
+        )
+
+
 class RecordingExtractor(LocalMediaAudioExtractor):
     def __init__(self, *arguments, **keywords):
         super().__init__(*arguments, **keywords)
@@ -177,7 +193,13 @@ def test_extractor_builds_complete_and_chunk_audio_from_lossless_vocal_stem(
     extracted = extractor.extract(local_request(source))
 
     assert extracted.data == b"audio-analysis.m4a"
-    assert extracted.audio_preprocessing == {
+    assert {
+        key: extracted.audio_preprocessing[key]
+        for key in (
+            "source", "decode", "separator", "model",
+            "vocal_coverage", "vocal_mean_probability",
+        )
+    } == {
         "source": "vocal_stem",
         "decode": "pcm_s16le_44100_stereo",
         "separator": "fake-separator",
@@ -185,12 +207,51 @@ def test_extractor_builds_complete_and_chunk_audio_from_lossless_vocal_stem(
         "vocal_coverage": 1.0,
         "vocal_mean_probability": 0.8,
     }
+    assert extracted.audio_preprocessing["planner_status"] == "full_coverage"
+    assert extracted.audio_preprocessing["planned_asr_seconds"] == 2
     assert extracted.voice_activity.scope == "vocal_stem_gate"
     assert "pcm_s16le" in extractor.commands[0]
     assert all(
         any(value.endswith("vocal-stem.wav") for value in command)
         for command in extractor.commands[1:]
     )
+
+
+def test_extractor_vad_sees_full_media_but_chunks_keep_song_relative_offsets(
+    tmp_path,
+) -> None:
+    source = tmp_path / "bounded-song.mp4"
+    source.write_bytes(b"video")
+    extractor = RecordingExtractor(
+        configured(tmp_path),
+        vocal_stem_separator=FakeStemSeparator(),
+        voice_activity_detector=IntervalVoiceActivityDetector((
+            (6.0, 9.0),
+            (15.0, 16.0),
+        )),
+    )
+    request = LocalAnalysisJobRequest(
+        media_fingerprint="bounded-vocal-pipeline",
+        media_path=str(source),
+        duration_seconds=20,
+        song_start_seconds=5,
+        song_end_seconds=18,
+    )
+
+    extracted = extractor.extract(request)
+
+    assert extractor.commands[0][extractor.commands[0].index("-t") + 1] == "20.000"
+    assert extracted.duration_seconds == 13
+    assert [chunk.offset_seconds for chunk in extracted.chunks] == [0, 8.5]
+    chunk_commands = [
+        command for command in extractor.commands
+        if command[-1].endswith(("chunk-000.m4a", "chunk-001.m4a"))
+    ]
+    assert [
+        command[command.index("-ss") + 1] for command in chunk_commands
+    ] == ["5.000", "13.500"]
+    assert extracted.audio_preprocessing["planned_asr_seconds"] == 9.5
+    assert extracted.audio_preprocessing["saved_asr_seconds"] == 3.5
 
 
 def test_extractor_stops_before_asr_when_vocal_stem_has_no_voice(tmp_path) -> None:

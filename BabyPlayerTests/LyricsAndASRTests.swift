@@ -96,6 +96,115 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
+    func testSmartSkipDefaultsOnAndRespectsStoredOff() {
+        XCTAssertTrue(BabyPlayerSmartSkipDefaultPolicy.resolvedValue(storedValue: nil))
+        XCTAssertTrue(BabyPlayerSmartSkipDefaultPolicy.resolvedValue(storedValue: true))
+        XCTAssertFalse(BabyPlayerSmartSkipDefaultPolicy.resolvedValue(storedValue: false))
+    }
+
+    func testPlaybackBoundaryPriorityIsChapterThenSmartThenManual() {
+        XCTAssertEqual(
+            BabyPlayerPlaybackBoundaryPolicy.introTarget(
+                chapter: 8,
+                smart: 12,
+                smartEnabled: true,
+                manualSkipSeconds: 20,
+                resumeTarget: nil
+            ),
+            8
+        )
+        XCTAssertEqual(
+            BabyPlayerPlaybackBoundaryPolicy.introTarget(
+                chapter: nil,
+                smart: 12,
+                smartEnabled: true,
+                manualSkipSeconds: 20,
+                resumeTarget: nil
+            ),
+            12
+        )
+        XCTAssertEqual(
+            BabyPlayerPlaybackBoundaryPolicy.outroTarget(
+                chapter: nil,
+                smart: 170,
+                smartEnabled: false,
+                manualSkipSeconds: 20,
+                duration: 180
+            ),
+            160
+        )
+        XCTAssertEqual(
+            BabyPlayerPlaybackBoundaryPolicy.outroTarget(
+                chapter: nil,
+                smart: 170,
+                smartEnabled: true,
+                manualSkipSeconds: 20,
+                duration: 180
+            ),
+            170
+        )
+    }
+
+    func testResumeNeverSeeksBackBeforeResolvedIntro() {
+        XCTAssertEqual(
+            BabyPlayerPlaybackBoundaryPolicy.introTarget(
+                chapter: nil,
+                smart: 12,
+                smartEnabled: true,
+                manualSkipSeconds: 20,
+                resumeTarget: 48
+            ),
+            48
+        )
+    }
+
+    func testSmartBoundaryRequiresTrustedPlannerAndMatchingDuration() {
+        let trusted = BabyPlayerVoiceWindowPlan(
+            plannerVersion: "voice-window-planner-v1",
+            plannerStatus: "sparse",
+            fallbackReason: nil,
+            mediaDurationSeconds: 180,
+            analysisDurationSeconds: 180,
+            rawVocalSeconds: 120,
+            plannedASRSeconds: 130,
+            savedASRSeconds: 50,
+            asrWindowCount: 2,
+            smartIntroEndSeconds: 12,
+            smartOutroStartSeconds: 168
+        )
+
+        let stored = BabyPlayerSmartSkipBoundaryPolicy.storedBoundary(
+            from: trusted,
+            expectedMediaDuration: 180
+        )
+        XCTAssertEqual(stored?.introEndSeconds, 12)
+        XCTAssertEqual(stored?.outroStartSeconds, 168)
+
+        let mismatched = BabyPlayerSmartSkipBoundaryPolicy.storedBoundary(
+            from: trusted,
+            expectedMediaDuration: 150
+        )
+        XCTAssertNil(mismatched)
+
+        let fallback = BabyPlayerVoiceWindowPlan(
+            plannerVersion: "voice-window-planner-v1",
+            plannerStatus: "fallback",
+            fallbackReason: "vad_unavailable",
+            mediaDurationSeconds: 180,
+            analysisDurationSeconds: 180,
+            rawVocalSeconds: 0,
+            plannedASRSeconds: 180,
+            savedASRSeconds: 0,
+            asrWindowCount: 1,
+            smartIntroEndSeconds: nil,
+            smartOutroStartSeconds: nil
+        )
+        XCTAssertNil(BabyPlayerSmartSkipBoundaryPolicy.storedBoundary(
+            from: fallback,
+            expectedMediaDuration: 180
+        ))
+    }
+
     /// AI 采用成功卡只短暂确认结果，不得在单曲循环中永久遮挡画面。
     func testAdoptedAIOverlayUsesFiveSecondDisplayWindow() {
         XCTAssertEqual(BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds, 5)
@@ -210,6 +319,32 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(decoded.voiceActivityScore, 0.02)
         XCTAssertEqual(decoded.voiceActivityCoverage, 0)
         XCTAssertTrue(decoded.isPossibleInstrumentalHallucination)
+    }
+
+    func testVoiceWindowPlanSurvivesServerJSONDecodingWithoutChangingLyrics() throws {
+        var original = makeAnalysis(segments: [makeSegment("hello", at: 12)])
+        original.voiceWindowPlan = BabyPlayerVoiceWindowPlan(
+            plannerVersion: "voice-window-planner-v1",
+            plannerStatus: "sparse",
+            fallbackReason: nil,
+            mediaDurationSeconds: 180,
+            analysisDurationSeconds: 180,
+            rawVocalSeconds: 120,
+            plannedASRSeconds: 132,
+            savedASRSeconds: 48,
+            asrWindowCount: 2,
+            smartIntroEndSeconds: 10,
+            smartOutroStartSeconds: 165
+        )
+
+        let decoded = try JSONDecoder().decode(
+            BabyPlayerASRAnalysis.self,
+            from: JSONEncoder().encode(original)
+        )
+
+        XCTAssertEqual(decoded.voiceWindowPlan?.savedASRSeconds, 48)
+        XCTAssertEqual(decoded.voiceWindowPlan?.smartIntroEndSeconds, 10)
+        XCTAssertEqual(decoded.segments.first?.text, "hello")
     }
 
     /// 腾讯长 segment 必须按词级时间拆成电视可读短行，不能把一分钟文字铺满屏幕。
@@ -742,17 +877,28 @@ final class LyricsAndASRTests: XCTestCase {
         let pinned = await repository.playback(for: ordinary, media: media, selectionOrigin: .manual)
         _ = try await repository.confirm(pinned, for: media)
 
+        let smartBoundary = StoredSmartPlaybackBoundary(
+            introEndSeconds: 11,
+            outroStartSeconds: 171,
+            mediaDurationSeconds: 180,
+            plannerVersion: "voice-window-planner-v1",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
         _ = try await repository.storeASRResult(
             analyzed,
             asrEvidenceHash: "audio-hash-1",
+            smartPlaybackBoundary: smartBoundary,
             for: media
         )
 
         let reloaded = makeRepository(storage)
         let bundle = await reloaded.analysisBundle(for: media)
+        let queueBoundaries = await reloaded.smartPlaybackBoundaries(for: [media])
         let stillPinned = await reloaded.storedLyrics(for: media)
         XCTAssertEqual(bundle?.asrResult?.candidate.id, analyzed.id)
         XCTAssertEqual(bundle?.asrResult?.asrEvidenceHash, "audio-hash-1")
+        XCTAssertEqual(bundle?.smartPlaybackBoundary, smartBoundary)
+        XCTAssertEqual(queueBoundaries[media.id], smartBoundary)
         XCTAssertEqual(bundle?.pinnedOrdinaryPlayback?.candidateID, ordinary.id)
         XCTAssertEqual(stillPinned?.candidateID, ordinary.id)
         XCTAssertEqual(stillPinned?.selectionOrigin, .manual)

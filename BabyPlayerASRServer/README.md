@@ -69,7 +69,7 @@ DATABASE_PATH="$TEST_DATABASE_DIR/test.sqlite3" PRODUCT_ENV=test \
   python -m pytest -q -p no:cacheprovider
 ```
 
-当前结果：54 项通过。测试目录只包含本次 SQLite，可在完成后删除。
+当前结果：63 项通过。测试目录只包含本次 SQLite，可在完成后删除。
 
 ### Mac 本地开发
 
@@ -103,15 +103,17 @@ Apple TV 提示 `-1004` 表示连不上 Mac 服务，不是腾讯 ASR 识别拒�
 Mac Debug 默认执行以下路径：
 
 ```text
-原视频歌曲范围
-  → 一次精确 seek 并解码为 44.1 kHz PCM/WAV
+完整原视频（不受家长片头/片尾秒数裁剪）
+  → 一次解码为 44.1 kHz PCM/WAV
   → python-audio-separator 0.44.5 + Kim_Vocal_2.onnx 提取 vocals stem
   → faster-whisper 内置 Silero VAD v6 分析人声轨
-  → 从同一无损人声轨独立编码腾讯 60/5 分片
+  → Voice Window Planner 过滤短噪声、合并短 gap 并增加首尾 safety padding
+  → 只在规划的人声窗口内复用腾讯 60/5 分片与原 offset 时间轴
 ```
 
 这一路径不下载 Whisper 转写模型。`/health` 应同时显示
-`voice_activity_configured=true`、`vocal_separation_configured=true` 和
+`voice_activity_configured=true`、`sparse_asr_configured=true`、
+`vocal_separation_configured=true` 和
 `vocal_separation_model_ready=true`。任一项为 false 都应先修复本机依赖，不要继续消耗腾讯额度。
 
 具体规则：
@@ -119,6 +121,10 @@ Mac Debug 默认执行以下路径：
 - 人声覆盖率低于 0.03 且平均概率低于 0.05 时，返回 `NO_VOCALS_DETECTED`，不调腾讯。
 - 每个 ASR word 保存 `voice_activity_score`、`voice_activity_coverage` 和 `quality_flags`；
   整体响应另存 `audio_preprocessing`。
+- Planner 失败、没有可信窗口或窗口越界时自动回到原完整歌曲 ASR；失败只会少省额度，
+  不会让现有歌词链路失效。
+- `voice_window_plan` 返回原始人声秒数、实际提交秒数、节省秒数和保守的片头/片尾候选；
+  当前阶段不改变播放器跳过行为。
 - 连续至少 3 个词同时低于 0.15 分数且活动覆盖低于 0.25 时，标为
   `possible_instrumental_hallucination`。
 - vocals stem 仍可泄漏短促音高；弱分数、短覆盖的 `BB/DD/Dee/E` 类残留会被额外标记，

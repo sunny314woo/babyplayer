@@ -122,6 +122,42 @@ class Settings:
     local_voice_activity_maximum_low_coverage: float = float(
         os.getenv("LOCAL_VOICE_ACTIVITY_MAXIMUM_LOW_COVERAGE", "0.25")
     )
+    # Sparse ASR is used only when VAD produced a trustworthy plan. Every planner
+    # failure falls back to the existing complete-song chunk path.
+    local_sparse_asr_enabled: bool = _boolean("LOCAL_SPARSE_ASR_ENABLED", True)
+    local_voice_window_minimum_speech_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_MINIMUM_SPEECH_SECONDS", "0.18")
+    )
+    local_voice_window_merge_gap_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_MERGE_GAP_SECONDS", "2.0")
+    )
+    local_voice_window_padding_before_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_PADDING_BEFORE_SECONDS", "1.5")
+    )
+    local_voice_window_padding_after_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_PADDING_AFTER_SECONDS", "1.5")
+    )
+    local_voice_window_stable_body_gap_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_STABLE_BODY_GAP_SECONDS", "4.0")
+    )
+    local_voice_window_stable_body_minimum_span_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_STABLE_BODY_MINIMUM_SPAN_SECONDS", "10.0")
+    )
+    local_voice_window_stable_body_minimum_speech_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_STABLE_BODY_MINIMUM_SPEECH_SECONDS", "6.0")
+    )
+    local_voice_window_stable_body_minimum_density: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_STABLE_BODY_MINIMUM_DENSITY", "0.35")
+    )
+    local_voice_window_boundary_safety_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_BOUNDARY_SAFETY_SECONDS", "1.0")
+    )
+    local_voice_window_minimum_skip_seconds: float = float(
+        os.getenv("LOCAL_VOICE_WINDOW_MINIMUM_SKIP_SECONDS", "3.0")
+    )
+    local_voice_window_maximum_count: int = int(
+        os.getenv("LOCAL_VOICE_WINDOW_MAXIMUM_COUNT", "32")
+    )
 
     @property
     def auth_enabled(self) -> bool:

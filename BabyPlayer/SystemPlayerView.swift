@@ -523,6 +523,23 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         return queueItems[currentIndex]
     }
 
+    /// 将刚完成分析的边界写回内存队列；片尾可立即生效，片头从下次循环或重新播放起生效。
+    private func updateSmartPlaybackBoundary(
+        _ boundary: StoredSmartPlaybackBoundary?,
+        mediaFingerprint: String
+    ) {
+        for index in queueItems.indices
+        where queueItems[index].lyricsMedia.asrFingerprint == mediaFingerprint {
+            queueItems[index].smartIntroEndSeconds = boundary?.introEndSeconds
+            queueItems[index].smartOutroStartSeconds = boundary?.outroStartSeconds
+        }
+        for index in originalQueueItems.indices
+        where originalQueueItems[index].lyricsMedia.asrFingerprint == mediaFingerprint {
+            originalQueueItems[index].smartIntroEndSeconds = boundary?.introEndSeconds
+            originalQueueItems[index].smartOutroStartSeconds = boundary?.outroStartSeconds
+        }
+    }
+
     /// 判断当前播放媒体；输入为 media fingerprint，输出是否仍为同一声音来源，不修改状态。
     // 【MODIFIED】循环重建 queue item 时使用稳定 fingerprint，而不是播放器实例生命周期。
     private func isCurrentMedia(fingerprint: String) -> Bool {
@@ -549,9 +566,12 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         let resumeTarget = currentPlayNumber == 1 && queueItem.id == initialItemID
             ? selection.startPositionSeconds
             : nil
-        let introTarget = max(
-            queueItem.chapterIntroEndSeconds ?? selection.introSkipSeconds,
-            resumeTarget ?? 0
+        let introTarget = BabyPlayerPlaybackBoundaryPolicy.introTarget(
+            chapter: queueItem.chapterIntroEndSeconds,
+            smart: queueItem.smartIntroEndSeconds,
+            smartEnabled: selection.smartSkipEnabled,
+            manualSkipSeconds: selection.introSkipSeconds,
+            resumeTarget: resumeTarget
         )
         if introTarget > 0 {
             player?.seek(
@@ -591,17 +611,13 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             return
         }
 
-        let outroTarget: Double?
-        if let chapterTarget = queueItem.chapterOutroStartSeconds {
-            outroTarget = chapterTarget
-        } else if selection.outroSkipSeconds > 0,
-                  let duration = player?.currentItem?.duration.seconds,
-                  duration.isFinite,
-                  duration > selection.outroSkipSeconds {
-            outroTarget = duration - selection.outroSkipSeconds
-        } else {
-            outroTarget = nil
-        }
+        let outroTarget = BabyPlayerPlaybackBoundaryPolicy.outroTarget(
+            chapter: queueItem.chapterOutroStartSeconds,
+            smart: queueItem.smartOutroStartSeconds,
+            smartEnabled: selection.smartSkipEnabled,
+            manualSkipSeconds: selection.outroSkipSeconds,
+            duration: player?.currentItem?.duration.seconds
+        )
 
         if let outroTarget, elapsed >= outroTarget {
             isAdvancing = true
@@ -1527,11 +1543,19 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 let bundle = try await BabyLyricsRepository.shared.storeASRResult(
                     candidate,
                     asrEvidenceHash: analysis.evidenceHash,
+                    smartPlaybackBoundary: BabyPlayerSmartSkipBoundaryPolicy.storedBoundary(
+                        from: analysis.voiceWindowPlan,
+                        expectedMediaDuration: item.lyricsMedia.durationSeconds
+                    ),
                     for: item.lyricsMedia
                 )
                 guard let storedASR = bundle.asrResult else {
                     throw BabyPlayerASRError.invalidResponse
                 }
+                self.updateSmartPlaybackBoundary(
+                    bundle.smartPlaybackBoundary,
+                    mediaFingerprint: fingerprint
+                )
                 asrResult = storedASR
                 if self.isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint) {
                     self.analysisBundle = bundle

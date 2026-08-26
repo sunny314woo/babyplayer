@@ -12,6 +12,7 @@ from app.config import Settings
 from app.database import AsrRepository, Usage
 from app.tencent_asr import TencentAsrError
 from app.voice_activity import annotate_asr_segments, voice_activity_summary
+from app.voice_window_planner import PLANNER_VERSION
 
 
 class AudioValidationError(Exception):
@@ -90,12 +91,31 @@ class AsrService:
             f"|source:{config.local_vocal_separation_version}"
             if config.local_vocal_separation_enabled else ""
         )
+        planner_shape = ""
+        if config.local_sparse_asr_enabled and config.local_voice_activity_enabled:
+            planner_settings = "|".join(str(value) for value in (
+                config.local_voice_window_minimum_speech_seconds,
+                config.local_voice_window_merge_gap_seconds,
+                config.local_voice_window_padding_before_seconds,
+                config.local_voice_window_padding_after_seconds,
+                config.local_voice_window_stable_body_gap_seconds,
+                config.local_voice_window_stable_body_minimum_span_seconds,
+                config.local_voice_window_stable_body_minimum_speech_seconds,
+                config.local_voice_window_stable_body_minimum_density,
+                config.local_voice_window_boundary_safety_seconds,
+                config.local_voice_window_minimum_skip_seconds,
+                config.local_voice_window_maximum_count,
+            ))
+            planner_digest = hashlib.sha256(
+                planner_settings.encode("utf-8")
+            ).hexdigest()[:10]
+            planner_shape = f"|planner:{PLANNER_VERSION}:{planner_digest}"
         # Cache identity changes when either the declared analysis algorithm or the
         # deterministic Mac chunk timeline changes. Existing whole-song v1 rows stay
         # intact but cannot mask the first complete chunked result.
         self.analysis_version = (
             f"{config.analysis_version}|{config.asr_timeline_version}"
-            f"{source_shape}|{chunk_shape}"
+            f"{source_shape}|{chunk_shape}{planner_shape}"
         )
         self._semaphore = threading.BoundedSemaphore(config.max_concurrency)
         self._provider_request_limiter = (
@@ -517,17 +537,24 @@ def merge_chunk_recognitions(
     if len(chunks) != len(recognitions) or not chunks:
         raise TencentAsrError("Tencent ASR chunk result count is invalid")
     ordered = sorted(zip(chunks, recognitions), key=lambda value: value[0].index)
-    boundaries = []
-    for (left, _), (right, _) in zip(ordered, ordered[1:]):
-        if right.offset_seconds > left.end_seconds + 0.05:
-            raise TencentAsrError("ASR chunk plan left a gap in the song timeline")
-        boundaries.append((left.end_seconds + right.offset_seconds) / 2)
+    ownership = []
+    for position, (chunk, _) in enumerate(ordered):
+        owner_start = chunk.offset_seconds
+        owner_end = chunk.end_seconds
+        if position > 0:
+            previous = ordered[position - 1][0]
+            if chunk.offset_seconds < previous.end_seconds:
+                owner_start = (previous.end_seconds + chunk.offset_seconds) / 2
+        if position + 1 < len(ordered):
+            following = ordered[position + 1][0]
+            if following.offset_seconds < chunk.end_seconds:
+                owner_end = (chunk.end_seconds + following.offset_seconds) / 2
+        ownership.append((owner_start, owner_end))
 
     word_candidates: list[dict] = []
     text_candidates: list[dict] = []
     for position, (chunk, recognition) in enumerate(ordered):
-        owner_start = boundaries[position - 1] if position > 0 else 0.0
-        owner_end = boundaries[position] if position < len(boundaries) else duration_seconds
+        owner_start, owner_end = ownership[position]
         for segment_index, segment in enumerate(recognition.segments):
             try:
                 local_segment_start = float(segment.get("start_seconds", 0))
@@ -658,8 +685,7 @@ def merge_chunk_recognitions(
             text = " ".join(str(recognition.transcript or "").split())
             if not text:
                 continue
-            owner_start = boundaries[position - 1] if position > 0 else 0.0
-            owner_end = boundaries[position] if position < len(boundaries) else duration_seconds
+            owner_start, owner_end = ownership[position]
             segments.append({
                 "group": None,
                 "text": text,
@@ -722,6 +748,19 @@ def annotate_audio_preprocessing(
         "model": str(evidence.get("model") or "")[:256] or None,
         "vocal_coverage": evidence.get("vocal_coverage"),
         "vocal_mean_probability": evidence.get("vocal_mean_probability"),
+        "planner_version": str(evidence.get("planner_version") or "")[:128] or None,
+        "planner_status": str(evidence.get("planner_status") or "")[:64] or None,
+        "planner_fallback_reason": (
+            str(evidence.get("planner_fallback_reason") or "")[:128] or None
+        ),
+        "media_duration_seconds": evidence.get("media_duration_seconds"),
+        "analysis_duration_seconds": evidence.get("analysis_duration_seconds"),
+        "raw_vocal_seconds": evidence.get("raw_vocal_seconds"),
+        "planned_asr_seconds": evidence.get("planned_asr_seconds"),
+        "saved_asr_seconds": evidence.get("saved_asr_seconds"),
+        "asr_window_count": evidence.get("asr_window_count"),
+        "smart_intro_end_seconds": evidence.get("smart_intro_end_seconds"),
+        "smart_outro_start_seconds": evidence.get("smart_outro_start_seconds"),
     }
     return [
         {**segment, "audio_preprocessing": allowed}
@@ -740,6 +779,25 @@ def audio_preprocessing_summary(segments: list[dict]) -> dict | None:
     )
 
 
+def voice_window_plan_summary(segments: list[dict]) -> dict | None:
+    preprocessing = audio_preprocessing_summary(segments)
+    if not preprocessing or not preprocessing.get("planner_status"):
+        return None
+    return {
+        "planner_version": preprocessing.get("planner_version") or "unknown",
+        "planner_status": preprocessing["planner_status"],
+        "fallback_reason": preprocessing.get("planner_fallback_reason"),
+        "media_duration_seconds": preprocessing.get("media_duration_seconds"),
+        "analysis_duration_seconds": preprocessing.get("analysis_duration_seconds"),
+        "raw_vocal_seconds": preprocessing.get("raw_vocal_seconds") or 0,
+        "planned_asr_seconds": preprocessing.get("planned_asr_seconds") or 0,
+        "saved_asr_seconds": preprocessing.get("saved_asr_seconds") or 0,
+        "asr_window_count": preprocessing.get("asr_window_count") or 0,
+        "smart_intro_end_seconds": preprocessing.get("smart_intro_end_seconds"),
+        "smart_outro_start_seconds": preprocessing.get("smart_outro_start_seconds"),
+    }
+
+
 def response_payload(
     *, cache_hit: bool, engine_type: str, duration_seconds: float,
     transcript: str, segments: list[dict], audio_sha256: str | None,
@@ -755,6 +813,7 @@ def response_payload(
         "segments": segments,
         "voice_activity": voice_activity_summary(segments),
         "audio_preprocessing": audio_preprocessing_summary(segments),
+        "voice_window_plan": voice_window_plan_summary(segments),
         "audio_sha256": audio_sha256,
         "media_content_sha256": media_content_sha256,
         "monthly_used_seconds": usage.used_seconds,

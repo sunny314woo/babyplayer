@@ -172,6 +172,11 @@ def create_app(
                 config.local_voice_activity_enabled
                 and SileroVoiceActivityDetector.available()
             ),
+            "sparse_asr_configured": bool(
+                config.local_sparse_asr_enabled
+                and config.local_voice_activity_enabled
+                and SileroVoiceActivityDetector.available()
+            ),
             "vocal_separation_configured": bool(
                 config.local_vocal_separation_enabled
                 and LocalVocalStemSeparator.available()
