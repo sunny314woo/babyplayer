@@ -643,6 +643,24 @@ enum BabyPlayerLyricsLanguagePolicy {
         guard Double(asciiWords.count) / Double(words.count) >= 0.8 else { return false }
         return asciiWords.contains(where: englishEvidenceWords.contains)
     }
+
+    /// 中文原文只用来选择展示模式；不会触发翻译或改变任何时间字段。
+    static func isPredominantlyChinese(_ lines: [TimedLyricLine]) -> Bool {
+        let scalars = lines.flatMap { $0.text.unicodeScalars }
+        let letters = scalars.filter { CharacterSet.letters.contains($0) }
+        let hanCount = letters.filter(isHanCharacter).count
+        guard hanCount >= 4, !letters.isEmpty else { return false }
+        return Double(hanCount) / Double(letters.count) >= 0.6
+    }
+
+    private static func isHanCharacter(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 enum BabyPlayerLyricsTranslationContract {
@@ -700,6 +718,69 @@ enum BabyPlayerBilingualLyricsComposer {
             ))
         }
         return result
+    }
+}
+
+/// 播放页只根据已有的字幕内容决定默认模式；不会触发网络或改写英文时间轴。
+enum BabyPlayerLyricsPresentationPolicy {
+    static func preferredMode(
+        subtitlesEnabled: Bool,
+        sourceLines: [TimedLyricLine],
+        bilingualLines: [BilingualLyricLine]?
+    ) -> BabyPlayerLyricsMode {
+        guard subtitlesEnabled else { return .off }
+        if bilingualLines?.isEmpty == false { return .bilingual }
+        if BabyPlayerLyricsLanguagePolicy.isPredominantlyChinese(sourceLines) { return .chinese }
+        return sourceLines.isEmpty ? .off : .english
+    }
+
+    static func availableModes(
+        sourceLines: [TimedLyricLine],
+        bilingualLines: [BilingualLyricLine]?
+    ) -> [BabyPlayerLyricsMode] {
+        if bilingualLines?.isEmpty == false {
+            return [.bilingual, .english, .chinese, .off]
+        }
+        if BabyPlayerLyricsLanguagePolicy.isPredominantlyChinese(sourceLines) {
+            return [.chinese, .off]
+        }
+        if !sourceLines.isEmpty {
+            return [.english, .off]
+        }
+        return [.off]
+    }
+
+    static func displayText(
+        mode: BabyPlayerLyricsMode,
+        sourceText: String,
+        bilingualLine: BilingualLyricLine?
+    ) -> String? {
+        switch mode {
+        case .off:
+            return nil
+        case .english:
+            return bilingualLine?.englishText ?? sourceText
+        case .chinese:
+            return bilingualLine?.chineseText ?? sourceText
+        case .bilingual:
+            guard let bilingualLine else { return sourceText }
+            return bilingualLine.englishText + "\n" + bilingualLine.chineseText
+        }
+    }
+}
+
+enum BabyPlayerLyricsSourceMenuPolicy {
+    /// 当前候选在上方单独展示；其他候选保留 LRCLIB 的原排名和原序。
+    static func rankedAlternatives(
+        _ candidates: [LyricsCandidate],
+        currentCandidateID: Int?,
+        currentLyricIdentifier: String?
+    ) -> [(rank: Int, candidate: LyricsCandidate)] {
+        candidates.enumerated().compactMap { index, candidate in
+            let isCurrent = candidate.id == currentCandidateID
+                || candidate.persistentIdentifier == currentLyricIdentifier
+            return isCurrent ? nil : (index + 1, candidate)
+        }
     }
 }
 

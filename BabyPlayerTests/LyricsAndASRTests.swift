@@ -895,6 +895,122 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertFalse(BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish([]))
     }
 
+    func testChineseLyricsLanguageDetectionIsDeterministicAndConservative() {
+        XCTAssertTrue(BabyPlayerLyricsLanguagePolicy.isPredominantlyChinese([
+            TimedLyricLine(time: 0, text: "一闪一闪亮晶晶"),
+            TimedLyricLine(time: 2, text: "满天都是小星星")
+        ]))
+        XCTAssertFalse(BabyPlayerLyricsLanguagePolicy.isPredominantlyChinese([
+            TimedLyricLine(time: 0, text: "Twinkle twinkle little star"),
+            TimedLyricLine(time: 2, text: "How I wonder what you are")
+        ]))
+        XCTAssertFalse(BabyPlayerLyricsLanguagePolicy.isPredominantlyChinese([]))
+    }
+
+    func testLyricsPresentationDefaultsToBilingualThenEnglishThenChinese() {
+        let english = [
+            TimedLyricLine(time: 0, text: "The wheels on the bus go round and round")
+        ]
+        let chinese = [
+            TimedLyricLine(time: 0, text: "巴士的轮子转呀转")
+        ]
+        let bilingual = [
+            BilingualLyricLine(
+                identifier: "line-0",
+                startSeconds: 0,
+                endSeconds: 2,
+                englishText: english[0].text,
+                chineseText: chinese[0].text
+            )
+        ]
+
+        XCTAssertEqual(BabyPlayerLyricsPresentationPolicy.preferredMode(
+            subtitlesEnabled: true,
+            sourceLines: english,
+            bilingualLines: bilingual
+        ), .bilingual)
+        XCTAssertEqual(BabyPlayerLyricsPresentationPolicy.preferredMode(
+            subtitlesEnabled: true,
+            sourceLines: english,
+            bilingualLines: nil
+        ), .english)
+        XCTAssertEqual(BabyPlayerLyricsPresentationPolicy.preferredMode(
+            subtitlesEnabled: true,
+            sourceLines: chinese,
+            bilingualLines: nil
+        ), .chinese)
+        XCTAssertEqual(BabyPlayerLyricsPresentationPolicy.preferredMode(
+            subtitlesEnabled: false,
+            sourceLines: english,
+            bilingualLines: bilingual
+        ), .off)
+        XCTAssertEqual(
+            BabyPlayerLyricsPresentationPolicy.availableModes(
+                sourceLines: english,
+                bilingualLines: bilingual
+            ),
+            [.bilingual, .english, .chinese, .off]
+        )
+    }
+
+    func testLyricsPresentationRendersEachLanguageWithoutChangingSourceLine() {
+        let bilingual = BilingualLyricLine(
+            identifier: "line-0",
+            startSeconds: 12,
+            endSeconds: 15,
+            englishText: "The wheels on the bus",
+            chineseText: "巴士的轮子"
+        )
+
+        XCTAssertEqual(BabyPlayerLyricsPresentationPolicy.displayText(
+            mode: .english,
+            sourceText: bilingual.englishText,
+            bilingualLine: bilingual
+        ), "The wheels on the bus")
+        XCTAssertEqual(BabyPlayerLyricsPresentationPolicy.displayText(
+            mode: .chinese,
+            sourceText: bilingual.englishText,
+            bilingualLine: bilingual
+        ), "巴士的轮子")
+        XCTAssertEqual(BabyPlayerLyricsPresentationPolicy.displayText(
+            mode: .bilingual,
+            sourceText: bilingual.englishText,
+            bilingualLine: bilingual
+        ), "The wheels on the bus\n巴士的轮子")
+        XCTAssertNil(BabyPlayerLyricsPresentationPolicy.displayText(
+            mode: .off,
+            sourceText: bilingual.englishText,
+            bilingualLine: bilingual
+        ))
+        XCTAssertEqual(bilingual.startSeconds, 12)
+        XCTAssertEqual(bilingual.endSeconds, 15)
+    }
+
+    func testLyricsSourceMenuRemovesCurrentCandidateAndPreservesOriginalRanks() {
+        let candidates = [
+            makeCandidate(id: 1, title: "First", words: "first lyric words"),
+            makeCandidate(id: 2, title: "Current", words: "current lyric words"),
+            makeCandidate(id: 3, title: "Third", words: "third lyric words")
+        ]
+
+        let alternatives = BabyPlayerLyricsSourceMenuPolicy.rankedAlternatives(
+            candidates,
+            currentCandidateID: 2,
+            currentLyricIdentifier: nil
+        )
+
+        XCTAssertEqual(alternatives.map(\.candidate.id), [1, 3])
+        XCTAssertEqual(alternatives.map(\.rank), [1, 3])
+        XCTAssertEqual(
+            BabyPlayerLyricsSourceMenuPolicy.rankedAlternatives(
+                candidates,
+                currentCandidateID: nil,
+                currentLyricIdentifier: candidates[1].persistentIdentifier
+            ).map(\.candidate.id),
+            [1, 3]
+        )
+    }
+
     func testBilingualCompositionCopiesEnglishTimelineOrderAndTextExactly() {
         let candidate = makeEnglishTranslationCandidate()
         let english = StoredLyricsAnalysisResult(

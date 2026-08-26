@@ -813,11 +813,12 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         let isSameFingerprint = preparedLyricsFingerprint == fingerprint
         // 【MODIFIED】单曲循环只重建 AVPlayerItem，完整保留当前歌词、候选和分析状态。
         if isSameFingerprint {
-            currentLyricsMode = mode
             currentLyricIndex = nil
-            if mode == .off {
+            if currentLyricsMode == .off {
                 lyricsContainer?.isHidden = true
                 lyricsLabel?.text = nil
+            } else if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
+                updateLyrics(at: elapsed)
             }
             updateLyricsTransportMenu()
             return
@@ -916,7 +917,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
             self.isSearchingLyrics = false
             self.lyricPlayback = playback
-            if self.currentLyricsMode != .off, let playback {
+            if let playback {
                 self.lyricLines = playback.lines
                 if let english = storedAnalysis?.deepSeekResult,
                    playback.lyricIdentifier == english.candidate.persistentIdentifier,
@@ -928,7 +929,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 } else {
                     self.bilingualLyricLines = nil
                 }
-                if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
+                self.currentLyricsMode = BabyPlayerLyricsPresentationPolicy.preferredMode(
+                    subtitlesEnabled: self.currentLyricsMode != .off,
+                    sourceLines: self.lyricLines,
+                    bilingualLines: self.bilingualLyricLines
+                )
+                if self.currentLyricsMode != .off,
+                   let elapsed = self.player?.currentTime().seconds,
+                   elapsed.isFinite {
                     self.updateLyrics(at: elapsed)
                 }
             }
@@ -1001,7 +1009,6 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             self.asrAnalysisStatus = bundle?.asrResult == nil ? .notRun : .completed
             self.deepSeekAnalysisStatus = bundle?.deepSeekResult == nil ? .notRun : .completed
             if let playback, bundle?.deepSeekResult != nil {
-                self.currentLyricsMode = .english
                 self.lyricPlayback = playback
                 self.lyricLines = playback.lines
                 if let english = bundle?.deepSeekResult,
@@ -1013,17 +1020,23 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 } else {
                     self.bilingualLyricLines = nil
                 }
+                self.currentLyricsMode = BabyPlayerLyricsPresentationPolicy.preferredMode(
+                    subtitlesEnabled: self.currentLyricsMode != .off,
+                    sourceLines: self.lyricLines,
+                    bilingualLines: self.bilingualLyricLines
+                )
                 self.currentLyricIndex = nil
-                if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
+                if self.currentLyricsMode != .off,
+                   let elapsed = self.player?.currentTime().seconds,
+                   elapsed.isFinite {
                     self.updateLyrics(at: elapsed)
                 }
+                let bilingualEnabled = self.currentLyricsMode == .bilingual
                 self.showManualAnalysisMessage(
-                    self.bilingualLyricLines == nil
-                        ? "DeepSeek：后台分析已完成"
-                        : "双语字幕已自动启用",
-                    detail: self.bilingualLyricLines == nil
-                        ? "✓ 结果已保存并用于当前字幕"
-                        : "✓ 英文字幕已保留\n✓ 简体中文字幕已启用",
+                    bilingualEnabled ? "双语字幕已自动启用" : "DeepSeek：后台分析已完成",
+                    detail: bilingualEnabled
+                        ? "✓ 英文字幕已保留\n✓ 简体中文字幕已启用"
+                        : "✓ 结果已保存，字幕显示设置未改变",
                     autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
                 )
             } else if bundle?.asrResult != nil {
@@ -1038,6 +1051,11 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
 
     private func updateLyrics(at elapsed: Double) {
+        guard currentLyricsMode != .off else {
+            lyricsContainer?.isHidden = true
+            lyricsLabel?.text = nil
+            return
+        }
         guard elapsed.isFinite, !lyricLines.isEmpty else { return }
         let adjustedElapsed = elapsed - (lyricPlayback?.offsetSeconds ?? 0)
         let index = BabyPlayerLyricTimeline.visibleLineIndex(
@@ -1050,62 +1068,104 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             lyricsContainer?.isHidden = true
             return
         }
+        let bilingualLine: BilingualLyricLine?
         if let bilingualLyricLines,
            bilingualLyricLines.indices.contains(index),
            bilingualLyricLines[index].englishText == lyricLines[index].text {
-            lyricsLabel?.text = bilingualLyricLines[index].englishText
-                + "\n" + bilingualLyricLines[index].chineseText
+            bilingualLine = bilingualLyricLines[index]
         } else {
-            lyricsLabel?.text = lyricLines[index].text
+            bilingualLine = nil
         }
+        lyricsLabel?.text = BabyPlayerLyricsPresentationPolicy.displayText(
+            mode: currentLyricsMode,
+            sourceText: lyricLines[index].text,
+            bilingualLine: bilingualLine
+        )
         lyricsContainer?.isHidden = false
     }
 
     private func updateLyricsTransportMenu() {
-        let isVisible = currentLyricsMode != .off
-        let visibility = UIAction(
-            title: isVisible ? "显示字幕：开" : "显示字幕：关",
-            image: UIImage(systemName: isVisible ? "captions.bubble.fill" : "captions.bubble")
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.setLyricsMode(isVisible ? .off : .english)
-        }
-        visibility.state = isVisible ? .on : .off
-
-        let english = UIAction(title: "英文", image: UIImage(systemName: "character.book.closed")) { [weak self] _ in
-            self?.setLyricsMode(.english)
-        }
-        english.state = currentLyricsMode == .english ? .on : .off
-
-        let chinese = UIAction(title: "中文（待接入翻译服务）") { _ in }
-        chinese.attributes = .disabled
-        chinese.state = currentLyricsMode == .chinese ? .on : .off
-
-        let bilingual = UIAction(title: "中英双语（待接入翻译服务）") { _ in }
-        bilingual.attributes = .disabled
-        bilingual.state = currentLyricsMode == .bilingual ? .on : .off
-
         // AVKit 不支持 transportBarCustomMenuItems 的嵌套菜单，因此保持单层遥控器选项。
-        var children: [UIMenuElement] = [visibility, english, chinese, bilingual]
-
-        if let media = currentQueueItem?.lyricsMedia {
-            let hints = [media.sourceHint, media.versionHint].compactMap { $0 }
-            if !hints.isEmpty {
-                let detected = UIAction(
-                    title: "文件名线索：\(hints.joined(separator: " · "))",
-                    image: UIImage(systemName: "tag")
-                ) { _ in }
-                detected.attributes = .disabled
-                children.append(detected)
+        let modes = BabyPlayerLyricsPresentationPolicy.availableModes(
+            sourceLines: lyricLines,
+            bilingualLines: bilingualLyricLines
+        )
+        var children: [UIMenuElement] = modes.map { mode in
+            let action = UIAction(
+                title: mode == .off ? "关闭字幕" : mode.rawValue,
+                image: UIImage(systemName: lyricsModeSymbol(mode))
+            ) { [weak self] _ in
+                self?.setLyricsMode(mode)
             }
+            action.state = currentLyricsMode == mode ? .on : .off
+            return action
         }
 
-        let candidatesTitle = UIAction(
-            title: "声音时间轴优先 · 3 份网络歌词 + 可选歌本兜底",
+        let currentSourceTitle = UIAction(
+            title: "当前歌词来源",
+            image: UIImage(systemName: "checkmark.seal")
+        ) { _ in }
+        currentSourceTitle.attributes = .disabled
+        children.append(currentSourceTitle)
+
+        if let playback = lyricPlayback {
+            let title: String
+            switch playback.selectionOrigin {
+            case .automatic:
+                title = "普通网络歌词 · 临时"
+            case .asr:
+                title = "\(currentAdoptedAnalysisSource()?.displayName ?? "AI 分析")字幕"
+            case .manual:
+                title = playback.isConfirmed ? "已固定的普通歌词" : "普通歌词 · 未固定"
+            }
+            let current = UIAction(
+                title: title,
+                subtitle: "\(playback.trackName) · \(playback.lines.count) 行",
+                image: UIImage(systemName: "checkmark.seal.fill"),
+                state: .on
+            ) { _ in }
+            current.attributes = .disabled
+            children.append(current)
+
+            if !playback.isConfirmed {
+                let confirm = UIAction(
+                    title: "固定为这首视频的默认歌词",
+                    image: UIImage(systemName: "pin.fill")
+                ) { [weak self] _ in
+                    self?.confirmCurrentLyrics()
+                }
+                children.append(confirm)
+            }
+        } else {
+            let unavailable = UIAction(
+                title: "暂无已采用歌词",
+                image: UIImage(systemName: "questionmark.circle")
+            ) { _ in }
+            unavailable.attributes = .disabled
+            children.append(unavailable)
+        }
+
+        let alternativesTitle = UIAction(
+            title: "其他歌词来源 · AI 参考候选",
             image: UIImage(systemName: "list.number")
         ) { _ in }
-        candidatesTitle.attributes = .disabled
-        children.append(candidatesTitle)
+        alternativesTitle.attributes = .disabled
+        children.append(alternativesTitle)
+
+        if let pinned = analysisBundle?.pinnedOrdinaryPlayback {
+            let isCurrentPinned = lyricPlayback?.selectionOrigin == .manual
+                && lyricPlayback?.lyricIdentifier == pinned.lyricIdentifier
+            if !isCurrentPinned {
+                let pinnedAction = UIAction(
+                    title: "切换回已固定的普通歌词",
+                    subtitle: pinned.trackName,
+                    image: UIImage(systemName: "pin.fill")
+                ) { [weak self] _ in
+                    self?.restorePinnedOrdinaryLyrics()
+                }
+                children.append(pinnedAction)
+            }
+        }
 
         if isSearchingLyrics {
             let searching = UIAction(
@@ -1122,96 +1182,24 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             unavailable.attributes = .disabled
             children.append(unavailable)
         } else {
-            children.append(contentsOf: lyricCandidates.enumerated().map { index, candidate in
-                lyricsCandidateAction(candidate, rank: index + 1)
+            let alternatives = BabyPlayerLyricsSourceMenuPolicy.rankedAlternatives(
+                lyricCandidates,
+                currentCandidateID: lyricPlayback?.candidateID,
+                currentLyricIdentifier: lyricPlayback?.lyricIdentifier
+            )
+            children.append(contentsOf: alternatives.map { ranked in
+                lyricsCandidateAction(ranked.candidate, rank: ranked.rank)
             })
         }
 
         let refresh = UIAction(
-            title: "重新搜索歌词",
+            title: "重新搜索网络歌词",
             image: UIImage(systemName: "arrow.clockwise")
         ) { [weak self] _ in
             self?.refreshLyricsCandidates()
         }
         if isSearchingLyrics { refresh.attributes = .disabled }
         children.append(refresh)
-
-        if let pinned = analysisBundle?.pinnedOrdinaryPlayback {
-            let isCurrentPinned = lyricPlayback?.selectionOrigin == .manual
-                && lyricPlayback?.lyricIdentifier == pinned.lyricIdentifier
-            let pinnedAction = UIAction(
-                title: isCurrentPinned ? "已固定普通歌词" : "切换回已固定的普通歌词",
-                subtitle: pinned.trackName,
-                image: UIImage(systemName: "pin.fill")
-            ) { [weak self] _ in
-                self?.restorePinnedOrdinaryLyrics()
-            }
-            pinnedAction.state = isCurrentPinned ? .on : .off
-            children.append(pinnedAction)
-        }
-
-        if let playback = lyricPlayback {
-            let offset = playback.offsetSeconds
-            let statusTitle: String
-            switch playback.selectionOrigin {
-            case .automatic:
-                statusTitle = "普通歌词·临时选择"
-            case .asr:
-                statusTitle = "\(currentAdoptedAnalysisSource()?.displayName ?? "分析")字幕·已采用"
-            case .manual:
-                statusTitle = playback.isConfirmed ? "普通歌词·已固定" : "已选择·未固定"
-            }
-            let status = UIAction(
-                title: "\(statusTitle)  总计 \(formattedOffset(offset)) · 自动 \(formattedOffset(playback.autoOffsetSeconds)) · 手动 \(formattedOffset(playback.manualAdjustmentSeconds))",
-                image: UIImage(systemName: playback.selectionOrigin == .asr || playback.isConfirmed
-                    ? "checkmark.circle.fill"
-                    : "questionmark.circle")
-            ) { _ in }
-            status.attributes = .disabled
-
-            let earlierHalf = UIAction(title: "歌词提前 0.5 秒", image: UIImage(systemName: "gobackward.5")) { [weak self] _ in
-                self?.adjustLyricsOffset(by: -0.5)
-            }
-            let earlierTenth = UIAction(title: "歌词提前 0.1 秒", image: UIImage(systemName: "minus.circle")) { [weak self] _ in
-                self?.adjustLyricsOffset(by: -0.1)
-            }
-            let laterTenth = UIAction(title: "歌词延后 0.1 秒", image: UIImage(systemName: "plus.circle")) { [weak self] _ in
-                self?.adjustLyricsOffset(by: 0.1)
-            }
-            let laterHalf = UIAction(title: "歌词延后 0.5 秒", image: UIImage(systemName: "goforward.5")) { [weak self] _ in
-                self?.adjustLyricsOffset(by: 0.5)
-            }
-            let reset = UIAction(title: "恢复原时间", image: UIImage(systemName: "arrow.counterclockwise")) { [weak self] _ in
-                self?.resetManualLyricsAdjustment()
-            }
-            let alignFirstLine = UIAction(
-                title: "把第一句对齐到当前位置",
-                image: UIImage(systemName: "scope")
-            ) { [weak self] _ in
-                self?.alignFirstLyricLineToCurrentTime()
-            }
-
-            var timingChildren: [UIMenuElement] = [
-                status,
-                alignFirstLine,
-                earlierHalf,
-                earlierTenth,
-                laterTenth,
-                laterHalf,
-                reset
-            ]
-            if !playback.isConfirmed {
-                let confirm = UIAction(
-                    title: "固定为这首视频的默认歌词",
-                    image: UIImage(systemName: "pin.fill")
-                ) { [weak self] _ in
-                    self?.confirmCurrentLyrics()
-                }
-                timingChildren.insert(confirm, at: 1)
-            }
-
-            children.append(contentsOf: timingChildren)
-        }
 
         transportBarCustomMenuItems = [
             UIMenu(
@@ -1587,10 +1575,15 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     }
 
     private func setLyricsMode(_ mode: BabyPlayerLyricsMode) {
-        guard mode.isCurrentlyAvailable else { return }
+        let availableModes = BabyPlayerLyricsPresentationPolicy.availableModes(
+            sourceLines: lyricLines,
+            bilingualLines: bilingualLyricLines
+        )
+        guard availableModes.contains(mode) else { return }
+        // 语言或关闭选择都是家长的明确意图，后台翻译不得再自动覆盖。
+        lyricsAutomationGuard.lockManually()
         currentLyricsMode = mode
         if mode == .off {
-            lyricLines = []
             currentLyricIndex = nil
             lyricsLabel?.text = nil
             lyricsContainer?.isHidden = true
@@ -1611,6 +1604,19 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             return
         }
         prepareLyrics(for: item, mode: mode)
+    }
+
+    private func lyricsModeSymbol(_ mode: BabyPlayerLyricsMode) -> String {
+        switch mode {
+        case .off:
+            return "captions.bubble"
+        case .english:
+            return "character.book.closed"
+        case .chinese:
+            return "character"
+        case .bilingual:
+            return "captions.bubble.fill"
+        }
     }
 
     // 【MODIFIED】以下入口是分析生命周期的唯一 UI 触发点；普通播放仍不会自动调用付费 API。
@@ -1875,10 +1881,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
            !lyricsAutomationGuard.permitsAutomaticResult(startedAt: automaticWorkflowGeneration) {
             return false
         }
-        currentLyricsMode = .english
         lyricPlayback = playback
         lyricLines = playback.lines
         bilingualLyricLines = nil
+        currentLyricsMode = BabyPlayerLyricsPresentationPolicy.preferredMode(
+            subtitlesEnabled: true,
+            sourceLines: playback.lines,
+            bilingualLines: nil
+        )
         currentLyricIndex = nil
         if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
             updateLyrics(at: elapsed)
@@ -1899,6 +1909,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             english.candidate.lines
         ) else {
             if isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint),
+               currentLyricsMode != .off,
                lyricsAutomationGuard.isCurrentGeneration(selectionGeneration) {
                 showManualAnalysisMessage(
                     "DeepSeek：已自动启用",
@@ -1957,16 +1968,19 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             analysisBundle = bundle
             bilingualLyricLines = bilingual
             currentLyricIndex = nil
-            if currentLyricsMode != .off,
-               let elapsed = player?.currentTime().seconds,
-               elapsed.isFinite {
-                updateLyrics(at: elapsed)
+            if currentLyricsMode != .off {
+                currentLyricsMode = .bilingual
+                if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
+                    updateLyrics(at: elapsed)
+                }
+                showManualAnalysisMessage(
+                    "双语字幕已自动启用",
+                    detail: "✓ 英文字幕已保留\n✓ 简体中文字幕已启用",
+                    autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
+                )
+            } else {
+                updateLyricsTransportMenu()
             }
-            showManualAnalysisMessage(
-                "双语字幕已自动启用",
-                detail: "✓ 英文字幕已保留\n✓ 简体中文字幕已启用",
-                autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
-            )
         } catch {
             guard !Task.isCancelled,
                   !didExit,
@@ -1976,10 +1990,15 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 return
             }
             bilingualLyricLines = nil
-            showManualAnalysisMessage(
-                "中文翻译暂不可用，已保留英文字幕",
-                detail: "中文翻译暂不可用，已保留英文字幕"
-            )
+            if currentLyricsMode != .off {
+                currentLyricsMode = .english
+                showManualAnalysisMessage(
+                    "中文翻译暂不可用，已保留英文字幕",
+                    detail: "中文翻译暂不可用，已保留英文字幕"
+                )
+            } else {
+                updateLyricsTransportMenu()
+            }
         }
     }
 
@@ -2079,8 +2098,12 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         guard let media = currentQueueItem?.lyricsMedia else { return }
         // 【MODIFIED】manual lock 必须在创建 Task/await repository 之前同步生效。
         lyricsAutomationGuard.lockManually()
-        currentLyricsMode = .english
         bilingualLyricLines = nil
+        currentLyricsMode = BabyPlayerLyricsPresentationPolicy.preferredMode(
+            subtitlesEnabled: true,
+            sourceLines: candidate.lines,
+            bilingualLines: nil
+        )
         pendingLyricSelectionIdentifier = candidate.persistentIdentifier
         lyricsSelectionTask?.cancel()
         let pendingSave = lyricsSaveTask
@@ -2115,7 +2138,11 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         lyricPlayback = pinned
         lyricLines = pinned.lines
         bilingualLyricLines = nil
-        currentLyricsMode = .english
+        currentLyricsMode = BabyPlayerLyricsPresentationPolicy.preferredMode(
+            subtitlesEnabled: true,
+            sourceLines: pinned.lines,
+            bilingualLines: nil
+        )
         currentLyricIndex = nil
         if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
             updateLyrics(at: elapsed)

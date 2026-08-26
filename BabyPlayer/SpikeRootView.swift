@@ -516,24 +516,28 @@ private struct SettingsLyricsModeMenu: View {
 
     var body: some View {
         Menu {
-            ForEach(BabyPlayerLyricsMode.allCases) { mode in
-                Button {
-                    selection = mode
-                } label: {
-                    if mode == selection {
-                        Label(mode.rawValue, systemImage: "checkmark")
-                    } else if mode.isCurrentlyAvailable {
-                        Text(mode.rawValue)
-                    } else {
-                        Text("\(mode.rawValue)（需翻译服务）")
-                    }
+            Button {
+                selection = .english
+            } label: {
+                if selection != .off {
+                    Label("自动选择（双语优先）", systemImage: "checkmark")
+                } else {
+                    Text("自动选择（双语优先）")
                 }
-                .disabled(!mode.isCurrentlyAvailable)
+            }
+            Button {
+                selection = .off
+            } label: {
+                if selection == .off {
+                    Label("关闭", systemImage: "checkmark")
+                } else {
+                    Text("关闭")
+                }
             }
         } label: {
             SettingsActionRow(
                 title: "在线歌词",
-                value: selection == .english ? "英文 · LRCLIB" : selection.rawValue
+                value: selection == .off ? "关闭" : "自动 · 双语优先"
             )
         }
     }

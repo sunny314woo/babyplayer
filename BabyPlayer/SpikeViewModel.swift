@@ -62,11 +62,6 @@ enum BabyPlayerLyricsMode: String, CaseIterable, Identifiable {
     case bilingual = "中英双语"
 
     var id: String { rawValue }
-
-    /// LRCLIB 可直接提供原文；中文翻译需要另行配置合规的翻译服务。
-    var isCurrentlyAvailable: Bool {
-        self == .off || self == .english
-    }
 }
 
 enum BabyPlayerSmartSkipPreferencePolicy {
@@ -231,8 +226,7 @@ enum BabyPlayerLyricsDefaultPolicy {
         hasAppliedEnabledByDefaultMigration: Bool
     ) -> BabyPlayerLyricsMode {
         if !hasAppliedEnabledByDefaultMigration { return .english }
-        guard let storedMode, storedMode.isCurrentlyAvailable else { return .english }
-        return storedMode
+        return storedMode == .off ? .off : .english
     }
 }
 
