@@ -197,6 +197,23 @@ struct StoredLyricsAnalysisResult: Codable, Sendable {
     let createdAt: Date
 }
 
+/// 与英文分析结果分开保存的逐行简体中文；不包含、也不能控制任何时间字段。
+struct StoredLyricsTranslationLine: Codable, Equatable, Sendable {
+    let lineIdentifier: String
+    let chineseText: String
+    let confidence: Double?
+}
+
+struct StoredLyricsTranslationResult: Codable, Equatable, Sendable {
+    let mediaFingerprint: String
+    let englishLyricsContentHash: String
+    let translationVersion: String
+    let targetLanguage: String
+    let model: String
+    let lines: [StoredLyricsTranslationLine]
+    let createdAt: Date
+}
+
 /// 声音分析给播放器的保守边界；独立于歌词候选和歌词偏移持久化。
 struct StoredSmartPlaybackBoundary: Codable, Equatable, Sendable {
     let introEndSeconds: Double?
@@ -204,6 +221,11 @@ struct StoredSmartPlaybackBoundary: Codable, Equatable, Sendable {
     let mediaDurationSeconds: Double
     let plannerVersion: String
     let createdAt: Date
+}
+
+struct StoredSmartPlaybackConfiguration: Equatable, Sendable {
+    let boundary: StoredSmartPlaybackBoundary?
+    let isEnabled: Bool
 }
 
 /// 一首媒体的 ASR/DeepSeek 并列结果；两者可同时保留，是否写入默认 binding 由上层显式工作流决定。
@@ -215,7 +237,11 @@ struct StoredLyricsAnalysisBundle: Codable, Sendable {
     var pinnedOrdinaryPlayback: LyricsPlayback?
     var asrResult: StoredLyricsAnalysisResult?
     var deepSeekResult: StoredLyricsAnalysisResult?
+    /// 独立于英文 StoredLyricsAnalysisResult；nil 同时兼容 Phase 3A 之前的 bundle。
+    var chineseTranslation: StoredLyricsTranslationResult?
     var smartPlaybackBoundary: StoredSmartPlaybackBoundary?
+    /// nil 兼容旧数据，并表示采用“每首歌曲默认开启”。
+    var smartPlaybackEnabled: Bool?
     var updatedAt: Date
 
     func result(for source: LyricsAnalysisSource) -> StoredLyricsAnalysisResult? {
@@ -660,7 +686,14 @@ actor BabyLyricsRepository {
                 pinnedOrdinaryPlayback: fallback.pinnedOrdinaryPlayback,
                 asrResult: fallback.asrResult,
                 deepSeekResult: fallback.deepSeekResult,
+                chineseTranslation: fallback.chineseTranslation.flatMap { translation in
+                    guard translation.mediaFingerprint == media.asrFingerprint,
+                          translation.englishLyricsContentHash
+                            == fallback.deepSeekResult?.lyricsContentHash else { return nil }
+                    return translation
+                },
                 smartPlaybackBoundary: fallback.smartPlaybackBoundary,
+                smartPlaybackEnabled: fallback.smartPlaybackEnabled,
                 updatedAt: Date()
             )
             try? saveAnalysisBundleToDisk(migrated)
@@ -672,12 +705,12 @@ actor BabyLyricsRepository {
     }
 
     /// 一次读取播放队列的智能边界，避免打开大列表时为每首媒体重复扫描分析目录。
-    func smartPlaybackBoundaries(
+    func smartPlaybackConfigurations(
         for mediaItems: [LyricsMediaDescriptor]
-    ) -> [String: StoredSmartPlaybackBoundary] {
+    ) -> [String: StoredSmartPlaybackConfiguration] {
         guard !mediaItems.isEmpty,
               let storedBundles = try? loadAllAnalysisBundles() else { return [:] }
-        var result: [String: StoredSmartPlaybackBoundary] = [:]
+        var result: [String: StoredSmartPlaybackConfiguration] = [:]
         for media in mediaItems {
             let fingerprint = mediaFingerprint(for: media)
             let legacyFingerprint = legacyMediaFingerprint(for: media)
@@ -687,11 +720,28 @@ actor BabyLyricsRepository {
                     || stored.mediaFingerprint == fingerprint
                     || stored.mediaFingerprint == legacyFingerprint
             }
-            if let boundary = match?.smartPlaybackBoundary {
-                result[media.id] = boundary
+            if let match {
+                result[media.id] = StoredSmartPlaybackConfiguration(
+                    boundary: match.smartPlaybackBoundary,
+                    isEnabled: match.smartPlaybackEnabled ?? true
+                )
             }
         }
         return result
+    }
+
+    /// 保存当前歌曲的智能跳过开关；只改变播放偏好，不修改歌词或智能边界。
+    @discardableResult
+    func setSmartPlaybackEnabled(
+        _ enabled: Bool,
+        for media: LyricsMediaDescriptor
+    ) throws -> StoredLyricsAnalysisBundle {
+        var bundle = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
+        bundle.smartPlaybackEnabled = enabled
+        bundle.updatedAt = Date()
+        try saveAnalysisBundleToDisk(bundle)
+        analysisMemoryCache[media.id] = bundle
+        return bundle
     }
 
     /// 保存人工运行的 ASR 结果；新证据会使基于旧 ASR 的 DeepSeek 结果过期，不修改当前歌词。
@@ -712,6 +762,7 @@ actor BabyLyricsRepository {
         )
         if bundle.asrResult?.asrEvidenceHash != asrEvidenceHash {
             bundle.deepSeekResult = nil
+            bundle.chineseTranslation = nil
         }
         bundle.asrResult = result
         // 边界和本次 ASR 使用同一份媒体证据；缺失或不可信时清掉旧值，避免沿用过期跳点。
@@ -730,17 +781,61 @@ actor BabyLyricsRepository {
         for media: LyricsMediaDescriptor
     ) throws -> StoredLyricsAnalysisBundle {
         var bundle = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
-        bundle.deepSeekResult = StoredLyricsAnalysisResult(
+        let result = StoredLyricsAnalysisResult(
             source: .deepSeek,
             candidate: candidate,
             lyricsContentHash: LyricsContentHash.make(candidate: candidate, source: .deepSeek),
             asrEvidenceHash: asrEvidenceHash,
             createdAt: Date()
         )
+        if bundle.chineseTranslation?.englishLyricsContentHash != result.lyricsContentHash {
+            bundle.chineseTranslation = nil
+        }
+        bundle.deepSeekResult = result
         bundle.updatedAt = Date()
         try saveAnalysisBundleToDisk(bundle)
         analysisMemoryCache[media.id] = bundle
         return bundle
+    }
+
+    /// 保存与当前 DeepSeek 英文版本严格匹配的中文翻译；不修改英文结果、binding 或时间轴。
+    @discardableResult
+    func storeChineseTranslation(
+        _ translation: StoredLyricsTranslationResult,
+        for media: LyricsMediaDescriptor
+    ) throws -> StoredLyricsAnalysisBundle {
+        var bundle = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
+        guard let english = bundle.deepSeekResult,
+              translation.mediaFingerprint == media.asrFingerprint,
+              translation.englishLyricsContentHash == english.lyricsContentHash,
+              BabyPlayerLyricsTranslationContract.isCompatible(translation),
+              BabyPlayerBilingualLyricsComposer.compose(
+                english: english,
+                translation: translation
+              ) != nil else {
+            throw BabyPlayerASRError.invalidResponse
+        }
+        bundle.chineseTranslation = translation
+        bundle.updatedAt = Date()
+        try saveAnalysisBundleToDisk(bundle)
+        analysisMemoryCache[media.id] = bundle
+        return bundle
+    }
+
+    /// 只返回与当前英文内容哈希和媒体 fingerprint 精确匹配的中文缓存。
+    func matchingChineseTranslation(
+        for english: StoredLyricsAnalysisResult,
+        media: LyricsMediaDescriptor
+    ) -> StoredLyricsTranslationResult? {
+        guard let translation = analysisBundle(for: media)?.chineseTranslation,
+              translation.mediaFingerprint == media.asrFingerprint,
+              translation.englishLyricsContentHash == english.lyricsContentHash,
+              BabyPlayerLyricsTranslationContract.isCompatible(translation),
+              BabyPlayerBilingualLyricsComposer.compose(
+                english: english,
+                translation: translation
+              ) != nil else { return nil }
+        return translation
     }
 
     /// Repository 层强制人工优先，避免未来新 UI 绕过播放器里的保护判断。
@@ -1443,7 +1538,9 @@ actor BabyLyricsRepository {
             pinnedOrdinaryPlayback: nil,
             asrResult: nil,
             deepSeekResult: nil,
+            chineseTranslation: nil,
             smartPlaybackBoundary: nil,
+            smartPlaybackEnabled: nil,
             updatedAt: Date()
         )
     }

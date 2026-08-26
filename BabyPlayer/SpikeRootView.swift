@@ -451,12 +451,6 @@ private struct ParentSettingsView: View {
                             selection: $model.playbackTimerMinutes,
                             valueText: { $0 == 0 ? "关闭" : "\($0) 分钟" }
                         )
-                        SettingsBooleanMenu(
-                            title: "智能跳过片头片尾",
-                            selection: $model.smartSkipEnabled,
-                            enabledText: "开启（默认）",
-                            disabledText: "关闭"
-                        )
                         SettingsIntegerMenu(
                             title: "手工片头（备用）",
                             options: [0, 5, 10, 15, 20, 30, 45, 60, 90, 120],
@@ -566,37 +560,6 @@ private struct SettingsIntegerMenu: View {
             }
         } label: {
             SettingsActionRow(title: title, value: valueText(selection))
-        }
-    }
-}
-
-private struct SettingsBooleanMenu: View {
-    let title: String
-    @Binding var selection: Bool
-    let enabledText: String
-    let disabledText: String
-
-    var body: some View {
-        Menu {
-            Button {
-                selection = true
-            } label: {
-                selection
-                    ? Label(enabledText, systemImage: "checkmark")
-                    : Label(enabledText, systemImage: "waveform")
-            }
-            Button {
-                selection = false
-            } label: {
-                selection
-                    ? Label(disabledText, systemImage: "pause.fill")
-                    : Label(disabledText, systemImage: "checkmark")
-            }
-        } label: {
-            SettingsActionRow(
-                title: title,
-                value: selection ? enabledText : disabledText
-            )
         }
     }
 }

@@ -90,6 +90,25 @@ CREATE TABLE IF NOT EXISTS ai_lyrics_cache (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (subject_hash, media_fingerprint_hash, reconciliation_version)
 );
+CREATE TABLE IF NOT EXISTS lyrics_translation_cache (
+  subject_hash TEXT NOT NULL,
+  media_fingerprint_hash TEXT NOT NULL,
+  english_lyrics_content_hash TEXT NOT NULL,
+  translation_version TEXT NOT NULL,
+  target_language TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (
+    subject_hash,
+    media_fingerprint_hash,
+    english_lyrics_content_hash,
+    translation_version,
+    target_language,
+    model_name
+  )
+);
 """
 
 
@@ -183,6 +202,74 @@ class AsrRepository:
                     subject_hash,
                     fingerprint_hash,
                     reconciliation_version,
+                    serialized,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    def cached_lyrics_translation(
+        self,
+        *,
+        subject_hash: str,
+        fingerprint_hash: str,
+        english_lyrics_content_hash: str,
+        translation_version: str,
+        target_language: str,
+        model_name: str,
+    ):
+        """Read only the translation for this exact verified English version."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT result_json FROM lyrics_translation_cache
+                   WHERE subject_hash=? AND media_fingerprint_hash=?
+                     AND english_lyrics_content_hash=? AND translation_version=?
+                     AND target_language=? AND model_name=?""",
+                (
+                    subject_hash,
+                    fingerprint_hash,
+                    english_lyrics_content_hash,
+                    translation_version,
+                    target_language,
+                    model_name,
+                ),
+            ).fetchone()
+        return json.loads(row["result_json"]) if row else None
+
+    def store_lyrics_translation(
+        self,
+        *,
+        subject_hash: str,
+        fingerprint_hash: str,
+        english_lyrics_content_hash: str,
+        translation_version: str,
+        target_language: str,
+        model_name: str,
+        result: dict,
+        now: datetime,
+    ) -> None:
+        """Atomically cache a translation without touching ASR or English lyrics rows."""
+        timestamp = now.astimezone(timezone.utc).isoformat()
+        serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO lyrics_translation_cache
+                   (subject_hash, media_fingerprint_hash, english_lyrics_content_hash,
+                    translation_version, target_language, model_name, result_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(subject_hash, media_fingerprint_hash,
+                     english_lyrics_content_hash, translation_version,
+                     target_language, model_name)
+                   DO UPDATE SET result_json=excluded.result_json,
+                     updated_at=excluded.updated_at""",
+                (
+                    subject_hash,
+                    fingerprint_hash,
+                    english_lyrics_content_hash,
+                    translation_version,
+                    target_language,
+                    model_name,
                     serialized,
                     timestamp,
                     timestamp,

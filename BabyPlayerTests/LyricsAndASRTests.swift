@@ -96,10 +96,10 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
-    func testSmartSkipDefaultsOnAndRespectsStoredOff() {
-        XCTAssertTrue(BabyPlayerSmartSkipDefaultPolicy.resolvedValue(storedValue: nil))
-        XCTAssertTrue(BabyPlayerSmartSkipDefaultPolicy.resolvedValue(storedValue: true))
-        XCTAssertFalse(BabyPlayerSmartSkipDefaultPolicy.resolvedValue(storedValue: false))
+    func testPerSongSmartSkipDefaultsOnAndRespectsStoredOff() {
+        XCTAssertTrue(BabyPlayerSmartSkipPreferencePolicy.resolvedValue(storedValue: nil))
+        XCTAssertTrue(BabyPlayerSmartSkipPreferencePolicy.resolvedValue(storedValue: true))
+        XCTAssertFalse(BabyPlayerSmartSkipPreferencePolicy.resolvedValue(storedValue: false))
     }
 
     func testPlaybackBoundaryPriorityIsChapterThenSmartThenManual() {
@@ -205,6 +205,63 @@ final class LyricsAndASRTests: XCTestCase {
         ))
     }
 
+    /// VAD 的早期候选不得让短噪声变成正片起点；真实歌词段才能确认跳点。
+    func testSmartIntroUsesFirstTrustworthyASRLyricSegment() {
+        let plan = BabyPlayerVoiceWindowPlan(
+            plannerVersion: "voice-window-planner-v1",
+            plannerStatus: "sparse",
+            fallbackReason: nil,
+            mediaDurationSeconds: 157.171,
+            analysisDurationSeconds: 152.171,
+            rawVocalSeconds: 109.912,
+            plannedASRSeconds: 132.832,
+            savedASRSeconds: 19.339,
+            asrWindowCount: 1,
+            smartIntroEndSeconds: 6.596,
+            smartOutroStartSeconds: 138.428
+        )
+        let noise = BabyPlayerASRSegment(
+            text: "BD.",
+            startSeconds: 11.606,
+            endSeconds: 12.406,
+            words: [
+                BabyPlayerASRWord(
+                    text: "BD", startSeconds: 11.606, endSeconds: 12.006,
+                    voiceActivityScore: 0.0983
+                )
+            ]
+        )
+        let lyrics = BabyPlayerASRSegment(
+            text: "The wheels on the bus go round and round",
+            startSeconds: 22.446,
+            endSeconds: 33.146,
+            words: [
+                BabyPlayerASRWord(text: "The", startSeconds: 22.446, endSeconds: 22.7),
+                BabyPlayerASRWord(text: "wheels", startSeconds: 22.7, endSeconds: 23.1),
+                BabyPlayerASRWord(text: "bus", startSeconds: 23.1, endSeconds: 23.5)
+            ]
+        )
+        let ending = BabyPlayerASRSegment(
+            text: "The daddies on the bus go shh shh",
+            startSeconds: 132.866,
+            endSeconds: 138.716,
+            words: [
+                BabyPlayerASRWord(text: "The", startSeconds: 132.866, endSeconds: 133.1),
+                BabyPlayerASRWord(text: "daddies", startSeconds: 133.316, endSeconds: 133.866),
+                BabyPlayerASRWord(text: "shh", startSeconds: 138.116, endSeconds: 138.716)
+            ]
+        )
+
+        let stored = BabyPlayerSmartSkipBoundaryPolicy.storedBoundary(
+            from: plan,
+            expectedMediaDuration: 157.171,
+            asrSegments: [noise, lyrics, ending]
+        )
+
+        XCTAssertEqual(stored?.introEndSeconds ?? -1, 21.696, accuracy: 0.001)
+        XCTAssertEqual(stored?.outroStartSeconds ?? -1, 140.716, accuracy: 0.001)
+    }
+
     /// AI 采用成功卡只短暂确认结果，不得在单曲循环中永久遮挡画面。
     func testAdoptedAIOverlayUsesFiveSecondDisplayWindow() {
         XCTAssertEqual(BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds, 5)
@@ -240,6 +297,38 @@ final class LyricsAndASRTests: XCTestCase {
 
         XCTAssertTrue(message.contains("连接超时"))
         XCTAssertTrue(message.contains("同一网络"))
+    }
+
+    func testMacLocalCacheIsReusedOnlyAfterVoiceWindowPlanningExists() {
+        var legacy = makeAnalysis(segments: [makeSegment("hello", at: 1)])
+        legacy.voiceWindowPlan = nil
+        XCTAssertFalse(BabyPlayerASRCacheReusePolicy.canReuse(
+            legacy,
+            requiresVoiceWindowPlan: true
+        ))
+        XCTAssertTrue(BabyPlayerASRCacheReusePolicy.canReuse(
+            legacy,
+            requiresVoiceWindowPlan: false
+        ))
+
+        var planned = legacy
+        planned.voiceWindowPlan = BabyPlayerVoiceWindowPlan(
+            plannerVersion: "voice-window-planner-v1",
+            plannerStatus: "sparse",
+            fallbackReason: nil,
+            mediaDurationSeconds: 180,
+            analysisDurationSeconds: 180,
+            rawVocalSeconds: 120,
+            plannedASRSeconds: 132,
+            savedASRSeconds: 48,
+            asrWindowCount: 1,
+            smartIntroEndSeconds: 10,
+            smartOutroStartSeconds: 165
+        )
+        XCTAssertTrue(BabyPlayerASRCacheReusePolicy.canReuse(
+            planned,
+            requiresVoiceWindowPlan: true
+        ))
     }
 
     /// 连续低人声词组不进入原始 ASR 字幕，但独立低活动演唱仍保留。
@@ -790,6 +879,114 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertTrue(text.contains("DeepSeek 字幕已自动启用"))
     }
 
+    func testEnglishLyricsLanguageDetectionIsDeterministicAndConservative() {
+        XCTAssertTrue(BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish([
+            TimedLyricLine(time: 0, text: "Twinkle twinkle little star"),
+            TimedLyricLine(time: 2, text: "How I wonder what you are")
+        ]))
+        XCTAssertFalse(BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish([
+            TimedLyricLine(time: 0, text: "一闪一闪亮晶晶"),
+            TimedLyricLine(time: 2, text: "满天都是小星星")
+        ]))
+        XCTAssertFalse(BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish([
+            TimedLyricLine(time: 0, text: "Frère Jacques, dormez-vous"),
+            TimedLyricLine(time: 2, text: "Sonnez les matines")
+        ]))
+        XCTAssertFalse(BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish([]))
+    }
+
+    func testBilingualCompositionCopiesEnglishTimelineOrderAndTextExactly() {
+        let candidate = makeEnglishTranslationCandidate()
+        let english = StoredLyricsAnalysisResult(
+            source: .deepSeek,
+            candidate: candidate,
+            lyricsContentHash: LyricsContentHash.make(candidate: candidate, source: .deepSeek),
+            asrEvidenceHash: "evidence",
+            createdAt: Date()
+        )
+        let translation = makeTranslation(for: english, mediaFingerprint: "fingerprint")
+
+        let bilingual = BabyPlayerBilingualLyricsComposer.compose(
+            english: english,
+            translation: translation
+        )
+
+        XCTAssertEqual(bilingual?.map(\.startSeconds), candidate.lines.map(\.time))
+        XCTAssertEqual(bilingual?.map(\.endSeconds), candidate.lines.map(\.endTime))
+        XCTAssertEqual(bilingual?.map(\.englishText), candidate.lines.map(\.text))
+        XCTAssertEqual(bilingual?.map(\.identifier), ["line-0", "line-1"])
+    }
+
+    func testBilingualCompositionRejectsUnknownDuplicateAndMissingIdentifiers() {
+        let candidate = makeEnglishTranslationCandidate()
+        let english = StoredLyricsAnalysisResult(
+            source: .deepSeek,
+            candidate: candidate,
+            lyricsContentHash: LyricsContentHash.make(candidate: candidate, source: .deepSeek),
+            asrEvidenceHash: "evidence",
+            createdAt: Date()
+        )
+        let valid = makeTranslation(for: english, mediaFingerprint: "fingerprint")
+        let unknown = StoredLyricsTranslationResult(
+            mediaFingerprint: valid.mediaFingerprint,
+            englishLyricsContentHash: valid.englishLyricsContentHash,
+            translationVersion: valid.translationVersion,
+            targetLanguage: valid.targetLanguage,
+            model: valid.model,
+            lines: [valid.lines[0], .init(lineIdentifier: "unknown", chineseText: "未知", confidence: 1)],
+            createdAt: valid.createdAt
+        )
+        let duplicate = StoredLyricsTranslationResult(
+            mediaFingerprint: valid.mediaFingerprint,
+            englishLyricsContentHash: valid.englishLyricsContentHash,
+            translationVersion: valid.translationVersion,
+            targetLanguage: valid.targetLanguage,
+            model: valid.model,
+            lines: [valid.lines[0], valid.lines[0]],
+            createdAt: valid.createdAt
+        )
+        let missing = StoredLyricsTranslationResult(
+            mediaFingerprint: valid.mediaFingerprint,
+            englishLyricsContentHash: valid.englishLyricsContentHash,
+            translationVersion: valid.translationVersion,
+            targetLanguage: valid.targetLanguage,
+            model: valid.model,
+            lines: [valid.lines[0]],
+            createdAt: valid.createdAt
+        )
+
+        XCTAssertNil(BabyPlayerBilingualLyricsComposer.compose(english: english, translation: unknown))
+        XCTAssertNil(BabyPlayerBilingualLyricsComposer.compose(english: english, translation: duplicate))
+        XCTAssertNil(BabyPlayerBilingualLyricsComposer.compose(english: english, translation: missing))
+    }
+
+    func testAppleTVTranslationValidationRejectsTimestampKeys() throws {
+        let data = Data(#"{"lines":[{"line_identifier":"line-0","chinese_text":"小星星","start_seconds":1}]}"#.utf8)
+        XCTAssertThrowsError(
+            try BabyPlayerLyricsTranslationResponseValidator.validateRawJSON(data)
+        )
+    }
+
+    func testTranslationGenerationCannotApplyAfterNewManualSelection() {
+        let guardState = LyricsAutomationGenerationGuard()
+        let englishSelectionGeneration = guardState.lockManually()
+        XCTAssertTrue(guardState.isCurrentGeneration(englishSelectionGeneration))
+
+        guardState.lockManually()
+
+        XCTAssertFalse(guardState.isCurrentGeneration(englishSelectionGeneration))
+    }
+
+    func testMissingChineseTranslationLeavesVerifiedEnglishUntouched() {
+        let candidate = makeEnglishTranslationCandidate()
+        let before = candidate.lines.map { ($0.time, $0.endTime, $0.text) }
+        let after = candidate.lines.map { ($0.time, $0.endTime, $0.text) }
+
+        XCTAssertEqual(before.map(\.0), after.map(\.0))
+        XCTAssertEqual(before.map(\.1), after.map(\.1))
+        XCTAssertEqual(before.map(\.2), after.map(\.2))
+    }
+
     /// 验证单曲重试使用封顶退避；输入为连续失败次数，输出时间序列，不修改状态。
     // 【MODIFIED】防止单曲循环每轮立即请求，同时确保后台能继续自愈。
     func testSingleRepeatUsesCappedBackoff() {
@@ -893,15 +1090,21 @@ final class LyricsAndASRTests: XCTestCase {
 
         let reloaded = makeRepository(storage)
         let bundle = await reloaded.analysisBundle(for: media)
-        let queueBoundaries = await reloaded.smartPlaybackBoundaries(for: [media])
+        let queueConfigurations = await reloaded.smartPlaybackConfigurations(for: [media])
         let stillPinned = await reloaded.storedLyrics(for: media)
         XCTAssertEqual(bundle?.asrResult?.candidate.id, analyzed.id)
         XCTAssertEqual(bundle?.asrResult?.asrEvidenceHash, "audio-hash-1")
         XCTAssertEqual(bundle?.smartPlaybackBoundary, smartBoundary)
-        XCTAssertEqual(queueBoundaries[media.id], smartBoundary)
+        XCTAssertEqual(queueConfigurations[media.id]?.boundary, smartBoundary)
+        XCTAssertEqual(queueConfigurations[media.id]?.isEnabled, true)
         XCTAssertEqual(bundle?.pinnedOrdinaryPlayback?.candidateID, ordinary.id)
         XCTAssertEqual(stillPinned?.candidateID, ordinary.id)
         XCTAssertEqual(stillPinned?.selectionOrigin, .manual)
+
+        _ = try await reloaded.setSmartPlaybackEnabled(false, for: media)
+        let disabledConfigurations = await reloaded.smartPlaybackConfigurations(for: [media])
+        XCTAssertEqual(disabledConfigurations[media.id]?.boundary, smartBoundary)
+        XCTAssertEqual(disabledConfigurations[media.id]?.isEnabled, false)
 
         let adopted = await reloaded.playback(for: analyzed, media: media, selectionOrigin: .asr)
         _ = try await reloaded.confirm(adopted, for: media)
@@ -947,6 +1150,91 @@ final class LyricsAndASRTests: XCTestCase {
         let reloadedBundle = await reloaded.analysisBundle(for: media)
         XCTAssertNotNil(reloadedBundle?.asrResult)
         XCTAssertNotNil(reloadedBundle?.deepSeekResult)
+    }
+
+    func testChineseTranslationPersistsAcrossRestartAndInvalidatesWithEnglishHash() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let repository = makeRepository(storage)
+        let media = makeMedia()
+        let asr = makeCandidate(id: -10, title: "ASR", words: "raw transcript words here")
+        let englishCandidate = makeEnglishTranslationCandidate()
+        _ = try await repository.storeASRResult(
+            asr,
+            asrEvidenceHash: "same-evidence",
+            for: media
+        )
+        var bundle = try await repository.storeDeepSeekResult(
+            englishCandidate,
+            asrEvidenceHash: "same-evidence",
+            for: media
+        )
+        let english = try XCTUnwrap(bundle.deepSeekResult)
+        let translation = makeTranslation(
+            for: english,
+            mediaFingerprint: media.asrFingerprint
+        )
+        bundle = try await repository.storeChineseTranslation(translation, for: media)
+        XCTAssertNotNil(bundle.chineseTranslation)
+
+        let reloaded = makeRepository(storage)
+        let restored = await reloaded.matchingChineseTranslation(for: english, media: media)
+        XCTAssertEqual(restored, translation)
+
+        let changedEnglish = LyricsCandidate(
+            id: englishCandidate.id,
+            trackName: englishCandidate.trackName,
+            artistName: englishCandidate.artistName,
+            albumName: nil,
+            duration: englishCandidate.duration,
+            lines: [
+                TimedLyricLine(time: 1.25, text: "Twinkle bright little star", endTime: 3.5),
+                TimedLyricLine(time: 4.0, text: "How I wonder what you are", endTime: 6.75)
+            ],
+            matchScore: 0,
+            providerName: "AI 证据歌词",
+            identityAnchor: englishCandidate.identityAnchor
+        )
+        let changedBundle = try await reloaded.storeDeepSeekResult(
+            changedEnglish,
+            asrEvidenceHash: "same-evidence",
+            for: media
+        )
+        XCTAssertNotEqual(
+            changedBundle.deepSeekResult?.lyricsContentHash,
+            english.lyricsContentHash
+        )
+        XCTAssertNil(changedBundle.chineseTranslation)
+    }
+
+    func testOldAnalysisBundleWithoutTranslationFieldStillDecodes() throws {
+        let bundle = StoredLyricsAnalysisBundle(
+            mediaID: "old-media",
+            mediaFingerprint: "old-fingerprint",
+            mediaSourceID: nil,
+            mediaTitle: "Old Song",
+            pinnedOrdinaryPlayback: nil,
+            asrResult: nil,
+            deepSeekResult: nil,
+            chineseTranslation: nil,
+            smartPlaybackBoundary: nil,
+            smartPlaybackEnabled: nil,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let encoded = try JSONEncoder().encode(bundle)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        object.removeValue(forKey: "chineseTranslation")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(
+            StoredLyricsAnalysisBundle.self,
+            from: legacyData
+        )
+
+        XCTAssertEqual(decoded.mediaID, bundle.mediaID)
+        XCTAssertNil(decoded.chineseTranslation)
     }
 
     /// 有 DeepSeek 校准结果时，新进入播放页默认选 DeepSeek，即使上次退出前固定的是普通歌词。
@@ -1764,6 +2052,48 @@ final class LyricsAndASRTests: XCTestCase {
             lines: [TimedLyricLine(time: 0, text: words)],
             matchScore: 0,
             providerName: "test"
+        )
+    }
+
+    private func makeEnglishTranslationCandidate() -> LyricsCandidate {
+        LyricsCandidate(
+            id: -11,
+            trackName: "Twinkle Twinkle Little Star",
+            artistName: "Kids",
+            albumName: nil,
+            duration: 6,
+            lines: [
+                TimedLyricLine(
+                    time: 0.4,
+                    text: "Twinkle twinkle little star",
+                    endTime: 2.0
+                ),
+                TimedLyricLine(
+                    time: 2.2,
+                    text: "How I wonder what you are",
+                    endTime: 4.1
+                )
+            ],
+            matchScore: 0,
+            providerName: "DeepSeek"
+        )
+    }
+
+    private func makeTranslation(
+        for english: StoredLyricsAnalysisResult,
+        mediaFingerprint: String
+    ) -> StoredLyricsTranslationResult {
+        StoredLyricsTranslationResult(
+            mediaFingerprint: mediaFingerprint,
+            englishLyricsContentHash: english.lyricsContentHash,
+            translationVersion: BabyPlayerLyricsTranslationContract.translationVersion,
+            targetLanguage: BabyPlayerLyricsTranslationContract.targetLanguage,
+            model: "deepseek-test",
+            lines: [
+                .init(lineIdentifier: "line-0", chineseText: "一闪一闪亮晶晶", confidence: 1),
+                .init(lineIdentifier: "line-1", chineseText: "我想知道你是什么", confidence: 1)
+            ],
+            createdAt: Date()
         )
     }
 

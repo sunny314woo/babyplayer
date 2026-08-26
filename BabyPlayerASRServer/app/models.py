@@ -6,7 +6,7 @@
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 
 LyricText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
@@ -264,3 +264,55 @@ class LyricsReconcileResponse(BaseModel):
     recovered_asr_word_count: int = Field(default=0, ge=0, le=20_000)
     lines: list[LyricsReconciledLine]
     discarded_lines: list[LyricsDiscardedLine] = Field(default_factory=list)
+
+
+EnglishLyricsHash = Annotated[
+    str,
+    StringConstraints(pattern=r"^[0-9a-f]{64}$"),
+]
+
+
+class LyricsTranslationInputLine(BaseModel):
+    """A timestamp-free English line sent to the independent translation stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    line_identifier: str = Field(min_length=3, max_length=128)
+    english_text: str = Field(min_length=1, max_length=500)
+
+
+class LyricsTranslateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    media_fingerprint: str = Field(min_length=8, max_length=512)
+    english_lyrics_content_hash: EnglishLyricsHash
+    translation_version: str = Field(min_length=1, max_length=128)
+    target_language: Literal["zh-Hans"]
+    lines: list[LyricsTranslationInputLine] = Field(min_length=1, max_length=300)
+
+    @model_validator(mode="after")
+    def validate_unique_line_identifiers(self):
+        identifiers = [line.line_identifier for line in self.lines]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("translation input line identifiers must be unique")
+        return self
+
+
+class LyricsTranslatedLine(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    line_identifier: str = Field(min_length=3, max_length=128)
+    chinese_text: str = Field(min_length=1, max_length=300)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+class LyricsTranslateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["completed"]
+    cache_hit: bool
+    model: str = Field(min_length=1, max_length=128)
+    translation_version: str = Field(min_length=1, max_length=128)
+    target_language: Literal["zh-Hans"]
+    english_lyrics_content_hash: EnglishLyricsHash
+    lines: list[LyricsTranslatedLine] = Field(min_length=1, max_length=300)

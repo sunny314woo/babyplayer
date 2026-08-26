@@ -604,3 +604,265 @@ struct BabyPlayerLyricsReconcilerClient {
         )
     }
 }
+
+// MARK: - Phase 3A independent Simplified Chinese translation
+
+enum BabyPlayerLyricsLanguagePolicy {
+    private static let englishEvidenceWords: Set<String> = [
+        "a", "all", "am", "an", "and", "are", "away", "baby", "be", "birthday",
+        "can", "come", "do", "down", "for", "go", "good", "had", "happy", "hello",
+        "here", "how", "i", "if", "in", "is", "it", "little", "love", "me", "my",
+        "no", "not", "of", "oh", "old", "on", "one", "out", "please", "see", "sing",
+        "star", "the", "there", "this", "three", "to", "two", "up", "we", "what",
+        "when", "where", "with", "wonder", "yes", "you", "your"
+    ]
+
+    /// 仅根据最终歌词文本作确定性判断；标题、模型和媒体元数据都不参与。
+    static func isPredominantlyEnglish(_ lines: [TimedLyricLine]) -> Bool {
+        let text = lines.map(\.text).joined(separator: " ")
+        var totalLetters = 0
+        var asciiLatinLetters = 0
+        for scalar in text.unicodeScalars where CharacterSet.letters.contains(scalar) {
+            totalLetters += 1
+            if (65...90).contains(Int(scalar.value)) || (97...122).contains(Int(scalar.value)) {
+                asciiLatinLetters += 1
+            }
+        }
+        guard totalLetters >= 12,
+              Double(asciiLatinLetters) / Double(totalLetters) >= 0.85 else { return false }
+
+        let words = text.lowercased().components(
+            separatedBy: CharacterSet.letters.union(CharacterSet(charactersIn: "'")).inverted
+        ).filter { !$0.isEmpty }
+        guard words.count >= 3 else { return false }
+        let asciiWords = words.filter { word in
+            word.unicodeScalars.allSatisfy {
+                (97...122).contains(Int($0.value)) || $0.value == 39
+            }
+        }
+        guard Double(asciiWords.count) / Double(words.count) >= 0.8 else { return false }
+        return asciiWords.contains(where: englishEvidenceWords.contains)
+    }
+}
+
+enum BabyPlayerLyricsTranslationContract {
+    static let translationVersion = "babyplayer-zh-hans-v1"
+    static let targetLanguage = "zh-Hans"
+    static let maximumChineseCharacters = 300
+
+    static func lineIdentifier(at index: Int) -> String {
+        "line-\(index)"
+    }
+
+    static func isCompatible(_ result: StoredLyricsTranslationResult) -> Bool {
+        result.translationVersion == translationVersion
+            && result.targetLanguage == targetLanguage
+            && !result.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+struct BilingualLyricLine: Equatable, Sendable {
+    let identifier: String
+    let startSeconds: Double
+    let endSeconds: Double?
+    let englishText: String
+    let chineseText: String
+}
+
+enum BabyPlayerBilingualLyricsComposer {
+    /// 中文只能按 identifier 附着；所有时间、顺序和英文内容逐字段复制自 DeepSeek 英文结果。
+    static func compose(
+        english: StoredLyricsAnalysisResult,
+        translation: StoredLyricsTranslationResult
+    ) -> [BilingualLyricLine]? {
+        guard english.source == .deepSeek,
+              translation.englishLyricsContentHash == english.lyricsContentHash,
+              BabyPlayerLyricsTranslationContract.isCompatible(translation),
+              translation.lines.count == english.candidate.lines.count else { return nil }
+
+        var seen = Set<String>()
+        var result: [BilingualLyricLine] = []
+        for (index, englishLine) in english.candidate.lines.enumerated() {
+            let translatedLine = translation.lines[index]
+            let expectedIdentifier = BabyPlayerLyricsTranslationContract.lineIdentifier(at: index)
+            let chinese = translatedLine.chineseText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard translatedLine.lineIdentifier == expectedIdentifier,
+                  seen.insert(translatedLine.lineIdentifier).inserted,
+                  !chinese.isEmpty,
+                  chinese.count <= BabyPlayerLyricsTranslationContract.maximumChineseCharacters,
+                  translatedLine.confidence.map({ (0...1).contains($0) }) ?? true else { return nil }
+            result.append(BilingualLyricLine(
+                identifier: expectedIdentifier,
+                startSeconds: englishLine.time,
+                endSeconds: englishLine.endTime,
+                englishText: englishLine.text,
+                chineseText: chinese
+            ))
+        }
+        return result
+    }
+}
+
+private struct LyricsTranslationRequest: Encodable {
+    struct Line: Encodable {
+        let lineIdentifier: String
+        let englishText: String
+
+        enum CodingKeys: String, CodingKey {
+            case lineIdentifier = "line_identifier"
+            case englishText = "english_text"
+        }
+    }
+
+    let mediaFingerprint: String
+    let englishLyricsContentHash: String
+    let translationVersion: String
+    let targetLanguage: String
+    let lines: [Line]
+
+    enum CodingKeys: String, CodingKey {
+        case lines
+        case mediaFingerprint = "media_fingerprint"
+        case englishLyricsContentHash = "english_lyrics_content_hash"
+        case translationVersion = "translation_version"
+        case targetLanguage = "target_language"
+    }
+}
+
+private struct LyricsTranslationResponse: Decodable {
+    struct Line: Decodable {
+        let lineIdentifier: String
+        let chineseText: String
+        let confidence: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case confidence
+            case lineIdentifier = "line_identifier"
+            case chineseText = "chinese_text"
+        }
+    }
+
+    let status: String
+    let model: String
+    let translationVersion: String
+    let targetLanguage: String
+    let englishLyricsContentHash: String
+    let lines: [Line]
+
+    enum CodingKeys: String, CodingKey {
+        case status, model, lines
+        case translationVersion = "translation_version"
+        case targetLanguage = "target_language"
+        case englishLyricsContentHash = "english_lyrics_content_hash"
+    }
+}
+
+enum BabyPlayerLyricsTranslationResponseValidator {
+    /// Swift Decodable 默认忽略未知键；因此先检查原始 JSON，明确拒绝模型夹带的时间字段。
+    static func validateRawJSON(_ data: Data) throws {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let lines = root["lines"] as? [[String: Any]] else {
+            throw BabyPlayerASRError.invalidResponse
+        }
+        let allowedRootKeys: Set<String> = [
+            "status", "cache_hit", "model", "translation_version",
+            "target_language", "english_lyrics_content_hash", "lines"
+        ]
+        let allowedLineKeys: Set<String> = ["line_identifier", "chinese_text", "confidence"]
+        guard Set(root.keys).isSubset(of: allowedRootKeys),
+              lines.allSatisfy({ Set($0.keys).isSubset(of: allowedLineKeys) }) else {
+            throw BabyPlayerASRError.invalidResponse
+        }
+    }
+}
+
+struct BabyPlayerLyricsTranslationClient {
+    private let configuration: LyricsRefinerConfiguration
+    private let session: URLSession
+
+    init(session: URLSession = .shared) throws {
+        configuration = try .load()
+        self.session = session
+    }
+
+    init(baseURL: URL, apiToken: String, session: URLSession) {
+        configuration = LyricsRefinerConfiguration(baseURL: baseURL, apiToken: apiToken)
+        self.session = session
+    }
+
+    func translate(
+        english: StoredLyricsAnalysisResult,
+        mediaFingerprint: String
+    ) async throws -> StoredLyricsTranslationResult {
+        guard english.source == .deepSeek,
+              BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish(english.candidate.lines) else {
+            throw BabyPlayerASRError.invalidResponse
+        }
+        let requestBody = LyricsTranslationRequest(
+            mediaFingerprint: mediaFingerprint,
+            englishLyricsContentHash: english.lyricsContentHash,
+            translationVersion: BabyPlayerLyricsTranslationContract.translationVersion,
+            targetLanguage: BabyPlayerLyricsTranslationContract.targetLanguage,
+            lines: english.candidate.lines.indices.map { index in
+                .init(
+                    lineIdentifier: BabyPlayerLyricsTranslationContract.lineIdentifier(at: index),
+                    englishText: english.candidate.lines[index].text
+                )
+            }
+        )
+        var request = URLRequest(
+            url: configuration.baseURL.appendingPathComponent("lyrics/translate/zh-Hans")
+        )
+        request.httpMethod = "POST"
+        request.timeoutInterval = 100
+        request.setValue("Bearer \(configuration.apiToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONEncoder().encode(requestBody)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BabyPlayerASRError.invalidResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
+                throw BabyPlayerASRError.server(envelope.detail.message ?? envelope.detail.code)
+            }
+            throw BabyPlayerASRError.invalidResponse
+        }
+        try BabyPlayerLyricsTranslationResponseValidator.validateRawJSON(data)
+        let translated = try JSONDecoder().decode(LyricsTranslationResponse.self, from: data)
+        let expectedIdentifiers = english.candidate.lines.indices.map {
+            BabyPlayerLyricsTranslationContract.lineIdentifier(at: $0)
+        }
+        let identifiers = translated.lines.map(\.lineIdentifier)
+        guard translated.status == "completed",
+              translated.englishLyricsContentHash == english.lyricsContentHash,
+              translated.translationVersion == BabyPlayerLyricsTranslationContract.translationVersion,
+              translated.targetLanguage == BabyPlayerLyricsTranslationContract.targetLanguage,
+              Set(identifiers).count == identifiers.count,
+              identifiers == expectedIdentifiers else {
+            throw BabyPlayerASRError.invalidResponse
+        }
+        let result = StoredLyricsTranslationResult(
+            mediaFingerprint: mediaFingerprint,
+            englishLyricsContentHash: translated.englishLyricsContentHash,
+            translationVersion: translated.translationVersion,
+            targetLanguage: translated.targetLanguage,
+            model: translated.model,
+            lines: translated.lines.map {
+                StoredLyricsTranslationLine(
+                    lineIdentifier: $0.lineIdentifier,
+                    chineseText: $0.chineseText,
+                    confidence: $0.confidence
+                )
+            },
+            createdAt: Date()
+        )
+        guard BabyPlayerBilingualLyricsComposer.compose(
+            english: english,
+            translation: result
+        ) != nil else { throw BabyPlayerASRError.invalidResponse }
+        return result
+    }
+}

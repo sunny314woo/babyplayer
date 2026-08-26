@@ -1521,6 +1521,16 @@ enum BabyPlayerASRProcessingStage: Equatable, Sendable {
     case refining
 }
 
+enum BabyPlayerASRCacheReusePolicy {
+    /// 本地 VAD/Planner 链只复用已经带规划结果的新缓存；旧缓存允许做一次升级分析。
+    static func canReuse(
+        _ analysis: BabyPlayerASRAnalysis,
+        requiresVoiceWindowPlan: Bool
+    ) -> Bool {
+        !requiresVoiceWindowPlan || analysis.voiceWindowPlan != nil
+    }
+}
+
 /// ASR 阶段回调；输入为真实处理阶段，无输出，回到 MainActor 更新 UI。
 typealias BabyPlayerASRStageHandler = @MainActor @Sendable (
     BabyPlayerASRProcessingStage
@@ -1540,6 +1550,14 @@ actor BabyPlayerASRCoordinator {
     ) async throws -> BabyPlayerASRAnalysis {
         let fingerprint = item.lyricsMedia.asrFingerprint
         let client = try BabyPlayerASRClient()
+        if !forceRefresh,
+           let cached = try? await client.cachedAnalysis(mediaFingerprint: fingerprint),
+           BabyPlayerASRCacheReusePolicy.canReuse(
+               cached,
+               requiresVoiceWindowPlan: client.usesMacLocalAnalysisJobs
+           ) {
+            return cached
+        }
         guard let songWindow = BabyPlayerTemporaryASRAudioPolicy.songWindow(
             for: item.lyricsMedia
         ) else { throw BabyPlayerASRError.audioExportFailed }
@@ -1581,11 +1599,6 @@ actor BabyPlayerASRCoordinator {
                 job = try await client.localAnalysisJob(id: job.jobID)
             }
             throw BabyPlayerASRError.server("Mac 本地分析等待超时，请稍后读取已保存结果")
-        }
-
-        if !forceRefresh,
-           let cached = try? await client.cachedAnalysis(mediaFingerprint: fingerprint) {
-            return cached
         }
 
         let usage = try await client.usage()

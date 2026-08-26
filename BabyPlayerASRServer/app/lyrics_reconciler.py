@@ -171,7 +171,10 @@ class LyricsReconcilerService:
         candidate_ids = {str(candidate["candidate_id"]) for candidate in candidates}
         allowed_sources = candidate_ids | {"mixed", "asr_only"}
         if primary_source not in allowed_sources:
-            raise LyricsReconciliationError("Unknown primary lyric source")
+            # Source is audit metadata, never timing/text evidence.  Models
+            # occasionally return a descriptive label instead of an exact id;
+            # normalize that label while keeping every ASR/text support gate.
+            primary_source = "mixed" if candidates else "asr_only"
         web_text_by_id = {
             str(candidate["candidate_id"]): str(candidate.get("retrieved_text") or "")
             for candidate in candidates
@@ -213,7 +216,19 @@ class LyricsReconcilerService:
                 raise LyricsReconciliationError("Lyric line requires integer ASR indices")
             if not isinstance(text_corrected, bool) or not text or len(text) > 500:
                 raise LyricsReconciliationError("Invalid reconciled lyric text")
-            if source not in allowed_sources or not 0 <= confidence <= 1:
+            if source not in allowed_sources:
+                referenced_sources = {
+                    source_id.partition(":")[0]
+                    for source_id in source_line_ids
+                    if source_id.partition(":")[0] in candidate_ids
+                }
+                if len(referenced_sources) == 1:
+                    source = next(iter(referenced_sources))
+                elif len(referenced_sources) > 1:
+                    source = "mixed"
+                else:
+                    source = "asr_only"
+            if not 0 <= confidence <= 1:
                 raise LyricsReconciliationError("Invalid reconciled line source/confidence")
             if (
                 start_index < 0

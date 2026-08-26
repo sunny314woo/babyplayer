@@ -275,6 +275,11 @@ final class LyricsAutomationGenerationGuard: @unchecked Sendable {
         }
     }
 
+    /// 翻译只附着到已选英文字幕；只要求期间没有更新选择，不清除已有 manual lock。
+    func isCurrentGeneration(_ expectedGeneration: Int) -> Bool {
+        stateLock.withLock { storedGeneration == expectedGeneration }
+    }
+
     /// 在同一把锁内检查 generation 并提交自动结果；输入为启动 generation 和同步操作，输出为可选操作结果，可修改 repository。
     func performIfAutomaticResultIsPermitted<Result>(
         startedAt startedGeneration: Int,
@@ -357,6 +362,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var lyricsSelectionTask: Task<Void, Never>?
     private var aiProgressHideTask: Task<Void, Never>?
     private var lyricLines: [TimedLyricLine] = []
+    /// 仅用于展示；英文 lyricLines 继续独立承担全部时间轴计算和偏移。
+    private var bilingualLyricLines: [BilingualLyricLine]?
     private var lyricPlayback: LyricsPlayback?
     private var lyricCandidates: [LyricsCandidate] = []
     private var analysisBundle: StoredLyricsAnalysisBundle?
@@ -540,6 +547,20 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
     }
 
+    private func updateSmartSkipEnabled(
+        _ enabled: Bool,
+        mediaFingerprint: String
+    ) {
+        for index in queueItems.indices
+        where queueItems[index].lyricsMedia.asrFingerprint == mediaFingerprint {
+            queueItems[index].smartSkipEnabled = enabled
+        }
+        for index in originalQueueItems.indices
+        where originalQueueItems[index].lyricsMedia.asrFingerprint == mediaFingerprint {
+            originalQueueItems[index].smartSkipEnabled = enabled
+        }
+    }
+
     /// 判断当前播放媒体；输入为 media fingerprint，输出是否仍为同一声音来源，不修改状态。
     // 【MODIFIED】循环重建 queue item 时使用稳定 fingerprint，而不是播放器实例生命周期。
     private func isCurrentMedia(fingerprint: String) -> Bool {
@@ -569,7 +590,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         let introTarget = BabyPlayerPlaybackBoundaryPolicy.introTarget(
             chapter: queueItem.chapterIntroEndSeconds,
             smart: queueItem.smartIntroEndSeconds,
-            smartEnabled: selection.smartSkipEnabled,
+            smartEnabled: queueItem.smartSkipEnabled,
             manualSkipSeconds: selection.introSkipSeconds,
             resumeTarget: resumeTarget
         )
@@ -614,7 +635,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         let outroTarget = BabyPlayerPlaybackBoundaryPolicy.outroTarget(
             chapter: queueItem.chapterOutroStartSeconds,
             smart: queueItem.smartOutroStartSeconds,
-            smartEnabled: selection.smartSkipEnabled,
+            smartEnabled: queueItem.smartSkipEnabled,
             manualSkipSeconds: selection.outroSkipSeconds,
             duration: player?.currentItem?.duration.seconds
         )
@@ -815,6 +836,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             isAnalyzingSound = false
             soundAnalysisMessage = nil
             analysisBundle = nil
+            bilingualLyricLines = nil
             latestAnalysisSource = nil
             asrAnalysisStatus = .notRun
             deepSeekAnalysisStatus = .notRun
@@ -824,6 +846,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         preparedLyricsFingerprint = fingerprint
         currentLyricsMode = mode
         lyricLines = []
+        bilingualLyricLines = nil
         lyricPlayback = nil
         lyricCandidates = []
         isSearchingLyrics = true
@@ -895,11 +918,33 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             self.lyricPlayback = playback
             if self.currentLyricsMode != .off, let playback {
                 self.lyricLines = playback.lines
+                if let english = storedAnalysis?.deepSeekResult,
+                   playback.lyricIdentifier == english.candidate.persistentIdentifier,
+                   let translation = storedAnalysis?.chineseTranslation {
+                    self.bilingualLyricLines = BabyPlayerBilingualLyricsComposer.compose(
+                        english: english,
+                        translation: translation
+                    )
+                } else {
+                    self.bilingualLyricLines = nil
+                }
                 if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
                     self.updateLyrics(at: elapsed)
                 }
             }
             self.updateLyricsTransportMenu()
+            if let english = storedAnalysis?.deepSeekResult,
+               playback?.lyricIdentifier == english.candidate.persistentIdentifier,
+               storedAnalysis?.chineseTranslation == nil,
+               BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish(english.candidate.lines) {
+                let translationGeneration = self.lyricsAutomationGuard.generation
+                await self.generateAndEnableChineseTranslation(
+                    english: english,
+                    item: item,
+                    selectionGeneration: translationGeneration,
+                    showsProgress: true
+                )
+            }
             // 【MODIFIED】普通歌词搜索在此结束；不再自动进入 ASR 或 DeepSeek。
         }
     }
@@ -948,6 +993,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 for: item.lyricsMedia
             )
             guard self.isCurrentMedia(fingerprint: fingerprint) else { return }
+            self.updateSmartPlaybackBoundary(
+                bundle?.smartPlaybackBoundary,
+                mediaFingerprint: fingerprint
+            )
             self.analysisBundle = bundle
             self.asrAnalysisStatus = bundle?.asrResult == nil ? .notRun : .completed
             self.deepSeekAnalysisStatus = bundle?.deepSeekResult == nil ? .notRun : .completed
@@ -955,13 +1004,26 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 self.currentLyricsMode = .english
                 self.lyricPlayback = playback
                 self.lyricLines = playback.lines
+                if let english = bundle?.deepSeekResult,
+                   let translation = bundle?.chineseTranslation {
+                    self.bilingualLyricLines = BabyPlayerBilingualLyricsComposer.compose(
+                        english: english,
+                        translation: translation
+                    )
+                } else {
+                    self.bilingualLyricLines = nil
+                }
                 self.currentLyricIndex = nil
                 if let elapsed = self.player?.currentTime().seconds, elapsed.isFinite {
                     self.updateLyrics(at: elapsed)
                 }
                 self.showManualAnalysisMessage(
-                    "DeepSeek：后台分析已完成",
-                    detail: "✓ 结果已保存并用于当前字幕",
+                    self.bilingualLyricLines == nil
+                        ? "DeepSeek：后台分析已完成"
+                        : "双语字幕已自动启用",
+                    detail: self.bilingualLyricLines == nil
+                        ? "✓ 结果已保存并用于当前字幕"
+                        : "✓ 英文字幕已保留\n✓ 简体中文字幕已启用",
                     autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
                 )
             } else if bundle?.asrResult != nil {
@@ -988,7 +1050,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             lyricsContainer?.isHidden = true
             return
         }
-        lyricsLabel?.text = lyricLines[index].text
+        if let bilingualLyricLines,
+           bilingualLyricLines.indices.contains(index),
+           bilingualLyricLines[index].englishText == lyricLines[index].text {
+            lyricsLabel?.text = bilingualLyricLines[index].englishText
+                + "\n" + bilingualLyricLines[index].chineseText
+        } else {
+            lyricsLabel?.text = lyricLines[index].text
+        }
         lyricsContainer?.isHidden = false
     }
 
@@ -1230,21 +1299,69 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         let adoptASR = analysisAdoptionAction(for: .asr)
         let adoptDeepSeek = analysisAdoptionAction(for: .deepSeek)
 
+        var children: [UIMenuElement] = []
+        if let smartSkip = smartSkipAction() {
+            children.append(smartSkip)
+        }
+        children.append(contentsOf: [
+            asr,
+            deepSeek,
+            rerunASR,
+            rerunDeepSeek,
+            asrStatus,
+            deepSeekStatus,
+            currentResult,
+            adoptASR,
+            adoptDeepSeek
+        ])
+
         return UIMenu(
-            title: "歌词分析",
+            title: "AI 功能",
             image: UIImage(systemName: "sparkles"),
-            children: [
-                asr,
-                deepSeek,
-                rerunASR,
-                rerunDeepSeek,
-                asrStatus,
-                deepSeekStatus,
-                currentResult,
-                adoptASR,
-                adoptDeepSeek
-            ]
+            children: children
         )
+    }
+
+    /// 只有当前歌曲已经生成可信边界时才显示，不为未分析或判断不足增加额外菜单状态。
+    private func smartSkipAction() -> UIAction? {
+        guard let item = currentQueueItem,
+              item.smartIntroEndSeconds != nil || item.smartOutroStartSeconds != nil else {
+            return nil
+        }
+        let action = UIAction(
+            title: "智能跳过片头片尾",
+            image: UIImage(systemName: item.smartSkipEnabled ? "forward.end.circle.fill" : "forward.end.circle")
+        ) { [weak self] _ in
+            self?.toggleSmartSkipForCurrentItem()
+        }
+        action.state = item.smartSkipEnabled ? .on : .off
+        return action
+    }
+
+    private func toggleSmartSkipForCurrentItem() {
+        guard let item = currentQueueItem,
+              item.smartIntroEndSeconds != nil || item.smartOutroStartSeconds != nil else { return }
+        let fingerprint = item.lyricsMedia.asrFingerprint
+        let previousValue = item.smartSkipEnabled
+        let newValue = !previousValue
+        updateSmartSkipEnabled(newValue, mediaFingerprint: fingerprint)
+        updateLyricsTransportMenu()
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let bundle = try await BabyLyricsRepository.shared.setSmartPlaybackEnabled(
+                    newValue,
+                    for: item.lyricsMedia
+                )
+                guard self.isCurrentMedia(fingerprint: fingerprint) else { return }
+                self.analysisBundle = bundle
+            } catch {
+                guard self.isCurrentMedia(fingerprint: fingerprint) else { return }
+                self.updateSmartSkipEnabled(previousValue, mediaFingerprint: fingerprint)
+                self.updateLyricsTransportMenu()
+            }
+        }
     }
 
     /// 为 ASR/DeepSeek 分别创建可采用项；一个结果缺失不会阻塞另一个。
@@ -1545,7 +1662,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                     asrEvidenceHash: analysis.evidenceHash,
                     smartPlaybackBoundary: BabyPlayerSmartSkipBoundaryPolicy.storedBoundary(
                         from: analysis.voiceWindowPlan,
-                        expectedMediaDuration: item.lyricsMedia.durationSeconds
+                        expectedMediaDuration: item.lyricsMedia.durationSeconds,
+                        asrSegments: analysis.segments
                     ),
                     for: item.lyricsMedia
                 )
@@ -1587,10 +1705,9 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 return
             }
 
-            // 独立获取该曲候选，不等待可能已切换到新曲目的 UI 任务。
-            let backgroundCandidates = (try? await BabyLyricsRepository.shared.searchCandidates(
-                for: item.lyricsMedia
-            )) ?? []
+            // DeepSeek 支持只用 ASR 证据。已加载的候选可直接带上，
+            // 但绝不在 ASR -> DeepSeek 之间等待第三方歌词搜索。
+            let backgroundCandidates = Array(self.lyricCandidates.prefix(3))
             guard !Task.isCancelled else { return }
             _ = await self.runDeepSeekAndAutoActivate(
                 item: item,
@@ -1631,9 +1748,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                     self.updateLyricsTransportMenu()
                 }
             }
-            let backgroundCandidates = (try? await BabyLyricsRepository.shared.searchCandidates(
-                for: item.lyricsMedia
-            )) ?? []
+            let backgroundCandidates = Array(self.lyricCandidates.prefix(3))
             guard !Task.isCancelled else { return }
             _ = await self.runDeepSeekAndAutoActivate(
                 item: item,
@@ -1689,10 +1804,11 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 automaticWorkflowGeneration: workflowGeneration
             )
             if activated {
-                showManualAnalysisMessage(
-                    "DeepSeek：已自动启用",
-                    detail: "ASR：已完成\nDeepSeek：已完成\n✓ 已自动设为这首视频的默认字幕",
-                    autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
+                await generateAndEnableChineseTranslation(
+                    english: result,
+                    item: item,
+                    selectionGeneration: workflowGeneration,
+                    showsProgress: true
                 )
             }
             return activated
@@ -1762,6 +1878,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         currentLyricsMode = .english
         lyricPlayback = playback
         lyricLines = playback.lines
+        bilingualLyricLines = nil
         currentLyricIndex = nil
         if let elapsed = player?.currentTime().seconds, elapsed.isFinite {
             updateLyrics(at: elapsed)
@@ -1770,12 +1887,108 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         return true
     }
 
+    /// 严格位于 DeepSeek 英文采纳之后；失败只影响中文展示，英文 binding 和时间轴保持原样。
+    private func generateAndEnableChineseTranslation(
+        english: StoredLyricsAnalysisResult,
+        item: BabyPlayerQueueItem,
+        selectionGeneration: Int,
+        showsProgress: Bool
+    ) async {
+        guard english.source == .deepSeek else { return }
+        guard BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish(
+            english.candidate.lines
+        ) else {
+            if isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint),
+               lyricsAutomationGuard.isCurrentGeneration(selectionGeneration) {
+                showManualAnalysisMessage(
+                    "DeepSeek：已自动启用",
+                    detail: "✓ 英文校准结果已保存并采用",
+                    autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
+                )
+            }
+            return
+        }
+
+        let cached = await BabyLyricsRepository.shared.matchingChineseTranslation(
+            for: english,
+            media: item.lyricsMedia
+        )
+        if cached == nil, showsProgress,
+           isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint),
+           lyricsAutomationGuard.isCurrentGeneration(selectionGeneration) {
+            showManualAnalysisMessage(
+                "正在生成中文字幕",
+                detail: "✓ DeepSeek 英文字幕已启用\n● 正在生成中文字幕"
+            )
+        }
+
+        do {
+            let translation: StoredLyricsTranslationResult
+            let bundle: StoredLyricsAnalysisBundle
+            if let cached {
+                translation = cached
+                guard let storedBundle = await BabyLyricsRepository.shared.analysisBundle(
+                    for: item.lyricsMedia
+                ) else { throw BabyPlayerASRError.invalidResponse }
+                bundle = storedBundle
+            } else {
+                translation = try await BabyPlayerLyricsTranslationClient().translate(
+                    english: english,
+                    mediaFingerprint: item.lyricsMedia.asrFingerprint
+                )
+                bundle = try await BabyLyricsRepository.shared.storeChineseTranslation(
+                    translation,
+                    for: item.lyricsMedia
+                )
+            }
+            guard let bilingual = BabyPlayerBilingualLyricsComposer.compose(
+                english: english,
+                translation: translation
+            ) else { throw BabyPlayerASRError.invalidResponse }
+
+            // 翻译可以跨页面完成并持久化；以下条件只控制是否还可更新当前画面。
+            guard !Task.isCancelled,
+                  !didExit,
+                  isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint),
+                  lyricsAutomationGuard.isCurrentGeneration(selectionGeneration),
+                  lyricPlayback?.lyricIdentifier == english.candidate.persistentIdentifier else {
+                return
+            }
+            analysisBundle = bundle
+            bilingualLyricLines = bilingual
+            currentLyricIndex = nil
+            if currentLyricsMode != .off,
+               let elapsed = player?.currentTime().seconds,
+               elapsed.isFinite {
+                updateLyrics(at: elapsed)
+            }
+            showManualAnalysisMessage(
+                "双语字幕已自动启用",
+                detail: "✓ 英文字幕已保留\n✓ 简体中文字幕已启用",
+                autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
+            )
+        } catch {
+            guard !Task.isCancelled,
+                  !didExit,
+                  isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint),
+                  lyricsAutomationGuard.isCurrentGeneration(selectionGeneration),
+                  lyricPlayback?.lyricIdentifier == english.candidate.persistentIdentifier else {
+                return
+            }
+            bilingualLyricLines = nil
+            showManualAnalysisMessage(
+                "中文翻译暂不可用，已保留英文字幕",
+                detail: "中文翻译暂不可用，已保留英文字幕"
+            )
+        }
+    }
+
     /// 采用指定的 ASR 或 DeepSeek 结果；只切换/持久化字幕，不会调用分析 API。
     private func adoptAnalysisResult(source: LyricsAnalysisSource) {
         guard let result = analysisBundle?.result(for: source),
               let media = currentQueueItem?.lyricsMedia else { return }
         latestAnalysisSource = source
-        lyricsAutomationGuard.lockManually()
+        let selectionGeneration = lyricsAutomationGuard.lockManually()
         lyricsSelectionTask?.cancel()
         lyricsSelectionTask = Task { [weak self] in
             guard let self else { return }
@@ -1785,6 +1998,17 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 automaticWorkflowGeneration: nil
             )
             guard activated else { return }
+            if source == .deepSeek,
+               let item = self.currentQueueItem,
+               item.lyricsMedia.id == media.id {
+                await self.generateAndEnableChineseTranslation(
+                    english: result,
+                    item: item,
+                    selectionGeneration: selectionGeneration,
+                    showsProgress: true
+                )
+                return
+            }
             self.showManualAnalysisMessage(
                 "已采用 \(source.displayName) 字幕",
                 detail: "当前字幕：\(result.source.displayName)\n以后打开这首视频将直接使用",
@@ -1856,6 +2080,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         // 【MODIFIED】manual lock 必须在创建 Task/await repository 之前同步生效。
         lyricsAutomationGuard.lockManually()
         currentLyricsMode = .english
+        bilingualLyricLines = nil
         pendingLyricSelectionIdentifier = candidate.persistentIdentifier
         lyricsSelectionTask?.cancel()
         let pendingSave = lyricsSaveTask
@@ -1889,6 +2114,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         lyricsAutomationGuard.lockManually()
         lyricPlayback = pinned
         lyricLines = pinned.lines
+        bilingualLyricLines = nil
         currentLyricsMode = .english
         currentLyricIndex = nil
         if let elapsed = player?.currentTime().seconds, elapsed.isFinite {

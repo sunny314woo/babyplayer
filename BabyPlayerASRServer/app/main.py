@@ -18,10 +18,15 @@ from app.database import (
 )
 from app.deepseek_refiner import DeepSeekLyricsRefinerClient, DeepSeekRefinerError
 from app.deepseek_lyrics_reconciler import DeepSeekLyricsReconcilerClient
+from app.deepseek_lyrics_translator import DeepSeekLyricsTranslatorClient
 from app.development_artifacts import DevelopmentArtifactWriter
 from app.lyrics_reconciler import LyricsReconciliationError, LyricsReconcilerService
 from app.lyrics_refiner import LyricsRefinementValidationError, LyricsRefinerService
 from app.lyrics_retriever import AllowlistedWebLyricsRetriever, NoopLyricsRetriever
+from app.lyrics_translation import (
+    LyricsTranslationService,
+    LyricsTranslationValidationError,
+)
 from app.local_analysis import LocalAnalysisJobManager, LocalMediaAudioExtractor
 from app.models import (
     AsrAnalysisResponse,
@@ -31,6 +36,8 @@ from app.models import (
     LyricsReconcileResponse,
     LyricsRefineRequest,
     LyricsRefineResponse,
+    LyricsTranslateRequest,
+    LyricsTranslateResponse,
     UsageResponse,
 )
 from app.service import AsrService, AudioValidationError, ServerBusyError
@@ -48,6 +55,7 @@ def create_app(
     provider_client=None,
     refiner_client=None,
     reconciler_client=None,
+    translator_client=None,
     lyrics_retriever=None,
     local_media_extractor=None,
     voice_activity_detector=None,
@@ -117,6 +125,17 @@ def create_app(
         model_name=config.deepseek_model,
         analysis_version=service.analysis_version,
         reconciliation_version=config.lyrics_reconciliation_version,
+    )
+    translation_provider = translator_client or DeepSeekLyricsTranslatorClient(
+        api_key=config.deepseek_api_key,
+        endpoint=config.deepseek_endpoint,
+        model=config.deepseek_model,
+        timeout_seconds=config.timeout_seconds,
+    )
+    translation_service = LyricsTranslationService(
+        repository=database,
+        model=translation_provider,
+        model_name=config.deepseek_model,
     )
     application = FastAPI(
         title="BabyPlayer ASR Service",
@@ -452,6 +471,45 @@ def create_app(
                 detail={"code": "AI_LYRICS_CACHE_NOT_FOUND"},
             )
         return {**result, "cache_hit": True}
+
+    @application.post(
+        "/v1/lyrics/translate/zh-Hans", response_model=LyricsTranslateResponse
+    )
+    def translate_lyrics_to_simplified_chinese(
+        request: LyricsTranslateRequest,
+        subject_hash: str = Depends(require_babyplayer_token),
+    ) -> dict:
+        """Translate only supplied verified English lines; never runs ASR or reconciliation."""
+        if not config.lyrics_refiner_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "DEEPSEEK_NOT_CONFIGURED"},
+            )
+        try:
+            return translation_service.translate(
+                subject_hash=subject_hash,
+                request=request,
+                now=datetime.now(timezone.utc),
+            )
+        except LyricsTranslationValidationError as exc:
+            logger.error("Lyrics translation rejected reason=%s", str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "INVALID_LYRICS_TRANSLATION", "message": str(exc)},
+            )
+        except DeepSeekRefinerError:
+            logger.exception(
+                "DeepSeek lyrics translation unavailable fingerprint=%s english_hash=%s",
+                request.media_fingerprint,
+                request.english_lyrics_content_hash,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "code": "DEEPSEEK_UNAVAILABLE",
+                    "message": "中文翻译暂不可用",
+                },
+            )
 
     return application
 

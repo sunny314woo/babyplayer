@@ -534,6 +534,26 @@ def test_reconciler_normalizes_overlapping_model_ranges_and_recovers_gap() -> No
     }]
 
 
+def test_reconciler_normalizes_unknown_model_source_labels() -> None:
+    unstable = FakeD3Model().result
+    unstable["primary_source"] = "best_matching_lyrics"
+    unstable["lines"][0]["source"] = "verified_candidate"
+    target = service(
+        MemoryRepository(), FakeD3Model(result=unstable), FakeRetriever()
+    )
+
+    reconciled = target.reconcile(
+        subject_hash="subject",
+        request=request(),
+        asr_analysis=asr_analysis(),
+        now=NOW,
+    )
+
+    assert reconciled["primary_source"] == "mixed"
+    assert reconciled["lines"][0]["source"] == "candidate_1"
+    assert reconciled["lines"][0]["start_seconds"] == 0.4
+
+
 def test_reconciler_still_rejects_out_of_bounds_model_range() -> None:
     invalid = FakeD3Model().result
     invalid["lines"][1]["asr_word_end_index"] = 10
