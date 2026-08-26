@@ -78,6 +78,72 @@ Jellyfin 不需要、也不能作为服务器安装在 Apple TV 上。平时播�
 
 Xcode 会自动签名、编译、安装并启动 BabyPlayer。Apple 官方的实体设备运行说明见 [Running your app on simulated or physical devices](https://developer.apple.com/documentation/xcode/running-your-app-on-simulated-or-physical-devices)。
 
+### 手动一键重新签名并部署
+
+项目内置了一个不依赖 AI 的命令行脚本。脚本地址：
+`Scripts/deploy-to-apple-tv.command`。它使用 Xcode 的 Automatic Signing 重新生成/更新开发签名，
+构建 tvOS App，通过 `devicectl` 安装到已配对的 Apple TV，并启动 BabyPlayer。
+
+对于当前这台已经配对并成功部署过的 Mac 与 Apple TV，日常更新只需要唤醒 Apple TV、确认两边在同一个
+Wi-Fi，然后执行下面这一条命令即可。不需要每次重新配对，也不需要每次打开 Apple TV 的配对页面。
+
+首次使用、更换 Mac，或配对关系失效时，才需要完成这些人工准备：
+
+1. 安装完整 Xcode，不是只有 Command Line Tools；打开 Xcode 并登录 Apple 账户。
+2. 在 Xcode 的 `Window → Devices and Simulators` 中完成 Apple TV 配对。
+3. Mac 和 Apple TV 连接同一个局域网；首次配对时让 Apple TV 保持唤醒，并准备输入电视 PIN。
+4. 确认项目 Target 的 Team 与 Bundle ID 是当前 Apple 账户可用的值。当前工程默认是
+   `RD2D85V483` 与 `com.wufengyu.BabyPlayer`，如果你的账户不同，可以修改工程设置，或使用脚本的环境变量覆盖。
+
+完成准备后，在终端执行单条命令即可：
+
+```bash
+"/Users/wufengyu/Projects/AppleTV-儿童播放器/Scripts/deploy-to-apple-tv.command"
+```
+
+如果当前就在项目目录，也可以执行：
+
+```bash
+./Scripts/deploy-to-apple-tv.command
+```
+
+默认会寻找名称为“客厅”的 tvOS 设备。Apple TV 改名或存在多台设备时，指定名称、CoreDevice ID
+或 UDID：
+
+```bash
+./Scripts/deploy-to-apple-tv.command --device "客厅"
+```
+
+常用选项：
+
+- `--debug`：构建 Debug 版本；默认构建 Release 版本；
+- `--no-launch`：只安装，不自动启动；
+- `--help`：查看完整参数和环境变量。
+
+脚本实际输出的签名 App 包位于
+`.derivedData-apple-tv/Build/Products/Release-appletvos/BabyPlayer.app`。这个 `.app` 就是供
+`devicectl` 直接安装的已签名 tvOS App 包，不需要另行制作 IPA。
+
+脚本不会代替首次 Apple ID 登录、Apple TV 配对、电视 PIN、Mac 管理员密码或 Xcode 弹窗确认。
+若 Apple TV 不在线、未配对、与 Mac 不在同一局域网，脚本会在查找设备或安装阶段停止；重新连接设备后
+再次执行同一条命令即可。若构建阶段提示证书或 Provisioning Profile，先打开 Xcode 手动运行一次
+BabyPlayer，让 Xcode 完成账户授权和 Automatic Signing 初始化。
+
+### 自动定时部署（暂不启用）
+
+当前先不注册定时任务，先确认上面的手动命令可以稳定完成一次完整部署。后续适合使用 macOS 的
+`launchd` 注册当前用户的 LaunchAgent，例如每 3 天运行一次，或每 7 天运行一次；电脑开机后
+登录用户会话时由 `launchd` 拉起检查脚本。检查逻辑应当是：
+
+1. 用 `devicectl list devices --json-output` 检查已配对的 Apple TV 是否可连接；不可连接时记录日志并跳过，避免无意义构建。
+2. 检查最近一次签名 App 内的 Provisioning Profile 到期时间，以及本机可用的 Apple Development 证书。
+3. 在到期前的安全窗口内调用上面的部署脚本；部署成功后写入时间戳和结果日志。
+4. Apple TV 不在线时等待下一次检查；自动任务不能替代首次配对，也不能可靠唤醒一台完全离线的电视。
+
+免费 Personal Team 通常只有约 7 天的设备安装授权，因此 3 天周期比 7 天周期更有余量；付费开发者账户
+的证书/profile 周期不同，仍应以本机实际 profile 的到期时间为准。等手动脚本验证通过后，再根据你希望的
+策略选择“固定每 3/7 天部署”还是“只在剩余时间低于阈值时部署”。
+
 ### 免费 Apple 账户的限制
 
 不付费也可以安装到自己的 Apple TV，但 Personal Team 的安装授权 7 天后到期，到时需要重新在 Xcode 中运行安装。Apple Developer Program 会员不需要每周重新签名。具体限制见 [Apple Developer account overview](https://developer.apple.com/help/account/basics/about-your-developer-account)。
