@@ -79,6 +79,11 @@ class Settings:
         "LOCAL_PREPROCESSED_AUDIO_CACHE_DIRECTORY",
         str(BASE_DIR / ".cache" / "preprocessed-audio"),
     )
+    # 完整媒体哈希只在源文件身份变化时重算，不与音频处理版本绑定。
+    local_media_content_hash_cache_directory: str = os.getenv(
+        "LOCAL_MEDIA_CONTENT_HASH_CACHE_DIRECTORY",
+        str(BASE_DIR / ".cache" / "media-content-hashes"),
+    )
     # 【MODIFIED】Mac 本地分析只允许读取显式白名单目录，不开放任意文件路径。
     local_media_roots: tuple[str, ...] = _path_list("LOCAL_MEDIA_ROOTS")
     local_ffmpeg_path: str = os.getenv(

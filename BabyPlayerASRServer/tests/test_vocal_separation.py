@@ -1,4 +1,6 @@
 from dataclasses import replace
+from concurrent.futures import Future
+import hashlib
 from pathlib import Path
 import wave
 
@@ -6,6 +8,7 @@ import pytest
 
 from app.config import Settings
 from app.local_analysis import (
+    LocalMediaContentHashCache,
     LocalMediaAudioExtractor,
     LocalNoVocalsDetectedError,
 )
@@ -57,6 +60,9 @@ def configured(tmp_path):
         local_vocal_separation_model_directory=str(tmp_path / "models"),
         local_preprocessed_audio_cache_directory=str(
             tmp_path / "preprocessed-audio"
+        ),
+        local_media_content_hash_cache_directory=str(
+            tmp_path / "media-content-hashes"
         ),
         local_voice_activity_enabled=True,
         max_audio_bytes=1024 * 1024,
@@ -315,6 +321,105 @@ def test_force_refresh_reuses_preprocessed_chunks_across_extractor_restart(
     assert reused.audio_preprocessing["preprocessing_cache_hit"] is True
     cache_root = Path(config.local_preprocessed_audio_cache_directory)
     assert len([value for value in cache_root.iterdir() if value.is_dir()]) == 1
+
+
+def test_media_content_hash_is_reused_across_extractor_restart(tmp_path) -> None:
+    source = tmp_path / "hash-once.mp4"
+    source.write_bytes(b"stable-video-content")
+    calls = []
+
+    def counting_hash(path):
+        calls.append(path)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    config = configured(tmp_path)
+    first = RecordingExtractor(
+        config,
+        vocal_stem_separator=FakeStemSeparator(),
+        voice_activity_detector=FakeVoiceActivityDetector(),
+        content_hash_cache=LocalMediaContentHashCache(
+            config.local_media_content_hash_cache_directory,
+            hash_file=counting_hash,
+        ),
+    )
+    first.extract(local_request(source))
+
+    restarted = RecordingExtractor(
+        config,
+        vocal_stem_separator=FakeStemSeparator(),
+        voice_activity_detector=FakeVoiceActivityDetector(),
+        content_hash_cache=LocalMediaContentHashCache(
+            config.local_media_content_hash_cache_directory,
+            hash_file=counting_hash,
+        ),
+    )
+    restarted.extract(local_request(source).model_copy(
+        update={"force_refresh": True}
+    ))
+
+    assert calls == [source]
+    assert restarted.commands == []
+
+
+def test_media_content_hash_invalidates_when_source_identity_changes(tmp_path) -> None:
+    source = tmp_path / "changed-hash.mp4"
+    source.write_bytes(b"video-v1")
+    calls = []
+
+    def counting_hash(path):
+        calls.append(path.read_bytes())
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    cache = LocalMediaContentHashCache(
+        str(tmp_path / "media-content-hashes"),
+        hash_file=counting_hash,
+    )
+    first = cache.compute(source)
+    assert cache.lookup(source) == first
+
+    source.write_bytes(b"video-v2")
+    second = cache.compute(source)
+
+    assert first != second
+    assert calls == [b"video-v1", b"video-v2"]
+
+
+def test_first_content_hash_starts_after_lossless_decode(tmp_path) -> None:
+    source = tmp_path / "deferred-hash.mp4"
+    source.write_bytes(b"video")
+    events = []
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    class DeferredHashCache:
+        def __init__(self):
+            self.value = None
+
+        def lookup(self, source):
+            del source
+            return self.value
+
+        def compute_async(self, source):
+            del source
+            events.append("hash")
+            self.value = digest
+            future = Future()
+            future.set_result(digest)
+            return future
+
+    class OrderedExtractor(RecordingExtractor):
+        def _run_ffmpeg(self, command, output, *, error_message):
+            if output.name == "source-mix.wav":
+                events.append("decode")
+            super()._run_ffmpeg(command, output, error_message=error_message)
+
+    OrderedExtractor(
+        configured(tmp_path),
+        vocal_stem_separator=FakeStemSeparator(),
+        voice_activity_detector=FakeVoiceActivityDetector(),
+        content_hash_cache=DeferredHashCache(),
+    ).extract(local_request(source))
+
+    assert events[:2] == ["decode", "hash"]
 
 
 def test_preprocessed_audio_cache_invalidates_for_content_or_pipeline_change(

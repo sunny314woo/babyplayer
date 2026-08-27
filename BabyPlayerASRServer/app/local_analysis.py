@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,11 @@ from app.vocal_separation import VocalSeparationError
 
 logger = logging.getLogger("babyplayer.local_analysis")
 PREPROCESSED_AUDIO_CACHE_SCHEMA = "babyplayer-preprocessed-audio-v1"
+MEDIA_CONTENT_HASH_CACHE_SCHEMA = "babyplayer-media-content-hash-v1"
+_CONTENT_HASH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="babyplayer-content-hash",
+)
 ALLOWED_MEDIA_EXTENSIONS = {
     ".aac", ".avi", ".m4a", ".m4v", ".mkv", ".mov", ".mp3", ".mp4", ".webm"
 }
@@ -90,6 +96,84 @@ class AudioChunkWindow:
             if self.source_offset_seconds is None
             else self.source_offset_seconds
         )
+
+
+class LocalMediaContentHashCache:
+    """Reuse one verified full-file hash while the source file identity is unchanged."""
+
+    def __init__(self, directory: str, *, hash_file=None) -> None:
+        self.root = Path(directory).expanduser().resolve() if directory else None
+        self._hash_file = hash_file or _sha256_file
+        self._lock = threading.Lock()
+        self._memory: dict[str, tuple[dict[str, int | str], str]] = {}
+
+    def lookup(self, source: Path) -> str | None:
+        identity = _source_file_identity(source)
+        memory = self._memory.get(str(source.resolve()))
+        if memory is not None and memory[0] == identity:
+            return memory[1]
+        if self.root is None:
+            return None
+        try:
+            manifest = json.loads(self._entry(source).read_text(encoding="utf-8"))
+            digest = str(manifest["media_content_sha256"])
+            if (
+                manifest.get("schema") != MEDIA_CONTENT_HASH_CACHE_SCHEMA
+                or manifest.get("source_identity") != identity
+                or len(digest) != 64
+                or any(value not in "0123456789abcdef" for value in digest)
+            ):
+                return None
+            self._memory[str(source.resolve())] = (identity, digest)
+            return digest
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+
+    def compute_async(self, source: Path) -> Future:
+        return _CONTENT_HASH_EXECUTOR.submit(self.compute, source)
+
+    def compute(self, source: Path) -> str:
+        with self._lock:
+            cached = self.lookup(source)
+            if cached is not None:
+                return cached
+            identity_before = _source_file_identity(source)
+            digest = self._hash_file(source)
+            identity_after = _source_file_identity(source)
+            if identity_after != identity_before:
+                raise LocalMediaExtractionError(
+                    "媒体文件在声音准备期间发生变化，请稍后重试"
+                )
+            if self.root is not None:
+                try:
+                    self.root.mkdir(parents=True, exist_ok=True)
+                    entry = self._entry(source)
+                    temporary = self.root / f".{entry.name}.{uuid.uuid4().hex}.tmp"
+                    try:
+                        temporary.write_text(
+                            json.dumps({
+                                "schema": MEDIA_CONTENT_HASH_CACHE_SCHEMA,
+                                "source_identity": identity_after,
+                                "media_content_sha256": digest,
+                            }, ensure_ascii=False, sort_keys=True),
+                            encoding="utf-8",
+                        )
+                        temporary.replace(entry)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                except OSError as exc:
+                    # Persistence is an optimization; a cache write failure must not
+                    # delay or discard otherwise valid subtitles from this session.
+                    logger.warning(
+                        "Media content hash cache write unavailable error_type=%s",
+                        type(exc).__name__,
+                    )
+            self._memory[str(source.resolve())] = (identity_after, digest)
+            return digest
+
+    def _entry(self, source: Path) -> Path:
+        encoded = str(source.resolve()).encode("utf-8")
+        return self.root / f"{hashlib.sha256(encoded).hexdigest()}.json"
 
 
 class LocalPreprocessedAudioCache:
@@ -306,6 +390,7 @@ class LocalMediaAudioExtractor:
         vocal_stem_separator=None,
         voice_window_planner=None,
         preprocessing_cache=None,
+        content_hash_cache=None,
     ) -> None:
         self.config = config
         self.voice_activity_detector = voice_activity_detector
@@ -352,6 +437,12 @@ class LocalMediaAudioExtractor:
                 config.local_preprocessed_audio_cache_directory
             )
         )
+        self.content_hash_cache = (
+            content_hash_cache
+            or LocalMediaContentHashCache(
+                config.local_media_content_hash_cache_directory
+            )
+        )
         self.roots = tuple(
             Path(value).expanduser().resolve()
             for value in config.local_media_roots
@@ -359,18 +450,22 @@ class LocalMediaAudioExtractor:
 
     def extract(self, request: LocalAnalysisJobRequest) -> ExtractedAudio:
         source = self._validated_source(request.media_path)
-        media_content_sha256 = _sha256_file(source)
         media_duration = request.duration_seconds
         timeline_start = request.song_start_seconds
         timeline_end = request.song_end_seconds or media_duration
         duration = timeline_end - timeline_start
-        preprocessing_cache_key = self._preprocessing_cache_key(
-            request,
-            media_content_sha256=media_content_sha256,
-        )
-        cached = self.preprocessing_cache.load(preprocessing_cache_key)
-        if cached is not None:
-            return cached
+        media_content_sha256 = self.content_hash_cache.lookup(source)
+        if media_content_sha256 is not None:
+            preprocessing_cache_key = self._preprocessing_cache_key(
+                request,
+                media_content_sha256=media_content_sha256,
+            )
+            cached = self.preprocessing_cache.load(preprocessing_cache_key)
+            if (
+                cached is not None
+                and self.content_hash_cache.lookup(source) == media_content_sha256
+            ):
+                return cached
 
         ffmpeg = Path(self.config.local_ffmpeg_path).expanduser()
         if not ffmpeg.is_file():
@@ -396,6 +491,13 @@ class LocalMediaAudioExtractor:
                 lossless_mix,
                 error_message="Mac 无法从该视频提取音频",
             )
+
+            # A cache miss must not put a full-file read in front of audio work.
+            # Start it only after the source has been decoded, then overlap it with
+            # the much slower separation/VAD/encoding pipeline.
+            content_hash_future = None
+            if media_content_sha256 is None:
+                content_hash_future = self.content_hash_cache.compute_async(source)
 
             asr_source = lossless_mix
             audio_preprocessing = {
@@ -586,6 +688,24 @@ class LocalMediaAudioExtractor:
                     duration_seconds=window.duration_seconds,
                     audio=chunk_audio,
                 ))
+            if content_hash_future is not None:
+                media_content_sha256 = content_hash_future.result()
+            if (
+                media_content_sha256 is None
+                or self.content_hash_cache.lookup(source) != media_content_sha256
+            ):
+                raise LocalMediaExtractionError(
+                    "媒体文件在声音准备期间发生变化，请稍后重试"
+                )
+            preprocessing_cache_key = self._preprocessing_cache_key(
+                request,
+                media_content_sha256=media_content_sha256,
+            )
+            concurrently_cached = self.preprocessing_cache.load(
+                preprocessing_cache_key
+            )
+            if concurrently_cached is not None:
+                return concurrently_cached
             extracted = ExtractedAudio(
                 data=audio,
                 duration_seconds=duration,
@@ -735,6 +855,18 @@ def _sha256_file(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _source_file_identity(path: Path) -> dict[str, int | str]:
+    stat = path.stat()
+    return {
+        "resolved_path": str(path.resolve()),
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+        "size": int(stat.st_size),
+        "modified_nanoseconds": int(stat.st_mtime_ns),
+        "changed_nanoseconds": int(stat.st_ctime_ns),
+    }
 
 
 def _voice_activity_metrics(
@@ -994,6 +1126,7 @@ __all__ = [
     "ExtractedAudio",
     "AudioChunkWindow",
     "LocalAnalysisJobManager",
+    "LocalMediaContentHashCache",
     "LocalMediaAudioExtractor",
     "LocalPreprocessedAudioCache",
     "LocalMediaExtractionError",
