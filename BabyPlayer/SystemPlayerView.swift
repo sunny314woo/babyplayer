@@ -361,6 +361,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var lyricsSaveTask: Task<Void, Never>?
     private var lyricsSelectionTask: Task<Void, Never>?
     private var aiProgressHideTask: Task<Void, Never>?
+    private var outroFadeTask: Task<Void, Never>?
     private var lyricLines: [TimedLyricLine] = []
     /// 仅用于展示；英文 lyricLines 继续独立承担全部时间轴计算和偏移。
     private var bilingualLyricLines: [BilingualLyricLine]?
@@ -467,6 +468,9 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         lyricsSelectionTask = nil
         aiProgressHideTask?.cancel()
         aiProgressHideTask = nil
+        outroFadeTask?.cancel()
+        outroFadeTask = nil
+        player?.volume = 1
         player?.pause()
         if let timeObserver, let player {
             player.removeTimeObserver(timeObserver)
@@ -575,6 +579,9 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             return
         }
 
+        outroFadeTask?.cancel()
+        outroFadeTask = nil
+        player?.volume = 1
         isAdvancing = false
         let playerItem = AVPlayerItem(url: queueItem.url)
         playerItem.externalMetadata = [titleMetadataItem(queueItem.title)]
@@ -642,14 +649,44 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
         if let outroTarget, elapsed >= outroTarget {
             isAdvancing = true
-            lyricsContainer?.isHidden = true
-            lyricsLabel?.text = nil
-            currentLyricIndex = nil
-            handleNaturalEnd()
+            beginOutroFadeAndAdvance(itemID: queueItem.id)
+        }
+    }
+
+    /// 从已验证的片尾边界开始做 1.5 秒音量渐弱，完成后再切换。
+    /// 渐弱只影响播放器音量，不修改歌词或 ASR 的绝对时间轴。
+    private func beginOutroFadeAndAdvance(itemID: String) {
+        outroFadeTask?.cancel()
+        let stepCount = BabyPlayerOutroTransitionPolicy.fadeStepCount
+        let stepNanoseconds = UInt64(
+            BabyPlayerOutroTransitionPolicy.fadeDurationSeconds
+                / Double(stepCount)
+                * 1_000_000_000
+        )
+        outroFadeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for step in 1...stepCount {
+                do {
+                    try await Task.sleep(nanoseconds: stepNanoseconds)
+                } catch {
+                    return
+                }
+                guard !self.didExit,
+                      self.currentQueueItem?.id == itemID,
+                      self.isAdvancing else { return }
+                self.player?.volume = max(0, 1 - Float(step) / Float(stepCount))
+            }
+            self.lyricsContainer?.isHidden = true
+            self.lyricsLabel?.text = nil
+            self.currentLyricIndex = nil
+            self.handleNaturalEnd()
         }
     }
 
     private func handleNaturalEnd() {
+        outroFadeTask?.cancel()
+        outroFadeTask = nil
+        player?.volume = 1
         guard !queueItems.isEmpty else {
             finishPlayback()
             return
@@ -1214,14 +1251,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         ]
     }
 
-    // 【MODIFIED】分析仍由用户显式发起；ASR 成功后自动续跑 DeepSeek 并启用，同时保留分阶段手工入口。
+    // 分析仍由用户显式发起；已有 DeepSeek 时 ASR 只更新声音证据和智能跳过。
     /// 构建 Apple TV 歌词分析菜单；无输入，输出单层 UIMenu，不访问网络或持久化。
     private func lyricsAnalysisMenu() -> UIMenu {
         let asr = UIAction(
-            title: "ASR 识别歌词",
+            title: "声音分析与智能跳过",
             subtitle: analysisBundle?.asrResult == nil
-                ? "识别后自动进入 DeepSeek 并启用"
-                : "优先使用缓存；完成后自动校准并启用",
+                ? "首次听写并生成片头片尾；完成后继续生成双语"
+                : "优先复用听写与音频切片缓存；保留现有双语",
             image: UIImage(systemName: "waveform")
         ) { [weak self] _ in
             self?.requestASRRecognition(forceRefresh: false)
@@ -1238,8 +1275,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             self?.requestDeepSeekCalibration(forceRefresh: false)
         }
         let rerunASR = UIAction(
-            title: "重新 ASR 识别",
-            subtitle: "强制重跑 ASR 和 DeepSeek，可能再次计费",
+            title: "重新听写 ASR",
+            subtitle: "复用已准备的人声音频和切片；只重新调用腾讯",
             image: UIImage(systemName: "arrow.clockwise")
         ) { [weak self] _ in
             self?.requestASRRecognition(forceRefresh: true)
@@ -1648,6 +1685,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             }
 
             let asrResult: StoredLyricsAnalysisResult
+            let shouldRunDeepSeek: Bool
             do {
                 let analysis = try await BabyPlayerASRCoordinator.shared.recognize(
                     item: item,
@@ -1681,15 +1719,26 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                     mediaFingerprint: fingerprint
                 )
                 asrResult = storedASR
+                shouldRunDeepSeek = BabyPlayerPostASRWorkflowPolicy.shouldRunDeepSeek(
+                    existingResult: bundle.deepSeekResult
+                )
                 if self.isCurrentMedia(fingerprint: item.lyricsMedia.asrFingerprint) {
                     self.analysisBundle = bundle
-                    self.latestAnalysisSource = .asr
+                    self.latestAnalysisSource = bundle.deepSeekResult == nil ? .asr : .deepSeek
                     self.asrAnalysisStatus = .completed
                     self.deepSeekAnalysisStatus = bundle.deepSeekResult == nil ? .notRun : .completed
-                    self.showManualAnalysisMessage(
-                        "ASR：已完成，准备 DeepSeek",
-                        detail: "ASR：已完成\nDeepSeek：正在准备候选证据…\n完成后将自动启用"
-                    )
+                    if shouldRunDeepSeek {
+                        self.showManualAnalysisMessage(
+                            "ASR：已完成，准备 DeepSeek",
+                            detail: "ASR：已完成\nDeepSeek：正在准备候选证据…\n完成后将自动启用"
+                        )
+                    } else {
+                        self.showManualAnalysisMessage(
+                            "ASR：已更新智能跳过",
+                            detail: "✓ 片头片尾边界已更新\n✓ 已保留现有 DeepSeek 双语字幕",
+                            autoHideAfterSeconds: BabyPlayerAIOverlayPolicy.adoptedResultDisplaySeconds
+                        )
+                    }
                 }
             } catch {
                 guard !Task.isCancelled else { return }
@@ -1710,6 +1759,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 }
                 return
             }
+
+            // 重扫 ASR 只更新声音证据和智能跳过；已有 DeepSeek 字幕时
+            // 保持原英文、中文和时间轴，不发起不必要的模型请求。
+            guard shouldRunDeepSeek else { return }
 
             // DeepSeek 支持只用 ASR 证据。已加载的候选可直接带上，
             // 但绝不在 ASR -> DeepSeek 之间等待第三方歌词搜索。

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import json
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -41,6 +43,7 @@ from app.vocal_separation import VocalSeparationError
 
 
 logger = logging.getLogger("babyplayer.local_analysis")
+PREPROCESSED_AUDIO_CACHE_SCHEMA = "babyplayer-preprocessed-audio-v1"
 ALLOWED_MEDIA_EXTENSIONS = {
     ".aac", ".avi", ".m4a", ".m4v", ".mkv", ".mov", ".mp3", ".mp4", ".webm"
 }
@@ -87,6 +90,149 @@ class AudioChunkWindow:
             if self.source_offset_seconds is None
             else self.source_offset_seconds
         )
+
+
+class LocalPreprocessedAudioCache:
+    """Persist exact provider inputs so forced ASR never repeats stem separation."""
+
+    def __init__(self, directory: str) -> None:
+        self.root = Path(directory).expanduser().resolve() if directory else None
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self.root is not None
+
+    def load(self, key: str) -> ExtractedAudio | None:
+        if self.root is None:
+            return None
+        folder = self.root / key
+        try:
+            manifest = json.loads((folder / "manifest.json").read_text())
+            if (
+                manifest.get("schema") != PREPROCESSED_AUDIO_CACHE_SCHEMA
+                or manifest.get("cache_key") != key
+            ):
+                return None
+            complete_audio = (folder / "complete.m4a").read_bytes()
+            if not complete_audio:
+                return None
+            chunks = []
+            for expected_index, raw in enumerate(manifest["chunks"]):
+                file_name = str(raw["file"])
+                expected_file_name = f"chunk-{expected_index:03d}.m4a"
+                if file_name != expected_file_name:
+                    return None
+                chunks.append(AsrAudioChunk(
+                    index=int(raw["index"]),
+                    offset_seconds=float(raw["offset_seconds"]),
+                    duration_seconds=float(raw["duration_seconds"]),
+                    audio=(folder / expected_file_name).read_bytes(),
+                    voice_format=str(raw.get("voice_format") or "m4a"),
+                ))
+            chunks = tuple(chunks)
+            if not chunks or any(
+                chunk.index != index or not chunk.audio
+                for index, chunk in enumerate(chunks)
+            ):
+                return None
+            voice_activity = _voice_activity_from_cache(manifest.get("voice_activity"))
+            preprocessing = manifest.get("audio_preprocessing")
+            if preprocessing is not None and not isinstance(preprocessing, dict):
+                return None
+            preprocessing = dict(preprocessing or {})
+            preprocessing["preprocessing_cache_hit"] = True
+            return ExtractedAudio(
+                data=complete_audio,
+                duration_seconds=float(manifest["duration_seconds"]),
+                voice_format=str(manifest.get("voice_format") or "m4a"),
+                media_content_sha256=str(manifest["media_content_sha256"]),
+                chunks=chunks,
+                voice_activity=voice_activity,
+                audio_preprocessing=preprocessing,
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+
+    def store(self, key: str, extracted: ExtractedAudio) -> None:
+        if self.root is None or not extracted.chunks or not extracted.data:
+            return
+        with self._lock:
+            if self.load(key) is not None:
+                return
+            self.root.mkdir(parents=True, exist_ok=True)
+            temporary = Path(tempfile.mkdtemp(prefix=f".{key[:12]}-", dir=self.root))
+            try:
+                (temporary / "complete.m4a").write_bytes(extracted.data)
+                chunk_descriptors = []
+                for chunk in extracted.chunks:
+                    file_name = f"chunk-{chunk.index:03d}.m4a"
+                    (temporary / file_name).write_bytes(chunk.audio)
+                    chunk_descriptors.append({
+                        "index": chunk.index,
+                        "offset_seconds": chunk.offset_seconds,
+                        "duration_seconds": chunk.duration_seconds,
+                        "voice_format": chunk.voice_format,
+                        "file": file_name,
+                    })
+                preprocessing = dict(extracted.audio_preprocessing or {})
+                preprocessing.pop("preprocessing_cache_hit", None)
+                manifest = {
+                    "schema": PREPROCESSED_AUDIO_CACHE_SCHEMA,
+                    "cache_key": key,
+                    "duration_seconds": extracted.duration_seconds,
+                    "voice_format": extracted.voice_format,
+                    "media_content_sha256": extracted.media_content_sha256,
+                    "chunks": chunk_descriptors,
+                    "voice_activity": _voice_activity_to_cache(extracted.voice_activity),
+                    "audio_preprocessing": preprocessing,
+                }
+                (temporary / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+                    encoding="utf-8",
+                )
+                final = self.root / key
+                if final.exists():
+                    # Keep a corrupt/incomplete entry recoverable for diagnostics,
+                    # while allowing the newly completed immutable entry to win.
+                    final.rename(
+                        self.root / f".invalid-{key[:12]}-{uuid.uuid4().hex}"
+                    )
+                temporary.rename(final)
+            finally:
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+
+
+def _voice_activity_to_cache(evidence: VoiceActivityEvidence | None):
+    if evidence is None:
+        return None
+    return {
+        "detector": evidence.detector,
+        "scope": evidence.scope,
+        "threshold": evidence.threshold,
+        "frame_seconds": evidence.frame_seconds,
+        "probabilities": list(evidence.probabilities),
+        "speech_intervals": [list(value) for value in evidence.speech_intervals],
+    }
+
+
+def _voice_activity_from_cache(raw) -> VoiceActivityEvidence | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise TypeError("cached voice activity must be an object")
+    return VoiceActivityEvidence(
+        detector=str(raw["detector"]),
+        scope=str(raw["scope"]),
+        threshold=float(raw["threshold"]),
+        frame_seconds=float(raw["frame_seconds"]),
+        probabilities=tuple(float(value) for value in raw["probabilities"]),
+        speech_intervals=tuple(
+            (float(value[0]), float(value[1]))
+            for value in raw["speech_intervals"]
+        ),
+    )
 
 
 def plan_audio_chunks(
@@ -159,6 +305,7 @@ class LocalMediaAudioExtractor:
         voice_activity_detector=None,
         vocal_stem_separator=None,
         voice_window_planner=None,
+        preprocessing_cache=None,
     ) -> None:
         self.config = config
         self.voice_activity_detector = voice_activity_detector
@@ -199,6 +346,12 @@ class LocalMediaAudioExtractor:
                 )
             )
         self.uses_vocal_separation = vocal_stem_separator is not None
+        self.preprocessing_cache = (
+            preprocessing_cache
+            or LocalPreprocessedAudioCache(
+                config.local_preprocessed_audio_cache_directory
+            )
+        )
         self.roots = tuple(
             Path(value).expanduser().resolve()
             for value in config.local_media_roots
@@ -211,6 +364,13 @@ class LocalMediaAudioExtractor:
         timeline_start = request.song_start_seconds
         timeline_end = request.song_end_seconds or media_duration
         duration = timeline_end - timeline_start
+        preprocessing_cache_key = self._preprocessing_cache_key(
+            request,
+            media_content_sha256=media_content_sha256,
+        )
+        cached = self.preprocessing_cache.load(preprocessing_cache_key)
+        if cached is not None:
+            return cached
 
         ffmpeg = Path(self.config.local_ffmpeg_path).expanduser()
         if not ffmpeg.is_file():
@@ -426,7 +586,7 @@ class LocalMediaAudioExtractor:
                     duration_seconds=window.duration_seconds,
                     audio=chunk_audio,
                 ))
-            return ExtractedAudio(
+            extracted = ExtractedAudio(
                 data=audio,
                 duration_seconds=duration,
                 media_content_sha256=media_content_sha256,
@@ -436,8 +596,93 @@ class LocalMediaAudioExtractor:
                     start_seconds=timeline_start,
                     end_seconds=timeline_end,
                 ),
-                audio_preprocessing=audio_preprocessing,
+                audio_preprocessing={
+                    **audio_preprocessing,
+                    "preprocessing_cache_hit": False,
+                },
             )
+            self.preprocessing_cache.store(preprocessing_cache_key, extracted)
+            return extracted
+
+    def _preprocessing_cache_key(
+        self,
+        request: LocalAnalysisJobRequest,
+        *,
+        media_content_sha256: str,
+    ) -> str:
+        config = self.config
+        identity = {
+            "schema": PREPROCESSED_AUDIO_CACHE_SCHEMA,
+            "media_fingerprint": request.media_fingerprint,
+            "media_content_sha256": media_content_sha256,
+            "media_duration_seconds": f"{request.duration_seconds:.6f}",
+            "song_start_seconds": f"{request.song_start_seconds:.6f}",
+            "song_end_seconds": f"{(request.song_end_seconds or request.duration_seconds):.6f}",
+            "audio": {
+                "complete_format": "aac-16k-mono-64k-v1",
+                "chunk_seconds": config.local_asr_chunk_seconds,
+                "chunk_overlap_seconds": config.local_asr_chunk_overlap_seconds,
+            },
+            "vocal_separation": {
+                "enabled": self.vocal_stem_separator is not None,
+                "implementation": getattr(
+                    self.vocal_stem_separator,
+                    "separator_name",
+                    type(self.vocal_stem_separator).__name__,
+                ),
+                "version": config.local_vocal_separation_version,
+                "model": config.local_vocal_separation_model,
+                "minimum_coverage": config.local_minimum_vocal_coverage,
+                "minimum_mean_probability": (
+                    config.local_minimum_vocal_mean_probability
+                ),
+            },
+            "voice_activity": {
+                "enabled": self.voice_activity_detector is not None,
+                "detector": getattr(
+                    self.voice_activity_detector,
+                    "detector_name",
+                    type(self.voice_activity_detector).__name__,
+                ),
+                "threshold": config.local_voice_activity_threshold,
+            },
+            "planner": {
+                "enabled": self.voice_window_planner is not None,
+                "minimum_speech_seconds": (
+                    config.local_voice_window_minimum_speech_seconds
+                ),
+                "merge_gap_seconds": config.local_voice_window_merge_gap_seconds,
+                "padding_before_seconds": (
+                    config.local_voice_window_padding_before_seconds
+                ),
+                "padding_after_seconds": (
+                    config.local_voice_window_padding_after_seconds
+                ),
+                "stable_body_gap_seconds": (
+                    config.local_voice_window_stable_body_gap_seconds
+                ),
+                "stable_body_minimum_span_seconds": (
+                    config.local_voice_window_stable_body_minimum_span_seconds
+                ),
+                "stable_body_minimum_speech_seconds": (
+                    config.local_voice_window_stable_body_minimum_speech_seconds
+                ),
+                "stable_body_minimum_density": (
+                    config.local_voice_window_stable_body_minimum_density
+                ),
+                "boundary_safety_seconds": (
+                    config.local_voice_window_boundary_safety_seconds
+                ),
+                "minimum_skip_seconds": (
+                    config.local_voice_window_minimum_skip_seconds
+                ),
+                "maximum_window_count": (
+                    config.local_voice_window_maximum_count
+                ),
+            },
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _run_ffmpeg(
         self,
@@ -750,6 +995,7 @@ __all__ = [
     "AudioChunkWindow",
     "LocalAnalysisJobManager",
     "LocalMediaAudioExtractor",
+    "LocalPreprocessedAudioCache",
     "LocalMediaExtractionError",
     "LocalNoVocalsDetectedError",
     "LocalMediaValidationError",

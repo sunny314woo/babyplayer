@@ -597,16 +597,10 @@ struct BabyPlayerASRClient {
         if (200...299).contains(http.statusCode) {
             return try JSONDecoder().decode(T.self, from: data)
         }
-        if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
-            if envelope.detail.code == "MONTHLY_ASR_LIMIT_REACHED" {
-                let message = envelope.detail.message
-                    ?? envelope.detail.nextAvailableAt.map(BabyPlayerASRDateFormatter.limitMessage)
-                    ?? "本月声音分析额度已用完"
-                throw BabyPlayerASRError.monthlyLimit(message)
-            }
-            throw BabyPlayerASRError.server(envelope.detail.message ?? envelope.detail.code)
-        }
-        throw BabyPlayerASRError.invalidResponse
+        throw BabyPlayerServerErrorResponse.error(
+            data: data,
+            statusCode: http.statusCode
+        )
     }
 
     private func appendField(_ name: String, _ value: String, boundary: String, to data: inout Data) {
@@ -628,6 +622,28 @@ struct ServerErrorEnvelope: Decodable {
         }
     }
     let detail: Detail
+}
+
+/// 同时兼容 BabyPlayer 结构化错误和 FastAPI 默认校验错误。
+/// 服务器升级导致请求契约不匹配时，不再误报“返回了无法识别的数据”。
+enum BabyPlayerServerErrorResponse {
+    static func error(data: Data, statusCode: Int) -> BabyPlayerASRError {
+        if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
+            if envelope.detail.code == "MONTHLY_ASR_LIMIT_REACHED" {
+                let message = envelope.detail.message
+                    ?? envelope.detail.nextAvailableAt.map(BabyPlayerASRDateFormatter.limitMessage)
+                    ?? "本月声音分析额度已用完"
+                return .monthlyLimit(message)
+            }
+            return .server(envelope.detail.message ?? envelope.detail.code)
+        }
+
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           object["detail"] is [Any] {
+            return .server("声音分析请求与服务器版本不兼容（HTTP \(statusCode)）")
+        }
+        return .server("声音分析服务请求失败（HTTP \(statusCode)）")
+    }
 }
 
 private extension Data {

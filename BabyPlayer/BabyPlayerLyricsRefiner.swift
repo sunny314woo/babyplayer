@@ -280,10 +280,10 @@ struct BabyPlayerLyricsRefinerClient {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw BabyPlayerASRError.invalidResponse }
         guard (200...299).contains(http.statusCode) else {
-            if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
-                throw BabyPlayerASRError.server(envelope.detail.message ?? envelope.detail.code)
-            }
-            throw BabyPlayerASRError.invalidResponse
+            throw BabyPlayerServerErrorResponse.error(
+                data: data,
+                statusCode: http.statusCode
+            )
         }
         let refined = try JSONDecoder().decode(LyricsRefinerResponse.self, from: data)
         guard refined.overallConfidence >= RepairPolicy.minimumOverallConfidence,
@@ -496,18 +496,24 @@ struct BabyPlayerLyricsReconcilerClient {
             throw BabyPlayerASRError.invalidResponse
         }
         guard (200...299).contains(http.statusCode) else {
-            if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
-                throw BabyPlayerASRError.server(envelope.detail.message ?? envelope.detail.code)
-            }
-            throw BabyPlayerASRError.invalidResponse
+            throw BabyPlayerServerErrorResponse.error(
+                data: data,
+                statusCode: http.statusCode
+            )
         }
-        let reconciled = try JSONDecoder().decode(LyricsReconciliationResponse.self, from: data)
-        return try makeResult(
-            reconciled,
-            songTitle: songTitle,
-            mediaFingerprint: mediaFingerprint,
-            ordinaryCandidates: ordinaryCandidates
-        )
+        do {
+            let reconciled = try JSONDecoder().decode(LyricsReconciliationResponse.self, from: data)
+            return try makeResult(
+                reconciled,
+                songTitle: songTitle,
+                mediaFingerprint: mediaFingerprint,
+                ordinaryCandidates: ordinaryCandidates
+            )
+        } catch is DecodingError {
+            throw BabyPlayerASRError.server("DeepSeek 歌词结果与当前播放器版本不兼容")
+        } catch BabyPlayerASRError.invalidResponse {
+            throw BabyPlayerASRError.server("DeepSeek 歌词结果未通过完整性校验")
+        }
     }
 
     /// 只读服务器已有 DeepSeek 结果；命中时不调用 ASR、搜索或大模型。
@@ -534,10 +540,10 @@ struct BabyPlayerLyricsReconcilerClient {
         }
         if http.statusCode == 404 { return nil }
         guard (200...299).contains(http.statusCode) else {
-            if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
-                throw BabyPlayerASRError.server(envelope.detail.message ?? envelope.detail.code)
-            }
-            throw BabyPlayerASRError.invalidResponse
+            throw BabyPlayerServerErrorResponse.error(
+                data: data,
+                statusCode: http.statusCode
+            )
         }
         let reconciled = try JSONDecoder().decode(LyricsReconciliationResponse.self, from: data)
         return try makeResult(
@@ -906,10 +912,10 @@ struct BabyPlayerLyricsTranslationClient {
             throw BabyPlayerASRError.invalidResponse
         }
         guard (200...299).contains(http.statusCode) else {
-            if let envelope = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
-                throw BabyPlayerASRError.server(envelope.detail.message ?? envelope.detail.code)
-            }
-            throw BabyPlayerASRError.invalidResponse
+            throw BabyPlayerServerErrorResponse.error(
+                data: data,
+                statusCode: http.statusCode
+            )
         }
         try BabyPlayerLyricsTranslationResponseValidator.validateRawJSON(data)
         let translated = try JSONDecoder().decode(LyricsTranslationResponse.self, from: data)

@@ -744,7 +744,10 @@ actor BabyLyricsRepository {
         return bundle
     }
 
-    /// 保存人工运行的 ASR 结果；新证据会使基于旧 ASR 的 DeepSeek 结果过期，不修改当前歌词。
+    /// 保存人工运行的 ASR 结果和智能跳过边界。
+    /// 已验证的 DeepSeek/中文结果是可独立恢复的播放资产；单独重扫 ASR
+    /// 不得提前删除它们。只有新 DeepSeek 英文成功落盘且内容哈希改变时，
+    /// storeDeepSeekResult 才会使旧中文翻译失效。
     @discardableResult
     func storeASRResult(
         _ candidate: LyricsCandidate,
@@ -760,10 +763,6 @@ actor BabyLyricsRepository {
             asrEvidenceHash: asrEvidenceHash,
             createdAt: Date()
         )
-        if bundle.asrResult?.asrEvidenceHash != asrEvidenceHash {
-            bundle.deepSeekResult = nil
-            bundle.chineseTranslation = nil
-        }
         bundle.asrResult = result
         // 边界和本次 ASR 使用同一份媒体证据；缺失或不可信时清掉旧值，避免沿用过期跳点。
         bundle.smartPlaybackBoundary = smartPlaybackBoundary

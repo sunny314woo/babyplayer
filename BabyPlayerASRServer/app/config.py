@@ -74,6 +74,11 @@ class Settings:
     development_artifacts_directory: str = os.getenv(
         "DEVELOPMENT_ARTIFACTS_DIRECTORY", ""
     )
+    # 与调试过程文件分开：这是可跨任务、跨服务重启复用的正式音频预处理缓存。
+    local_preprocessed_audio_cache_directory: str = os.getenv(
+        "LOCAL_PREPROCESSED_AUDIO_CACHE_DIRECTORY",
+        str(BASE_DIR / ".cache" / "preprocessed-audio"),
+    )
     # 【MODIFIED】Mac 本地分析只允许读取显式白名单目录，不开放任意文件路径。
     local_media_roots: tuple[str, ...] = _path_list("LOCAL_MEDIA_ROOTS")
     local_ffmpeg_path: str = os.getenv(

@@ -102,6 +102,25 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertFalse(BabyPlayerSmartSkipPreferencePolicy.resolvedValue(storedValue: false))
     }
 
+    func testASRRefreshReusesExistingDeepSeekAndOnlyRunsItForFirstAnalysis() {
+        XCTAssertTrue(BabyPlayerPostASRWorkflowPolicy.shouldRunDeepSeek(existingResult: nil))
+        let result = StoredLyricsAnalysisResult(
+            source: .deepSeek,
+            candidate: makeCandidate(id: -11, title: "AI", words: "hello hello"),
+            lyricsContentHash: "english-hash",
+            asrEvidenceHash: "old-asr-hash",
+            createdAt: Date()
+        )
+        XCTAssertFalse(
+            BabyPlayerPostASRWorkflowPolicy.shouldRunDeepSeek(existingResult: result)
+        )
+    }
+
+    func testSmartOutroUsesOneAndHalfSecondFade() {
+        XCTAssertEqual(BabyPlayerOutroTransitionPolicy.fadeDurationSeconds, 1.5)
+        XCTAssertEqual(BabyPlayerOutroTransitionPolicy.fadeStepCount, 6)
+    }
+
     func testPlaybackBoundaryPriorityIsChapterThenSmartThenManual() {
         XCTAssertEqual(
             BabyPlayerPlaybackBoundaryPolicy.introTarget(
@@ -297,6 +316,27 @@ final class LyricsAndASRTests: XCTestCase {
 
         XCTAssertTrue(message.contains("连接超时"))
         XCTAssertTrue(message.contains("同一网络"))
+    }
+
+    func testFastAPIValidationErrorIsReportedAsVersionMismatch() {
+        let data = Data(
+            #"{"detail":[{"loc":["body","media_fingerprint"],"msg":"Field required","type":"missing"}]}"#.utf8
+        )
+        let error = BabyPlayerServerErrorResponse.error(data: data, statusCode: 422)
+
+        XCTAssertEqual(
+            error.errorDescription,
+            "声音分析请求与服务器版本不兼容（HTTP 422）"
+        )
+    }
+
+    func testUnknownServerErrorIncludesHTTPStatusInsteadOfInvalidResponse() {
+        let error = BabyPlayerServerErrorResponse.error(
+            data: Data("not-json".utf8),
+            statusCode: 502
+        )
+
+        XCTAssertEqual(error.errorDescription, "声音分析服务请求失败（HTTP 502）")
     }
 
     func testMacLocalCacheIsReusedOnlyAfterVoiceWindowPlanningExists() {
@@ -1386,20 +1426,26 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(preferred?.lines.map(\.text), deepSeek.lines.map(\.text))
     }
 
-    // 【MODIFIED】重新 ASR 产生不同证据时，基于旧证据的 DeepSeek 结果不得继续可采用。
-    func testNewASREvidenceInvalidatesStoredDeepSeekResult() async throws {
+    // 重扫 ASR 只更新声音证据和边界；已验证 DeepSeek 在新结果成功前作为独立兜底。
+    func testNewASREvidencePreservesStoredDeepSeekResult() async throws {
         let storage = try makeStorage()
         defer { try? FileManager.default.removeItem(at: storage) }
         let repository = makeRepository(storage)
         let media = makeMedia()
         let asr = makeCandidate(id: -10, title: "ASR", words: "one two three four")
-        let deepSeek = makeCandidate(id: -11, title: "AI", words: "one two three four")
+        let deepSeek = makeEnglishTranslationCandidate()
         _ = try await repository.storeASRResult(asr, asrEvidenceHash: "hash-1", for: media)
-        _ = try await repository.storeDeepSeekResult(
+        let initial = try await repository.storeDeepSeekResult(
             deepSeek,
             asrEvidenceHash: "hash-1",
             for: media
         )
+        let english = try XCTUnwrap(initial.deepSeekResult)
+        let translation = makeTranslation(
+            for: english,
+            mediaFingerprint: media.asrFingerprint
+        )
+        _ = try await repository.storeChineseTranslation(translation, for: media)
 
         let updated = try await repository.storeASRResult(
             asr,
@@ -1408,7 +1454,9 @@ final class LyricsAndASRTests: XCTestCase {
         )
 
         XCTAssertNotNil(updated.asrResult)
-        XCTAssertNil(updated.deepSeekResult)
+        XCTAssertEqual(updated.deepSeekResult?.candidate.id, deepSeek.id)
+        XCTAssertEqual(updated.deepSeekResult?.asrEvidenceHash, "hash-1")
+        XCTAssertEqual(updated.chineseTranslation, translation)
     }
 
     func testManualBindingCannotBeOverwrittenByASRRecommendation() async throws {

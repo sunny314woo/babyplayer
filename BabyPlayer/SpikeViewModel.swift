@@ -71,6 +71,14 @@ enum BabyPlayerSmartSkipPreferencePolicy {
     }
 }
 
+/// ASR 重扫首先服务于声音证据和智能跳过。已有验证英文时直接复用，
+/// 只有首次缺少 DeepSeek 结果才自动继续校准。
+enum BabyPlayerPostASRWorkflowPolicy {
+    static func shouldRunDeepSeek(existingResult: StoredLyricsAnalysisResult?) -> Bool {
+        existingResult == nil
+    }
+}
+
 /// 将服务端候选收缩为播放器可采用的边界；不修改歌词的媒体时间轴。
 enum BabyPlayerSmartSkipBoundaryPolicy {
     static let minimumSkipSeconds = 3.0
@@ -217,6 +225,12 @@ enum BabyPlayerPlaybackBoundaryPolicy {
     private static func positive(_ value: Double) -> Double? {
         value.isFinite && value > 0 ? value : nil
     }
+}
+
+/// 智能片尾从安全边界开始渐弱，避免直接切到下一首。
+enum BabyPlayerOutroTransitionPolicy {
+    static let fadeDurationSeconds: TimeInterval = 1.5
+    static let fadeStepCount = 6
 }
 
 // 【MODIFIED】版本化的字幕默认策略：本次升级会把旧的“关闭”一次性迁移为英文，之后仍尊重用户手工关闭。

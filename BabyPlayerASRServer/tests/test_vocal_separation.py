@@ -55,6 +55,9 @@ def configured(tmp_path):
         local_vocal_separation_enabled=True,
         local_vocal_separation_model="Kim_Vocal_2.onnx",
         local_vocal_separation_model_directory=str(tmp_path / "models"),
+        local_preprocessed_audio_cache_directory=str(
+            tmp_path / "preprocessed-audio"
+        ),
         local_voice_activity_enabled=True,
         max_audio_bytes=1024 * 1024,
     )
@@ -113,7 +116,11 @@ def test_separator_rejects_a_truncated_timeline(tmp_path) -> None:
 
 
 class FakeStemSeparator:
+    def __init__(self):
+        self.calls = 0
+
     def separate(self, source, *, output_directory, expected_duration_seconds):
+        self.calls += 1
         output = output_directory / "vocal-stem.wav"
         write_wave(output, duration_seconds=expected_duration_seconds)
         return VocalStem(
@@ -271,3 +278,79 @@ def test_extractor_stops_before_asr_when_vocal_stem_has_no_voice(tmp_path) -> No
 
     # Lossless decode completes, but no provider input chunks are encoded.
     assert len(extractor.commands) == 1
+
+
+def test_force_refresh_reuses_preprocessed_chunks_across_extractor_restart(
+    tmp_path,
+) -> None:
+    source = tmp_path / "cached-song.mp4"
+    source.write_bytes(b"same-video-content")
+    config = configured(tmp_path)
+    first_separator = FakeStemSeparator()
+    first_extractor = RecordingExtractor(
+        config,
+        vocal_stem_separator=first_separator,
+        voice_activity_detector=FakeVoiceActivityDetector(),
+    )
+    first = first_extractor.extract(local_request(source))
+
+    second_separator = FakeStemSeparator()
+    restarted_extractor = RecordingExtractor(
+        config,
+        vocal_stem_separator=second_separator,
+        voice_activity_detector=FakeVoiceActivityDetector(),
+    )
+    forced_request = local_request(source).model_copy(
+        update={"force_refresh": True}
+    )
+    reused = restarted_extractor.extract(forced_request)
+
+    assert first_separator.calls == 1
+    assert second_separator.calls == 0
+    assert restarted_extractor.commands == []
+    assert reused.data == first.data
+    assert reused.chunks == first.chunks
+    assert reused.voice_activity == first.voice_activity
+    assert first.audio_preprocessing["preprocessing_cache_hit"] is False
+    assert reused.audio_preprocessing["preprocessing_cache_hit"] is True
+    cache_root = Path(config.local_preprocessed_audio_cache_directory)
+    assert len([value for value in cache_root.iterdir() if value.is_dir()]) == 1
+
+
+def test_preprocessed_audio_cache_invalidates_for_content_or_pipeline_change(
+    tmp_path,
+) -> None:
+    source = tmp_path / "changing-song.mp4"
+    source.write_bytes(b"video-v1")
+    config = configured(tmp_path)
+    initial_separator = FakeStemSeparator()
+    RecordingExtractor(
+        config,
+        vocal_stem_separator=initial_separator,
+        voice_activity_detector=FakeVoiceActivityDetector(),
+    ).extract(local_request(source))
+
+    source.write_bytes(b"video-v2")
+    content_separator = FakeStemSeparator()
+    changed_content = RecordingExtractor(
+        config,
+        vocal_stem_separator=content_separator,
+        voice_activity_detector=FakeVoiceActivityDetector(),
+    ).extract(local_request(source))
+
+    changed_config = replace(
+        config,
+        local_vocal_separation_version="separator-pipeline-v-next",
+    )
+    version_separator = FakeStemSeparator()
+    changed_version = RecordingExtractor(
+        changed_config,
+        vocal_stem_separator=version_separator,
+        voice_activity_detector=FakeVoiceActivityDetector(),
+    ).extract(local_request(source))
+
+    assert initial_separator.calls == 1
+    assert content_separator.calls == 1
+    assert version_separator.calls == 1
+    assert changed_content.audio_preprocessing["preprocessing_cache_hit"] is False
+    assert changed_version.audio_preprocessing["preprocessing_cache_hit"] is False
