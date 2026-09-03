@@ -16,6 +16,13 @@ import XCTest
 @testable import BabyPlayer
 
 final class LyricsAndASRTests: XCTestCase {
+    func testBatchAnalysisExcludesOnlyParentBlockedVideos() {
+        XCTAssertFalse(BabyPlayerBatchEligibilityPolicy.shouldInclude(rating: .blocked))
+        XCTAssertTrue(BabyPlayerBatchEligibilityPolicy.shouldInclude(rating: .disliked))
+        XCTAssertTrue(BabyPlayerBatchEligibilityPolicy.shouldInclude(rating: .liked))
+        XCTAssertTrue(BabyPlayerBatchEligibilityPolicy.shouldInclude(rating: .unrated))
+    }
+
     /// 播放器倍速菜单包含用于快速检查字幕的 3×，默认仍为正常 1×。
     func testPlaybackRateMenuUsesRequestedRatesIncludingThreeTimes() {
         XCTAssertEqual(BabyPlayerPlaybackRatePolicy.availableRates, [0.8, 1, 1.5, 2, 3])
@@ -296,15 +303,16 @@ final class LyricsAndASRTests: XCTestCase {
         )
     }
 
-    /// 本地服务未启动时明确提示 Mac 8011，不再让 -1004 看起来像腾讯识别失败。
-    func testASRConnectionErrorIdentifiesUnavailableLocalService() {
+    /// AI 固定走当前 Jellyfin 主机的 8011；连接失败时应直接提示检查 Mac 局域网服务。
+    func testASRConnectionErrorIdentifiesMacLocalServiceFailure() {
         let message = BabyPlayerAnalysisErrorPresentation.message(
             URLError(.cannotConnectToHost),
             fallback: "ASR 处理失败"
         )
 
-        XCTAssertTrue(message.contains("无法连接声音分析服务"))
+        XCTAssertTrue(message.contains("无法连接 Mac 本地 AI 服务"))
         XCTAssertTrue(message.contains("-1004"))
+        XCTAssertTrue(message.contains("同一网络"))
         XCTAssertTrue(message.contains("8011"))
     }
 
@@ -314,8 +322,8 @@ final class LyricsAndASRTests: XCTestCase {
             fallback: "ASR 处理失败"
         )
 
-        XCTAssertTrue(message.contains("连接超时"))
-        XCTAssertTrue(message.contains("同一网络"))
+        XCTAssertTrue(message.contains("响应超时"))
+        XCTAssertTrue(message.contains("Jennifer"))
     }
 
     func testFastAPIValidationErrorIsReportedAsVersionMismatch() {
@@ -736,8 +744,8 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(segments.first?.startSeconds, 0)
     }
 
-    // 【MODIFIED】Debug 只开放回环与 RFC1918/.local HTTP，公网明文地址必须拒绝。
-    func testDebugLocalServiceURLPolicyRejectsPublicPlainHTTP() {
+    /// 正式服务只开放本地 8011/v1；公网 HTTP、HTTPS/VPS 和其他端口都必须拒绝。
+    func testLocalServiceURLPolicyRejectsPublicAndVPSAddresses() {
         XCTAssertTrue(BabyPlayerServiceConfiguration.isAllowed(
             URL(string: "http://192.168.3.33:8011/v1")!
         ))
@@ -747,8 +755,29 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertFalse(BabyPlayerServiceConfiguration.isAllowed(
             URL(string: "http://203.0.113.10:8011/v1")!
         ))
-        XCTAssertTrue(BabyPlayerServiceConfiguration.isAllowed(
+        XCTAssertFalse(BabyPlayerServiceConfiguration.isAllowed(
             URL(string: "https://player.example.test/v1")!
+        ))
+        XCTAssertFalse(BabyPlayerServiceConfiguration.isAllowed(
+            URL(string: "http://192.168.3.33:8096/v1")!
+        ))
+    }
+
+    func testAIServiceBaseURLReusesJellyfinHostWithFixedPortAndPath() {
+        XCTAssertEqual(
+            BabyPlayerServiceConfiguration.localBaseURL(
+                forJellyfinServerAddress: "http://192.168.1.14:8096"
+            )?.absoluteString,
+            "http://192.168.1.14:8011/v1"
+        )
+        XCTAssertEqual(
+            BabyPlayerServiceConfiguration.localBaseURL(
+                forJellyfinServerAddress: "jennifer.local:8096"
+            )?.absoluteString,
+            "http://jennifer.local:8011/v1"
+        )
+        XCTAssertNil(BabyPlayerServiceConfiguration.localBaseURL(
+            forJellyfinServerAddress: "https://player.example.test"
         ))
     }
 
@@ -1361,6 +1390,46 @@ final class LyricsAndASRTests: XCTestCase {
             english.lyricsContentHash
         )
         XCTAssertNil(changedBundle.chineseTranslation)
+    }
+
+    /// 批量页只把真正可播放的双语结果计为完成；可信片头片尾为空不会造成重复 ASR。
+    func testBatchAnalysisCompletionRequiresChineseForEnglishButNotSmartBoundary() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let repository = makeRepository(storage)
+        let media = makeMedia()
+        let asr = makeCandidate(id: -10, title: "ASR", words: "raw transcript words here")
+
+        var bundle = try await repository.storeASRResult(
+            asr,
+            asrEvidenceHash: "batch-evidence",
+            smartPlaybackBoundary: nil,
+            for: media
+        )
+        XCTAssertFalse(BabyPlayerBatchAnalysisCompletionPolicy.isComplete(bundle))
+        XCTAssertEqual(
+            BabyPlayerBatchAnalysisCompletionPolicy.pendingStage(bundle),
+            "待 DeepSeek 英文校准"
+        )
+
+        bundle = try await repository.storeDeepSeekResult(
+            makeEnglishTranslationCandidate(),
+            asrEvidenceHash: "batch-evidence",
+            for: media
+        )
+        XCTAssertFalse(BabyPlayerBatchAnalysisCompletionPolicy.isComplete(bundle))
+        XCTAssertEqual(
+            BabyPlayerBatchAnalysisCompletionPolicy.pendingStage(bundle),
+            "待生成中文字幕"
+        )
+
+        let english = try XCTUnwrap(bundle.deepSeekResult)
+        bundle = try await repository.storeChineseTranslation(
+            makeTranslation(for: english, mediaFingerprint: media.asrFingerprint),
+            for: media
+        )
+        XCTAssertTrue(BabyPlayerBatchAnalysisCompletionPolicy.isComplete(bundle))
+        XCTAssertNil(bundle.smartPlaybackBoundary)
     }
 
     func testOldAnalysisBundleWithoutTranslationFieldStillDecodes() throws {

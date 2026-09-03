@@ -28,10 +28,8 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>BabyPlayer 需要连接家庭局域网中的 Jellyfin 服务器来浏览和播放儿童视频。</string>
+	<string>BabyPlayer 需要连接家庭局域网中的 Jellyfin 和 Mac 本地 AI 服务来播放视频及生成字幕。</string>
 	<!-- The real Bearer token is supplied only by the Git-ignored local xcconfig. -->
-	<key>BabyPlayerASRBaseURL</key>
-	<string>$(BABYPLAYER_ASR_BASE_URL)</string>
 	<key>BabyPlayerASRAPIToken</key>
 	<string>$(BABYPLAYER_ASR_API_TOKEN)</string>
 </dict>

@@ -49,6 +49,13 @@ enum BabyPlayerRating: String, CaseIterable, Identifiable {
     }
 }
 
+/// 批量 AI 只跳过家长明确屏蔽的项目；“不喜欢”仍是可见内容偏好，不等同于拉黑。
+enum BabyPlayerBatchEligibilityPolicy {
+    static func shouldInclude(rating: BabyPlayerRating) -> Bool {
+        rating != .blocked
+    }
+}
+
 enum BabyPlayerRepeatMode {
     case stopAtEnd
     case repeatOne
@@ -275,6 +282,69 @@ struct SpikePlaybackSelection: Identifiable {
     let startPositionSeconds: Double?
 }
 
+/// 家长批量补全页中的单条状态；每首成功后立即持久化，停止或退出不会回滚已完成结果。
+enum BabyPlayerBatchAnalysisItemState: Equatable {
+    case completed
+    case pending(String)
+    case processing(String)
+    case quotaLimited(String)
+    case failed(String)
+
+    var isCompleted: Bool {
+        if case .completed = self { return true }
+        return false
+    }
+
+    var isProcessing: Bool {
+        if case .processing = self { return true }
+        return false
+    }
+
+    var detailText: String {
+        switch self {
+        case .completed: return "双语字幕已就绪"
+        case .pending(let text), .processing(let text), .quotaLimited(let text), .failed(let text):
+            return text
+        }
+    }
+}
+
+struct BabyPlayerBatchAnalysisItem: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let durationSeconds: Double?
+    var requiresASR: Bool
+    var state: BabyPlayerBatchAnalysisItemState
+}
+
+/// “已生成”表示完整 AI 资产已落到 Apple TV：ASR、DeepSeek 英文，以及英文歌曲所需的中文翻译。
+/// 智能片头/片尾可能因没有可信边界而为空，但 ASR 已完成时不应无限重复分析。
+enum BabyPlayerBatchAnalysisCompletionPolicy {
+    static func isComplete(_ bundle: StoredLyricsAnalysisBundle?) -> Bool {
+        guard let bundle,
+              bundle.asrResult != nil,
+              let deepSeek = bundle.deepSeekResult else { return false }
+        guard BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish(
+            deepSeek.candidate.lines
+        ) else { return true }
+        guard let translation = bundle.chineseTranslation else { return false }
+        return BabyPlayerBilingualLyricsComposer.compose(
+            english: deepSeek,
+            translation: translation
+        ) != nil
+    }
+
+    static func pendingStage(_ bundle: StoredLyricsAnalysisBundle?) -> String {
+        guard let bundle, bundle.asrResult != nil else { return "待 ASR 与片头片尾分析" }
+        guard let deepSeek = bundle.deepSeekResult else { return "待 DeepSeek 英文校准" }
+        if BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish(deepSeek.candidate.lines),
+           bundle.chineseTranslation == nil {
+            return "待生成中文字幕"
+        }
+        return "待补全 AI 资产"
+    }
+}
+
 /// Apple TV 本地续播点；不包含带授权信息的播放 URL。
 struct BabyPlayerPlaybackResumeState: Codable, Equatable, Sendable {
     let itemID: String
@@ -397,12 +467,18 @@ final class SpikeViewModel: ObservableObject {
     @Published var lyricsMode: BabyPlayerLyricsMode = .english {
         didSet { UserDefaults.standard.set(lyricsMode.rawValue, forKey: Self.lyricsModeKey) }
     }
+    @Published private(set) var batchAnalysisItems: [BabyPlayerBatchAnalysisItem] = []
+    @Published private(set) var batchAnalysisUsage: BabyPlayerASRUsage?
+    @Published private(set) var batchAnalysisStatusText = "正在读取 AI 字幕状态…"
+    @Published private(set) var isBatchAnalyzing = false
+    @Published private(set) var isBatchAnalysisPaused = false
 
     private var authenticatedUserID: String?
     private var accessToken: String?
     private var operationTask: Task<Void, Never>?
     private var coverPrewarmTask: Task<Void, Never>?
     private var playbackPreparationTask: Task<Void, Never>?
+    private var batchAnalysisTask: Task<Void, Never>?
 
     private static let playbackTimerKey = "BabyPlayer.PlaybackTimerMinutes"
     private static let introSkipKey = "BabyPlayer.IntroSkipSeconds"
@@ -411,6 +487,24 @@ final class SpikeViewModel: ObservableObject {
     private static let lyricsEnabledByDefaultMigrationKey = "BabyPlayer.LyricsEnabledByDefaultV1"
     private static let ratingsKey = "BabyPlayer.MediaRatings"
     private static let playbackResumeKey = "BabyPlayer.PlaybackResumeV1"
+
+    var completedBatchAnalysisItems: [BabyPlayerBatchAnalysisItem] {
+        batchAnalysisItems.filter { $0.state.isCompleted }
+    }
+
+    var pendingBatchAnalysisItems: [BabyPlayerBatchAnalysisItem] {
+        batchAnalysisItems.filter { !$0.state.isCompleted }
+    }
+
+    var batchAnalysisSummary: String {
+        let completed = completedBatchAnalysisItems.count
+        return "总计 \(batchAnalysisItems.count) · 已完成 \(completed) · 待生成 \(max(0, batchAnalysisItems.count - completed))"
+    }
+
+    var batchAnalysisUsageText: String {
+        guard let usage = batchAnalysisUsage else { return "ASR 额度读取中…" }
+        return "ASR 剩余 \(formatBatchDuration(usage.remainingSeconds)) / \(formatBatchDuration(usage.limitSeconds)) · 预计可新增 \(estimatedBatchASRItemCount(using: usage.remainingSeconds)) 条"
+    }
 
     init() {
         let defaults = UserDefaults.standard
@@ -452,6 +546,7 @@ final class SpikeViewModel: ObservableObject {
 
         guard let credentials = JellyfinCredentialStore.load() else { return }
         serverAddress = credentials.serverAddress
+        BabyPlayerServiceConfiguration.updateJellyfinServerAddress(credentials.serverAddress)
         authenticatedUserID = credentials.userID
         accessToken = credentials.accessToken
         appState = .loading
@@ -528,6 +623,7 @@ final class SpikeViewModel: ObservableObject {
                             accessToken: accessToken
                         )
                     )
+                    BabyPlayerServiceConfiguration.updateJellyfinServerAddress(self.serverAddress)
                     self.quickConnectCode = nil
                     self.statusText = "已找到 \(videos.count) 个视频"
                     self.onboardingStep = .success
@@ -642,13 +738,19 @@ final class SpikeViewModel: ObservableObject {
         operationTask?.cancel()
         coverPrewarmTask?.cancel()
         playbackPreparationTask?.cancel()
+        batchAnalysisTask?.cancel()
         operationTask = nil
+        batchAnalysisTask = nil
         JellyfinCredentialStore.delete()
+        BabyPlayerServiceConfiguration.updateJellyfinServerAddress(nil)
         authenticatedUserID = nil
         accessToken = nil
         mediaItems = []
         quickConnectCode = nil
         isWorking = false
+        isBatchAnalyzing = false
+        isBatchAnalysisPaused = false
+        batchAnalysisItems = []
         onboardingStep = .welcome
         appState = .onboarding
         statusText = ""
@@ -775,6 +877,336 @@ final class SpikeViewModel: ObservableObject {
     func incrementOutroSkip() { outroSkipSeconds = min(120, outroSkipSeconds + 5) }
     func decrementOutroSkip() { outroSkipSeconds = max(0, outroSkipSeconds - 5) }
 
+    /// 刷新家长页统计；只读取 Apple TV 已保存结果和 ASR 额度，不触发任何付费分析。
+    func refreshBatchAnalysisInventory() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.rebuildBatchAnalysisInventory()
+            await self.refreshBatchAnalysisUsage()
+        }
+    }
+
+    /// 从未完成项继续；任务使用 utility 优先级且不控制播放器，前台播放可照常进行。
+    func startBatchAnalysis() {
+        guard !isBatchAnalyzing else { return }
+        batchAnalysisTask?.cancel()
+        isBatchAnalyzing = true
+        isBatchAnalysisPaused = false
+        batchAnalysisStatusText = "正在准备批量 AI 任务…"
+        batchAnalysisTask = Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.runBatchAnalysis()
+        }
+    }
+
+    func stopBatchAnalysis() {
+        batchAnalysisTask?.cancel()
+        batchAnalysisTask = nil
+        isBatchAnalyzing = false
+        isBatchAnalysisPaused = true
+        batchAnalysisStatusText = "任务已暂停；已完成结果均已保存，可随时继续"
+    }
+
+    private func rebuildBatchAnalysisInventory() async {
+        var inventory: [BabyPlayerBatchAnalysisItem] = []
+        for item in batchEligibleMediaItems {
+            let descriptor = analysisDescriptor(for: item)
+            let bundle = await BabyLyricsRepository.shared.analysisBundle(for: descriptor)
+            inventory.append(
+                BabyPlayerBatchAnalysisItem(
+                    id: item.id,
+                    title: item.name,
+                    durationSeconds: descriptor.expectedSongDurationSeconds
+                        ?? descriptor.durationSeconds,
+                    requiresASR: bundle?.asrResult == nil,
+                    state: BabyPlayerBatchAnalysisCompletionPolicy.isComplete(bundle)
+                        ? .completed
+                        : .pending(BabyPlayerBatchAnalysisCompletionPolicy.pendingStage(bundle))
+                )
+            )
+        }
+        batchAnalysisItems = inventory
+        if inventory.isEmpty {
+            batchAnalysisStatusText = "媒体库中没有可处理的未屏蔽视频"
+        } else if !isBatchAnalyzing {
+            batchAnalysisStatusText = "已有结果直接复用；未完成项会从缺失阶段继续"
+        }
+    }
+
+    private func refreshBatchAnalysisUsage() async {
+        do {
+            batchAnalysisUsage = try await BabyPlayerASRClient().usage()
+        } catch {
+            if !isBatchAnalyzing {
+                batchAnalysisStatusText = (error as? LocalizedError)?.errorDescription
+                    ?? "暂时无法读取 ASR 额度"
+            }
+        }
+    }
+
+    private func runBatchAnalysis() async {
+        defer {
+            isBatchAnalyzing = false
+            batchAnalysisTask = nil
+        }
+
+        await rebuildBatchAnalysisInventory()
+        await refreshBatchAnalysisUsage()
+        guard !Task.isCancelled else { return }
+
+        let queue = await makeQueueItems(from: batchEligibleMediaItems)
+        let queueIDs = Set(queue.map(\.id))
+        for index in batchAnalysisItems.indices
+        where !queueIDs.contains(batchAnalysisItems[index].id)
+            && !batchAnalysisItems[index].state.isCompleted {
+            batchAnalysisItems[index].state = .failed("媒体地址：无法建立播放地址")
+        }
+
+        var partialItems: [BabyPlayerQueueItem] = []
+        var asrItems: [BabyPlayerQueueItem] = []
+        for item in queue {
+            let bundle = await BabyLyricsRepository.shared.analysisBundle(for: item.lyricsMedia)
+            guard !BabyPlayerBatchAnalysisCompletionPolicy.isComplete(bundle) else { continue }
+            if bundle?.asrResult == nil {
+                asrItems.append(item)
+            } else {
+                partialItems.append(item)
+            }
+        }
+        // 先补完不消耗 ASR 的半成品，再用剩余额度优先覆盖更多短视频。
+        asrItems.sort {
+            ($0.lyricsMedia.expectedSongDurationSeconds ?? .greatestFiniteMagnitude)
+                < ($1.lyricsMedia.expectedSongDurationSeconds ?? .greatestFiniteMagnitude)
+        }
+        let orderedItems = partialItems + asrItems
+        guard !orderedItems.isEmpty else {
+            batchAnalysisStatusText = "全部视频的双语 AI 字幕都已生成"
+            return
+        }
+
+        for (position, item) in orderedItems.enumerated() {
+            guard !Task.isCancelled else { return }
+            let progressPrefix = "\(position + 1)/\(orderedItems.count) · \(item.title)"
+            var bundle = await BabyLyricsRepository.shared.analysisBundle(for: item.lyricsMedia)
+            if BabyPlayerBatchAnalysisCompletionPolicy.isComplete(bundle) {
+                setBatchItemState(id: item.id, state: .completed)
+                continue
+            }
+
+            if bundle?.asrResult == nil {
+                setBatchItemState(id: item.id, state: .processing("ASR 与片头片尾分析中"))
+                batchAnalysisStatusText = progressPrefix + " · ASR 与片头片尾"
+                do {
+                    let analysis = try await BabyPlayerASRCoordinator.shared.recognize(
+                        item: item,
+                        forceRefresh: false,
+                        onStage: { [weak self] stage in
+                            guard let self else { return }
+                            let detail = self.batchStageText(stage)
+                            self.setBatchItemState(
+                                id: item.id,
+                                state: .processing(detail)
+                            )
+                            self.batchAnalysisStatusText = progressPrefix + " · " + detail
+                        }
+                    )
+                    let candidate = try analysis.lyricsCandidate(
+                        title: item.lyricsMedia.searchTitle,
+                        mediaFingerprint: item.lyricsMedia.asrFingerprint
+                    )
+                    bundle = try await BabyLyricsRepository.shared.storeASRResult(
+                        candidate,
+                        asrEvidenceHash: analysis.evidenceHash,
+                        smartPlaybackBoundary: BabyPlayerSmartSkipBoundaryPolicy.storedBoundary(
+                            from: analysis.voiceWindowPlan,
+                            expectedMediaDuration: item.lyricsMedia.durationSeconds,
+                            asrSegments: analysis.segments
+                        ),
+                        for: item.lyricsMedia
+                    )
+                    setBatchItemRequiresASR(id: item.id, requiresASR: false)
+                    await refreshBatchAnalysisUsage()
+                } catch is CancellationError {
+                    return
+                } catch {
+                    let message = BabyPlayerAnalysisErrorPresentation.message(
+                        error,
+                        fallback: "ASR 处理失败"
+                    )
+                    if let asrError = error as? BabyPlayerASRError,
+                       case .monthlyLimit = asrError {
+                        setBatchItemState(id: item.id, state: .quotaLimited("ASR 额度：" + message))
+                    } else {
+                        setBatchItemState(id: item.id, state: .failed("ASR：" + message))
+                    }
+                    isBatchAnalysisPaused = true
+                    batchAnalysisStatusText = "已暂停：\(item.title) 的 ASR 失败 · \(message)"
+                    return
+                }
+            }
+
+            guard !Task.isCancelled, let asrResult = bundle?.asrResult else { return }
+            if bundle?.deepSeekResult == nil {
+                setBatchItemState(id: item.id, state: .processing("DeepSeek 英文校准中"))
+                batchAnalysisStatusText = progressPrefix + " · DeepSeek 英文校准"
+                do {
+                    let candidates = (try? await BabyLyricsRepository.shared.searchCandidates(
+                        for: item.lyricsMedia
+                    )) ?? []
+                    let reconciliation = try await runBatchAuxiliaryStage(
+                        name: "DeepSeek",
+                        itemID: item.id,
+                        progressPrefix: progressPrefix
+                    ) { attempt in
+                        try await BabyPlayerASRCoordinator.shared.reconcile(
+                            item: item,
+                            candidates: Array(candidates.prefix(3)),
+                            forceRefresh: attempt > 1
+                        )
+                    }
+                    bundle = try await BabyLyricsRepository.shared.storeDeepSeekResult(
+                        reconciliation.candidate,
+                        asrEvidenceHash: asrResult.asrEvidenceHash,
+                        for: item.lyricsMedia
+                    )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    let message = BabyPlayerAnalysisErrorPresentation.message(
+                        error,
+                        fallback: "DeepSeek 校准失败"
+                    )
+                    setBatchItemState(id: item.id, state: .failed("DeepSeek：" + message))
+                    batchAnalysisStatusText = progressPrefix + " · " + message
+                    continue
+                }
+            }
+
+            guard !Task.isCancelled, let english = bundle?.deepSeekResult else { continue }
+            if BabyPlayerLyricsLanguagePolicy.isPredominantlyEnglish(english.candidate.lines),
+               bundle?.chineseTranslation == nil {
+                setBatchItemState(id: item.id, state: .processing("中文字幕生成中"))
+                batchAnalysisStatusText = progressPrefix + " · 中文字幕"
+                do {
+                    let translation = try await runBatchAuxiliaryStage(
+                        name: "中文字幕",
+                        itemID: item.id,
+                        progressPrefix: progressPrefix
+                    ) { _ in
+                        try await BabyPlayerLyricsTranslationClient().translate(
+                            english: english,
+                            mediaFingerprint: item.lyricsMedia.asrFingerprint
+                        )
+                    }
+                    bundle = try await BabyLyricsRepository.shared.storeChineseTranslation(
+                        translation,
+                        for: item.lyricsMedia
+                    )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    let message = BabyPlayerAnalysisErrorPresentation.message(
+                        error,
+                        fallback: "中文字幕生成失败"
+                    )
+                    setBatchItemState(id: item.id, state: .failed("中文字幕：" + message))
+                    batchAnalysisStatusText = progressPrefix + " · " + message
+                    continue
+                }
+            }
+
+            if BabyPlayerBatchAnalysisCompletionPolicy.isComplete(bundle) {
+                setBatchItemState(id: item.id, state: .completed)
+                batchAnalysisStatusText = progressPrefix + " · 已保存到 Apple TV"
+            } else {
+                setBatchItemState(id: item.id, state: .failed("AI 结果不完整，可稍后继续"))
+            }
+        }
+
+        await refreshBatchAnalysisUsage()
+        let failedCount = pendingBatchAnalysisItems.filter {
+            if case .failed = $0.state { return true }
+            return false
+        }.count
+        batchAnalysisStatusText = failedCount == 0
+            ? "本轮可生成项目已全部完成"
+            : "本轮完成；另有 \(failedCount) 条可稍后继续"
+    }
+
+    private func setBatchItemState(id: String, state: BabyPlayerBatchAnalysisItemState) {
+        guard let index = batchAnalysisItems.firstIndex(where: { $0.id == id }) else { return }
+        batchAnalysisItems[index].state = state
+    }
+
+    private func setBatchItemRequiresASR(id: String, requiresASR: Bool) {
+        guard let index = batchAnalysisItems.firstIndex(where: { $0.id == id }) else { return }
+        batchAnalysisItems[index].requiresASR = requiresASR
+    }
+
+    /// DeepSeek 与翻译允许短暂网络错误自动重试；ASR 不走这里，仍按家长规则首次失败即暂停。
+    private func runBatchAuxiliaryStage<T>(
+        name: String,
+        itemID: String,
+        progressPrefix: String,
+        operation: (Int) async throws -> T
+    ) async throws -> T {
+        let maximumAttempts = 3
+        for attempt in 1...maximumAttempts {
+            do {
+                return try await operation(attempt)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                guard attempt < maximumAttempts,
+                      BabyPlayerAIAnalysisRetryPolicy.shouldRetry(error) else {
+                    throw error
+                }
+                let delay = BabyPlayerAIAnalysisRetryPolicy.delay(afterFailureCount: attempt)
+                let retryText = "\(name) 暂时失败，\(Int(delay)) 秒后重试（\(attempt)/\(maximumAttempts)）"
+                setBatchItemState(id: itemID, state: .processing(retryText))
+                batchAnalysisStatusText = progressPrefix + " · " + retryText
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+        throw BabyPlayerASRError.invalidResponse
+    }
+
+    private func batchStageText(_ stage: BabyPlayerASRProcessingStage) -> String {
+        switch stage {
+        case .preparingAudio: return "准备 ASR 音频"
+        case .recognizing: return "ASR 识别中"
+        case .aligning: return "时间轴对齐中"
+        case .refining: return "歌词优化中"
+        }
+    }
+
+    private func estimatedBatchASRItemCount(using remainingSeconds: Int) -> Int {
+        var remaining = Double(max(0, remainingSeconds))
+        var count = 0
+        let durations = pendingBatchAnalysisItems
+            .filter(\.requiresASR)
+            .compactMap(\.durationSeconds)
+            .filter { $0.isFinite && $0 > 0 }
+            .sorted()
+        for duration in durations where duration <= remaining {
+            remaining -= ceil(duration)
+            count += 1
+        }
+        return count
+    }
+
+    private func formatBatchDuration(_ seconds: Int) -> String {
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        return hours > 0 ? "\(hours) 小时 \(minutes) 分" : "\(minutes) 分"
+    }
+
+    private var batchEligibleMediaItems: [JellyfinMediaItem] {
+        mediaItems.filter {
+            BabyPlayerBatchEligibilityPolicy.shouldInclude(rating: rating(for: $0.id))
+        }
+    }
+
     private func restoreSavedSession() async {
         guard let authenticatedUserID, let accessToken else {
             appState = .onboarding
@@ -831,63 +1263,11 @@ final class SpikeViewModel: ObservableObject {
         startIndex: Int,
         behaviorOverride: BabyPlayerPlaybackBehavior?
     ) async {
-        guard let accessToken,
-              let client = try? makeClient() else {
+        guard accessToken != nil else {
             startRePairing()
             return
         }
-
-        var preparedItems: [(
-            item: JellyfinMediaItem,
-            url: URL,
-            lyricsMedia: LyricsMediaDescriptor,
-            chapterIntro: Double?,
-            chapterOutro: Double?
-        )] = []
-        for item in items {
-            guard !Task.isCancelled else { return }
-            guard let url = try? client.directPlaybackURL(for: item, accessToken: accessToken) else { continue }
-            let markers = chapterMarkers(for: item)
-            let duration = item.runTimeTicks.map { Double($0) / 10_000_000 }
-            let inferredSongStart = markers.introEnd
-                ?? (introSkipSeconds > 0 ? Double(introSkipSeconds) : nil)
-            let inferredSongEnd = markers.outroStart
-                ?? duration.flatMap { total in
-                    outroSkipSeconds > 0 && total > Double(outroSkipSeconds)
-                        ? total - Double(outroSkipSeconds)
-                        : nil
-                }
-            let lyricsMedia = Self.lyricsDescriptor(
-                from: item,
-                songStartSeconds: inferredSongStart,
-                songEndSeconds: inferredSongEnd
-            )
-            preparedItems.append((item, url, lyricsMedia, markers.introEnd, markers.outroStart))
-        }
-        let storedSmartConfigurations = await BabyLyricsRepository.shared
-            .smartPlaybackConfigurations(for: preparedItems.map { $0.lyricsMedia })
-        guard !Task.isCancelled else { return }
-        let queue = preparedItems.map { prepared in
-            let storedConfiguration = storedSmartConfigurations[prepared.item.id]
-            let storedSmartBoundary = BabyPlayerSmartSkipBoundaryPolicy.validatedStoredBoundary(
-                storedConfiguration?.boundary,
-                expectedMediaDuration: prepared.lyricsMedia.durationSeconds
-            )
-            return BabyPlayerQueueItem(
-                id: prepared.item.id,
-                title: prepared.item.name,
-                url: prepared.url,
-                lyricsMedia: prepared.lyricsMedia,
-                localMediaPath: prepared.item.path,
-                chapterIntroEndSeconds: prepared.chapterIntro,
-                chapterOutroStartSeconds: prepared.chapterOutro,
-                smartIntroEndSeconds: storedSmartBoundary?.introEndSeconds,
-                smartOutroStartSeconds: storedSmartBoundary?.outroStartSeconds,
-                smartSkipEnabled: BabyPlayerSmartSkipPreferencePolicy.resolvedValue(
-                    storedValue: storedConfiguration?.isEnabled
-                )
-            )
-        }
+        let queue = await makeQueueItems(from: items)
         guard !queue.isEmpty else {
             statusText = "这些视频暂时无法播放"
             return
@@ -922,6 +1302,76 @@ final class SpikeViewModel: ObservableObject {
             startPositionSeconds: playbackResumeState.flatMap { state in
                 state.itemID == queue[queueStartIndex].id ? state.positionSeconds : nil
             }
+        )
+    }
+
+    /// 统一把媒体源项目变成播放器/后台 AI 都可消费的队列；只生成 URL 和读取本地智能边界。
+    private func makeQueueItems(from items: [JellyfinMediaItem]) async -> [BabyPlayerQueueItem] {
+        guard let accessToken,
+              let client = try? makeClient() else { return [] }
+        var preparedItems: [(
+            item: JellyfinMediaItem,
+            url: URL,
+            lyricsMedia: LyricsMediaDescriptor,
+            chapterIntro: Double?,
+            chapterOutro: Double?
+        )] = []
+        for item in items {
+            guard !Task.isCancelled else { return [] }
+            guard let url = try? client.directPlaybackURL(
+                for: item,
+                accessToken: accessToken
+            ) else { continue }
+            let markers = chapterMarkers(for: item)
+            preparedItems.append((
+                item,
+                url,
+                analysisDescriptor(for: item),
+                markers.introEnd,
+                markers.outroStart
+            ))
+        }
+        let storedSmartConfigurations = await BabyLyricsRepository.shared
+            .smartPlaybackConfigurations(for: preparedItems.map { $0.lyricsMedia })
+        guard !Task.isCancelled else { return [] }
+        return preparedItems.map { prepared in
+            let storedConfiguration = storedSmartConfigurations[prepared.item.id]
+            let storedSmartBoundary = BabyPlayerSmartSkipBoundaryPolicy.validatedStoredBoundary(
+                storedConfiguration?.boundary,
+                expectedMediaDuration: prepared.lyricsMedia.durationSeconds
+            )
+            return BabyPlayerQueueItem(
+                id: prepared.item.id,
+                title: prepared.item.name,
+                url: prepared.url,
+                lyricsMedia: prepared.lyricsMedia,
+                localMediaPath: prepared.item.path,
+                chapterIntroEndSeconds: prepared.chapterIntro,
+                chapterOutroStartSeconds: prepared.chapterOutro,
+                smartIntroEndSeconds: storedSmartBoundary?.introEndSeconds,
+                smartOutroStartSeconds: storedSmartBoundary?.outroStartSeconds,
+                smartSkipEnabled: BabyPlayerSmartSkipPreferencePolicy.resolvedValue(
+                    storedValue: storedConfiguration?.isEnabled
+                )
+            )
+        }
+    }
+
+    private func analysisDescriptor(for item: JellyfinMediaItem) -> LyricsMediaDescriptor {
+        let markers = chapterMarkers(for: item)
+        let duration = item.runTimeTicks.map { Double($0) / 10_000_000 }
+        let inferredSongStart = markers.introEnd
+            ?? (introSkipSeconds > 0 ? Double(introSkipSeconds) : nil)
+        let inferredSongEnd = markers.outroStart
+            ?? duration.flatMap { total in
+                outroSkipSeconds > 0 && total > Double(outroSkipSeconds)
+                    ? total - Double(outroSkipSeconds)
+                    : nil
+            }
+        return Self.lyricsDescriptor(
+            from: item,
+            songStartSeconds: inferredSongStart,
+            songEndSeconds: inferredSongEnd
         )
     }
 
@@ -973,7 +1423,9 @@ final class SpikeViewModel: ObservableObject {
     }
 
     private func makeClient() throws -> JellyfinSpikeClient {
-        try JellyfinSpikeClient(serverAddress: serverAddress, deviceID: Self.deviceID())
+        let client = try JellyfinSpikeClient(serverAddress: serverAddress, deviceID: Self.deviceID())
+        BabyPlayerServiceConfiguration.updateJellyfinServerAddress(serverAddress)
+        return client
     }
 
     private static func deviceID() -> String {

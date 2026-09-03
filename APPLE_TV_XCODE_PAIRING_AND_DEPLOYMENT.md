@@ -18,9 +18,9 @@
 | 已安装应用 | BabyPlayer，Bundle ID 为 `com.wufengyu.BabyPlayer` |
 
 当前工程是个人内测版本：暂不包含用户注册、登录、订阅、支付或多用户系统。Apple TV
-只访问个人 VPS 的 `player.wisteriasoftware.uk`；腾讯云和 DeepSeek 的真实密钥只在
-VPS 上，工程本地只配置独立的 BabyPlayer Bearer Token。未来如果公开分发，再增加
-逐设备配对 Token，不改变当前 ASR/歌词闭环。
+连接 Mac 上的 Jennifer/Jellyfin `:8096`，并自动复用同一主机访问本地 AI 服务
+`:8011/v1`；不通过 VPS 处理 ASR、DeepSeek 或翻译。腾讯云和 DeepSeek 的真实密钥只在
+Mac 本地服务的 `.env` 中，工程只配置独立的 BabyPlayer Bearer Token。
 
 这里最重要的不是两台设备都必须使用 Wi-Fi，而是它们必须位于同一个可互相访问的局域网。本次实际成功的配置是两边都使用同一个 Wi-Fi。
 

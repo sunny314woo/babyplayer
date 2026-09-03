@@ -415,10 +415,43 @@ private struct ParentSettingsView: View {
     // 【MODIFIED】额度读取与临时分段生命周期解耦，不展示已取消的完整音频库。
     @StateObject private var asrUsage = BabyPlayerASRUsageViewModel()
     @State private var confirmClear = false
+    @State private var showsBatchAnalysis = false
 
     var body: some View {
         ZStack {
             OrchardBackground()
+            if showsBatchAnalysis {
+                BabyPlayerBatchAnalysisView(
+                    model: model,
+                    close: { showsBatchAnalysis = false }
+                )
+            } else {
+                settingsContent
+            }
+        }
+        .onExitCommand {
+            if showsBatchAnalysis {
+                showsBatchAnalysis = false
+            } else {
+                close()
+            }
+        }
+        .task {
+            asrUsage.refresh()
+            model.refreshBatchAnalysisInventory()
+        }
+        .alert("清除 Jellyfin 配对？", isPresented: $confirmClear) {
+            Button("取消", role: .cancel) { }
+            Button("清除", role: .destructive) {
+                close()
+                model.clearPairing()
+            }
+        } message: {
+            Text("下次打开 BabyPlayer 需要重新输入配对码。")
+        }
+    }
+
+    private var settingsContent: some View {
             VStack(alignment: .leading, spacing: 26) {
                 HStack {
                     Text("家长设置")
@@ -444,6 +477,17 @@ private struct ParentSettingsView: View {
                         }
                         SettingsLyricsModeMenu(selection: $model.lyricsMode)
                         SettingsInfoRow(title: "本月声音分析", value: asrUsage.usageText)
+                        Button {
+                            model.refreshBatchAnalysisInventory()
+                            showsBatchAnalysis = true
+                        } label: {
+                            SettingsActionRow(
+                                title: "批量生成 AI 双语字幕",
+                                value: model.batchAnalysisItems.isEmpty && !model.mediaItems.isEmpty
+                                    ? "读取中…"
+                                    : model.batchAnalysisSummary
+                            )
+                        }
                         blockedRatingsSection
                         SettingsIntegerMenu(
                             title: "定时关闭",
@@ -479,18 +523,6 @@ private struct ParentSettingsView: View {
             // 与首页一致：依赖 tvOS 安全区，只保留少量版面呼吸空间。
             .padding(.horizontal, 24)
             .padding(.vertical, 10)
-        }
-        .onExitCommand(perform: close)
-        .task { asrUsage.refresh() }
-        .alert("清除 Jellyfin 配对？", isPresented: $confirmClear) {
-            Button("取消", role: .cancel) { }
-            Button("清除", role: .destructive) {
-                close()
-                model.clearPairing()
-            }
-        } message: {
-            Text("下次打开 BabyPlayer 需要重新输入配对码。")
-        }
     }
 
     /// 家长可查看并解除屏蔽；儿童首页不会渲染这组记录。
@@ -507,6 +539,246 @@ private struct ParentSettingsView: View {
                     SettingsActionRow(title: item.name, value: "解除屏蔽")
                 }
             }
+        }
+    }
+}
+
+/// 家长批量 AI 工作台：左右两栏直接对照已完成与待生成项目，任务在后台串行运行。
+private enum BabyPlayerBatchPalette {
+    static let surface = Color(red: 0.035, green: 0.055, blue: 0.085)
+    static let elevated = Color(red: 0.065, green: 0.09, blue: 0.13)
+    static let primaryText = Color.white
+    static let secondaryText = Color(red: 0.82, green: 0.86, blue: 0.92)
+    static let completedPanel = Color(red: 0.025, green: 0.12, blue: 0.085)
+    static let completedRow = Color(red: 0.045, green: 0.19, blue: 0.135)
+    static let completedAccent = Color(red: 0.35, green: 0.94, blue: 0.63)
+    static let pendingPanel = Color(red: 0.15, green: 0.075, blue: 0.035)
+    static let pendingRow = Color(red: 0.24, green: 0.115, blue: 0.045)
+    static let pendingAccent = Color(red: 1.0, green: 0.68, blue: 0.25)
+    static let progress = Color(red: 0.35, green: 0.76, blue: 1.0)
+    static let warning = Color(red: 1.0, green: 0.82, blue: 0.28)
+}
+
+private struct BabyPlayerBatchAnalysisView: View {
+    @ObservedObject var model: SpikeViewModel
+    let close: () -> Void
+
+    private var progress: Double {
+        guard !model.batchAnalysisItems.isEmpty else { return 0 }
+        return Double(model.completedBatchAnalysisItems.count)
+            / Double(model.batchAnalysisItems.count)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .center, spacing: 20) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("AI 字幕果园")
+                        .font(.system(size: 52, weight: .heavy, design: .rounded))
+                        .foregroundStyle(BabyPlayerBatchPalette.primaryText)
+                    Text("Mac 本地 8011 处理 · 已有结果从缺失阶段继续 · ASR 失败自动暂停")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .foregroundStyle(BabyPlayerBatchPalette.secondaryText)
+                }
+                Spacer()
+                Text(model.batchAnalysisUsageText)
+                    .font(.system(size: 21, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.black)
+                    .padding(.horizontal, 22)
+                    .frame(height: 54)
+                    .background(BabyPlayerBatchPalette.warning, in: Capsule())
+                Button("返回", action: close)
+                    .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.berry))
+            }
+
+            HStack(spacing: 14) {
+                Text(model.batchAnalysisSummary)
+                    .font(.system(size: 23, weight: .heavy, design: .rounded))
+                    .foregroundStyle(BabyPlayerBatchPalette.primaryText)
+                ProgressView(value: progress)
+                    .tint(BabyPlayerBatchPalette.progress)
+                    .frame(maxWidth: .infinity)
+                Text("\(Int((progress * 100).rounded()))%")
+                    .font(.system(size: 23, weight: .heavy, design: .rounded).monospacedDigit())
+                    .foregroundStyle(BabyPlayerBatchPalette.progress)
+            }
+            .padding(.horizontal, 22)
+            .frame(height: 64)
+            .background(BabyPlayerBatchPalette.elevated, in: RoundedRectangle(cornerRadius: 20))
+            .overlay {
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(Color.white.opacity(0.24), lineWidth: 2)
+            }
+
+            HStack(alignment: .top, spacing: 18) {
+                BatchAnalysisColumn(
+                    title: "已生成",
+                    subtitle: "双语字幕已保存在 Apple TV",
+                    count: model.completedBatchAnalysisItems.count,
+                    accent: BabyPlayerBatchPalette.completedAccent,
+                    background: BabyPlayerBatchPalette.completedPanel,
+                    rowBackground: BabyPlayerBatchPalette.completedRow,
+                    items: model.completedBatchAnalysisItems
+                )
+                BatchAnalysisColumn(
+                    title: "等待生成",
+                    subtitle: "Mac 本地处理 · 按 ASR 剩余额度从短视频开始",
+                    count: model.pendingBatchAnalysisItems.count,
+                    accent: BabyPlayerBatchPalette.pendingAccent,
+                    background: BabyPlayerBatchPalette.pendingPanel,
+                    rowBackground: BabyPlayerBatchPalette.pendingRow,
+                    items: model.pendingBatchAnalysisItems
+                )
+            }
+            .frame(maxHeight: .infinity)
+
+            HStack(spacing: 18) {
+                if model.isBatchAnalyzing {
+                    Button("暂停任务", action: model.stopBatchAnalysis)
+                        .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.berry))
+                } else {
+                    Button(
+                        model.isBatchAnalysisPaused ? "继续生成" : "一键补全",
+                        action: model.startBatchAnalysis
+                    )
+                    .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.coral))
+                    .disabled(model.pendingBatchAnalysisItems.isEmpty)
+                }
+                Button("刷新统计", action: model.refreshBatchAnalysisInventory)
+                    .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerBatchPalette.elevated))
+                    .disabled(model.isBatchAnalyzing)
+                Text(model.batchAnalysisStatusText)
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .foregroundStyle(BabyPlayerBatchPalette.primaryText)
+                    .lineLimit(2)
+                    .padding(.horizontal, 18)
+                    .frame(minHeight: 58)
+                    .background(BabyPlayerBatchPalette.elevated, in: RoundedRectangle(cornerRadius: 16))
+                Spacer()
+            }
+            .frame(minHeight: 68)
+        }
+        .foregroundStyle(BabyPlayerBatchPalette.primaryText)
+        .background(BabyPlayerBatchPalette.surface.opacity(0.92))
+        .padding(.horizontal, 24)
+        .padding(.vertical, 10)
+        .task { model.refreshBatchAnalysisInventory() }
+    }
+}
+
+private struct BatchAnalysisColumn: View {
+    let title: String
+    let subtitle: String
+    let count: Int
+    let accent: Color
+    let background: Color
+    let rowBackground: Color
+    let items: [BabyPlayerBatchAnalysisItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.system(size: 31, weight: .heavy, design: .rounded))
+                        .foregroundStyle(BabyPlayerBatchPalette.primaryText)
+                    Text(subtitle)
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                        .foregroundStyle(BabyPlayerBatchPalette.secondaryText)
+                }
+                Spacer()
+                Text("\(count)")
+                    .font(.system(size: 36, weight: .heavy, design: .rounded).monospacedDigit())
+                    .foregroundStyle(accent)
+            }
+
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    if items.isEmpty {
+                        VStack(spacing: 12) {
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 34, weight: .semibold))
+                                .foregroundStyle(accent)
+                            Text(title == "已生成" ? "还没有完整结果" : "全部完成")
+                                .font(.system(size: 22, weight: .bold, design: .rounded))
+                                .foregroundStyle(BabyPlayerBatchPalette.secondaryText)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 150)
+                    } else {
+                        ForEach(items) { item in
+                            BatchAnalysisItemRow(
+                                item: item,
+                                accent: accent,
+                                background: rowBackground
+                            )
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(background, in: RoundedRectangle(cornerRadius: 26))
+        .overlay {
+            RoundedRectangle(cornerRadius: 26)
+                .stroke(accent, lineWidth: 3)
+        }
+    }
+}
+
+private struct BatchAnalysisItemRow: View {
+    let item: BabyPlayerBatchAnalysisItem
+    let accent: Color
+    let background: Color
+
+    private var icon: String {
+        switch item.state {
+        case .completed: return "checkmark.circle.fill"
+        case .processing: return "waveform.circle.fill"
+        case .quotaLimited: return "hourglass.circle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        case .pending: return "circle.dashed"
+        }
+    }
+
+    private var statusColor: Color {
+        switch item.state {
+        case .failed: return BabyPlayerPalette.berry
+        case .quotaLimited: return BabyPlayerBatchPalette.warning
+        case .completed, .processing, .pending: return accent
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 21, weight: .semibold))
+                .foregroundStyle(statusColor)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                    .foregroundStyle(BabyPlayerBatchPalette.primaryText)
+                    .lineLimit(1)
+                Text(item.state.detailText)
+                    .font(.system(size: 17, weight: .semibold, design: .rounded))
+                    .foregroundStyle(BabyPlayerBatchPalette.secondaryText)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if item.state.isProcessing {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(statusColor)
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 70)
+        .background(background, in: RoundedRectangle(cornerRadius: 16))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.white.opacity(0.18), lineWidth: 1)
         }
     }
 }

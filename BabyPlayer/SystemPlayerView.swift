@@ -32,11 +32,11 @@ enum BabyPlayerAnalysisErrorPresentation {
         if let urlError = error as? URLError {
             switch urlError.code {
             case .cannotConnectToHost:
-                return "无法连接声音分析服务（-1004）。Debug 调试时请确认 Mac 的 8011 服务已启动"
+                return "无法连接 Mac 本地 AI 服务（8011，-1004），请确认 Mac 与 Apple TV 在同一网络"
             case .timedOut:
-                return "声音分析服务连接超时，请确认 Mac 与 Apple TV 在同一网络后重试"
+                return "Mac 本地 AI 服务响应超时，请确认 Jennifer 服务仍在运行"
             case .networkConnectionLost, .notConnectedToInternet:
-                return "声音分析网络连接已中断，请检查 Mac、Apple TV 和局域网"
+                return "Apple TV 与 Mac 的局域网连接已中断，请恢复网络后重试"
             default:
                 break
             }

@@ -50,9 +50,9 @@ ASR、DeepSeek 和普通歌词都可继续保留。DeepSeek 失败不会替换�
 
 ## 三、两条执行路径
 
-### 3.1 Debug + Mac HTTP 本地分析
+### 3.1 Debug / Release + Mac HTTP 本地分析
 
-Swift 只有在 `DEBUG` 且 Base URL 是 HTTP 时才启用 Mac 本地任务：
+Swift 从当前 Jellyfin 地址复用主机并固定使用 `8011/v1`；Debug 与 Release 都启用 Mac 本地任务：
 
 ```text
 Apple TV
@@ -75,9 +75,9 @@ Mac 本地服务
 Apple TV 只轮询 job，不上传音频。当前 UI 把所有 recognizing 状态显示为 1/1；Mac 内部虽然知道
 分片 1/3、2/3、3/3，但没有把该序号展示到电视。
 
-### 3.2 Release + VPS HTTPS 上传
+### 3.2 已停用：Release + VPS HTTPS 上传
 
-Release 始终关闭 Mac 本地任务：
+以下是旧实现，仅作历史记录。当前安装包不配置 VPS Base URL，也不会执行这条上传路径：
 
 ```text
 Apple TV
@@ -91,8 +91,7 @@ VPS
   └── 单次调用腾讯并缓存结果
 ```
 
-Release 路径没有复用 Mac 的 60/5 分片任务。两个路径的网络、音频处理、超时和失败模式不同，必须
-分别验收。
+当前正式路径只验收 3.1 的 Mac `8011/v1`；不得在连接失败时静默回退到此旧路径。
 
 ## 四、ASR 处理
 

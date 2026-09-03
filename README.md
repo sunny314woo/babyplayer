@@ -34,7 +34,28 @@ Jellyfin 不需要、也不能作为服务器安装在 Apple TV 上。平时播�
 
    歌名越准确，歌词候选越可靠。
 
-4. 记下电脑的局域网 IP。Jellyfin 默认地址通常是：
+4. 记下电脑的局域网 IP。macOS 上如果使用 Wi-Fi，通常可以在终端执行：
+
+   ```bash
+   ipconfig getifaddr en0
+   ```
+
+   命令输出的内容就是当前电脑的局域网 IP，例如 `192.168.1.14`。如果 `en0` 没有输出，先执行下面的命令，找到 Wi-Fi 或以太网对应的 `Device`（例如 `en1`），再把设备名代入：
+
+   ```bash
+   networksetup -listallhardwareports
+   ipconfig getifaddr en1
+   ```
+
+   也可以查看所有网卡的 IPv4 地址：
+
+   ```bash
+   ifconfig | rg "inet "
+   ```
+
+   选择与 Apple TV 在同一局域网的地址，例如 `192.168.1.x` 或 `10.x.x.x`；不要选择 `127.0.0.1`、`localhost` 或 VPN 地址。
+
+   Jellyfin 默认地址通常是：
 
    ```text
    http://电脑局域网IP:8096
@@ -150,15 +171,17 @@ BabyPlayer，让 Xcode 完成账户授权和 Automatic Signing 初始化。
 
 ## 三、让 BabyPlayer 连接 Jellyfin
 
-1. 保持电脑和 Jellyfin Server 开机，并确认 Apple TV 与电脑在同一局域网。
+1. 保持电脑和 Jellyfin Server 开机，并确认 Apple TV 与电脑在同一局域网。可以先在电脑浏览器打开 `http://127.0.0.1:8096`，确认 Jellyfin 正在运行。
 
-2. 第一次打开 BabyPlayer，输入 Jellyfin 地址，例如：
+2. 在电脑终端执行 `ipconfig getifaddr en0`，取得电脑当前局域网 IP。然后在 Apple TV 第一次打开 BabyPlayer，输入 Jellyfin 地址：
 
    ```text
-   http://192.168.3.33:8096
+   http://电脑局域网IP:8096
    ```
 
-3. BabyPlayer 会显示一个 Quick Connect 配对码。
+   例如电脑当前 IP 是 `192.168.1.14`，就输入 `http://192.168.1.14:8096`。不要输入 `localhost` 或 `127.0.0.1`，因为在 Apple TV 上它们指向的是 Apple TV 自己。
+
+3. 点击“连接并生成配对码”，BabyPlayer 会显示一个 Quick Connect 配对码。
 
 4. 在已经登录 Jellyfin 的电脑或手机浏览器中打开：
 
@@ -169,6 +192,16 @@ BabyPlayer，让 Xcode 完成账户授权和 Automatic Signing 初始化。
    输入电视上的配对码并批准。Quick Connect 的官方说明见 [Jellyfin Quick Connect](https://jellyfin.org/docs/general/server/quick-connect/)。
 
 5. 批准后 BabyPlayer 会自动进入“音乐视频”首页。以后通常不需要重新配对。
+
+### 更换网络后重新连接
+
+电脑更换 Wi-Fi、路由器或网络环境后，局域网 IP 可能会变化；Jellyfin 服务器没有更换，也不代表 IP 一定不变。此时重新执行：
+
+```bash
+ipconfig getifaddr en0
+```
+
+把新 IP 与 `:8096` 组成新的 Jellyfin 地址，例如 `http://192.168.1.25:8096`。在 Apple TV 的“家长设置”中选择“重新配对”，输入新地址并再次批准 Quick Connect。若 IP 经常变化，可以在路由器中为这台电脑设置 DHCP 地址保留。
 
 ## 四、播放时选择歌词
 
@@ -239,19 +272,23 @@ ASR、DeepSeek 和固定的普通歌词可以共存并反复切换。DeepSeek �
 
 本地 Token 不直接写入 `Info.plist`。复制
 `Config/BabyPlayerSecrets.xcconfig.example` 为 `Config/BabyPlayerSecrets.xcconfig`，只在后者中填入
-BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VPS 的
-`/opt/babyplayer-asr/.env`，不进入 Apple TV 安装包。
+BabyPlayer Bearer Token；该文件已被 Git 忽略。腾讯与 DeepSeek 密钥只填入这台 Mac 的
+`BabyPlayerASRServer/.env`，不进入 Apple TV 安装包。
 
-- Debug 真机连接局域网 Mac HTTP 服务时，Apple TV 只提交 Jellyfin 本机路径；Mac 读取白名单内
-  的原视频，一次解码 PCM/WAV，用 Audio Separator 提取人声并在人声轨上跑 VAD，然后按
-  60 秒、重叠 5 秒从无损人声轨生成分片。Release 默认连接 VPS HTTPS，由 Apple TV
-  临时提取并上传整首 M4A；两条路径需要分别验证。
-- Mac Debug 建议一次运行 `BabyPlayerASRServer/scripts/install-local-development-service.sh`，
-  让 `8011` 服务随登录启动并在异常退出后自动恢复。Apple TV 的 `-1004` 表示无法连接
-  该 Mac 服务，应先检查 `8011`、局域网和 Debug Base URL，而不是重跑腾讯 ASR。
-- Apple TV 不建立永久音频库。Release 提取的音频是临时文件；歌词候选、绑定和分析副本保存在
-  tvOS 私有 Caches，空间不足时系统可能清除。Mac/VPS 缓存才是可重建结果的来源。
-- VPS 不保存上传音频或 Jellyfin URL。ASR 模块缓存不可逆指纹、转写文字与时间戳；D3 缓存最终
+- `8011/v1` 不是 Debug 补丁，而是 Debug 与 Release 共用的正式 Mac 本地 AI 服务入口。
+  App 不保存固定 ASR IP，也不配置 VPS Base URL。
+- Apple TV 会从当前已配对的 Jellyfin 地址只取主机名：若 Jellyfin 是
+  `http://192.168.1.14:8096`，ASR、DeepSeek 和翻译自动使用
+  `http://192.168.1.14:8011/v1`。没有任何静默 VPS 回退。
+- 更换 Wi-Fi 或路由器时，先用 `ipconfig getifaddr en0` 查看 Mac 新 IP，再仅更新并重新配对
+  Apple TV 中的 Jellyfin `:8096` 地址；AI 服务会同步换到同一主机的 `:8011/v1`，无需改工程配置。
+- 首次配置 Mac 后运行 `BabyPlayerASRServer/scripts/install-local-development-service.sh`，让
+  `8011` 服务随登录启动并在异常退出后自动恢复。`-1004` 表示 Apple TV 无法连接 Mac 的
+  `8011`，应检查同一局域网、LaunchAgent、防火墙和路由器客户端隔离。
+- Apple TV 不建立永久音频库。双语字幕、人工绑定和片头片尾结果会按媒体 ID/内容指纹写入
+  tvOS 私有 Caches；正常退出设置、播放或覆盖安装不会重新生成。Mac 本地 SQLite 同时保存
+  可重建的 ASR/DeepSeek 结果；只有卸载 App 或 tvOS 清理 Caches 时，电视副本才可能需要恢复。
+- Mac 本地服务不保存 Jellyfin URL。ASR 模块缓存不可逆指纹、转写文字与时间戳；D3 缓存最终
   AI Lyrics。D3 缓存现已绑定实际 ASR word timeline/VAD 标记和候选内容哈希，
   不会再把旧 word ranges 套到新证据上。
 - D3 现会按 ASR 时间确定性归一化模型乱序/重叠行，并自动回收 DeepSeek 漏掉但有人声证据的 ASR 词。
@@ -340,7 +377,7 @@ BabyPlayer Bearer Token；该文件已被 Git 忽略。DeepSeek Key 只填入 VP
 
 在该视频的播放页打开“字幕与歌词”，先看最多 3 个同步候选和可选本地歌本；不合适时
 选择“重新搜索歌词”。如果需要声音分析，点一次“ASR 识别歌词”；DeepSeek 成功后会自动切换并保存绑定。tvOS Caches
-属于可清理存储，如果系统删除缓存，可从 Mac/VPS 重新生成，但当前人工绑定仍可能需要重新选择。
+属于可清理存储，如果系统删除缓存，可从 Mac 本地服务恢复或重新生成，但当前人工绑定仍可能需要重新选择。
 
 ## 当前要求
 

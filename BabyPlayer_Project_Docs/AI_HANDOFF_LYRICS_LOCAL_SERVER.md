@@ -1,6 +1,6 @@
 # BabyPlayer 开发接力摘要
 
-更新：2026-08-25（人声分离与 Wheels 前奏修复后）
+更新：2026-08-27（统一 Mac 本地 8011 正式路径后）
 项目：`/Users/wufengyu/Projects/AppleTV-儿童播放器`
 
 本文件用于快速接力；架构现状、代码审查、实测数据、竞品研究和改进优先级以
@@ -15,8 +15,9 @@
 - Mac 先用 `python-audio-separator 0.44.5 + Kim_Vocal_2.onnx` 提取 vocals stem，再跑 Silero VAD；
   各 60 秒/重叠 5 秒腾讯分片从同一无损人声轨生成。
 - 测试不绑定 Jennifer，可对任意视频人工操作。
-- VPS 暂不用于开发验证，但保留且不删除。
-- Debug 真机包连 Mac；Release 默认仍连生产 VPS HTTPS。
+- VPS 不用于 Apple TV 的 ASR、DeepSeek、翻译或字幕处理。
+- Debug 与 Release 都从当前 Jellyfin 地址复用主机，并固定连接 Mac `:8011/v1`；没有固定 IP
+  配置或 VPS 回退。
 - 播放器已用倍速菜单取代 App 内声音菜单，固定提供 `0.8× / 1× / 1.5× / 2× / 3×`，初始为 `1×`。
 
 ## 歌词交互规则
@@ -61,7 +62,8 @@ DeepSeek 失败时保留当前字幕与 ASR；如果处理期间用户又手动�
 
 ## 本地测试环境
 
-- Apple TV Debug 地址：`http://192.168.3.33:8011/v1`
+- Apple TV 不配置固定 AI 地址。例如当前 Jellyfin 是 `http://192.168.1.14:8096`，运行时自动
+  使用 `http://192.168.1.14:8011/v1`。换网后只更新并重新配对 Jellyfin。
 - 持久启动：首次运行 `BabyPlayerASRServer/scripts/install-local-development-service.sh`，安装后由
   LaunchAgent `uk.wisteriasoftware.babyplayer-asr-local` 在登录时启动并在异常退出后自动拉起。
 - 手工前台调试：`BabyPlayerASRServer/scripts/start-local-development.sh`

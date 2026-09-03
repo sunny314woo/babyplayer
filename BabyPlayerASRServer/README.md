@@ -1,21 +1,20 @@
 # BabyPlayer ASR Server
 
-这是 BabyPlayer 的独立 ASR 代理，与 EnglishFlow Account Server、翻译、TTS、支付和
-Jellyfin 完全解耦。它可以部署在同一台 VPS，但使用独立目录、Linux 用户、systemd
-进程、端口、SQLite 数据库、Bearer Token 和环境变量。
+这是与 Jennifer/Jellyfin 运行在同一台 Mac 上的 BabyPlayer 本地 AI 服务。它负责腾讯 ASR、
+DeepSeek、中文字幕和结果缓存，固定监听 `8011`；Apple TV 不通过 VPS 处理这些任务。
 
 ## 当前开发状态
 
 当前为个人内测的最小闭环：只有一台 Apple TV 使用，不提供用户系统、登录、订阅、支付、
-家庭共享或多租户功能。开发验证和 Release 使用两条不同路径：
+家庭共享或多租户功能。Debug 与 Release 使用同一条 Mac 局域网路径：
 
 | 场景 | Apple TV 提交内容 | 音频处理位置 | 服务地址 |
 | --- | --- | --- | --- |
-| Debug + 局域网 HTTP | Jellyfin 本机 Path、指纹、歌曲范围 | Mac 读取白名单内原视频，60 秒分片、重叠 5 秒 | Mac `:8011/v1` |
-| Release + HTTPS | Apple TV 临时导出的整首 M4A | Apple TV 导出，VPS 接收一次上传 | 生产 VPS `/v1` |
+| Debug / Release | Jellyfin 本机 Path、指纹、歌曲范围 | Mac 读取白名单内原视频，60 秒分片、重叠 5 秒 | 当前 Jellyfin 主机的 `:8011/v1` |
 
-Debug 只有在 HTTP Base URL 下才使用 `/v1/local-analysis/jobs`；Release 始终关闭这个客户端路径。
-因此 Mac 真机验证通过不等于 VPS 上传路径已经验证通过。
+Apple TV 不读取固定 Base URL。若当前 Jellyfin 为 `http://192.168.1.14:8096`，客户端会自动把
+ASR、DeepSeek 和翻译地址构造成 `http://192.168.1.14:8011/v1`，并使用
+`/v1/local-analysis/jobs`。代码不允许静默回退到 VPS。
 
 ```text
 /opt/babyplayer-asr                 独立程序与 .env
@@ -52,7 +51,7 @@ pip install -r requirements-local-quality.txt
 .venv/bin/audio-separator -m Kim_Vocal_2.onnx \
   --model_file_dir .cache/audio-separator-models --download_model_only
 cp .env.example .env
-uvicorn app.main:app --host 127.0.0.1 --port 8011
+uvicorn app.main:app --host 0.0.0.0 --port 8011
 ```
 
 `Kim_Vocal_2.onnx` 约 66.8 MB，只保存在已被 Git 忽略的
@@ -94,13 +93,14 @@ BabyPlayerASRServer/scripts/start-local-development.sh
 过程目录。`PRODUCT_ENV=production` 会关闭本地 Path 接口；生产部署必须使用精确的
 `production`，不要使用容易误拼的自定义名称。
 
-Apple TV 提示 `-1004` 表示连不上 Mac 服务，不是腾讯 ASR 识别拒绝。先检查
-`launchctl print`、Mac 的 `8011` 健康接口和 Apple TV 的 Debug Base URL；Mac DHCP 地址
-变化后，还需同步更新被 Git 忽略的 `Config/BabyPlayerSecrets.xcconfig`。
+Apple TV 的 `-1004` 表示连不上 Mac `8011`，不是腾讯 ASR 识别拒绝。先检查
+`launchctl print`、Mac 的 `8011` 健康接口、防火墙和两台设备是否在同一局域网。Mac DHCP
+地址变化后，只更新 Apple TV 的 Jellyfin `:8096` 地址；AI 会自动跟随同一主机，不修改
+`BabyPlayerSecrets.xcconfig`，也不重新编译 Base URL。
 
 ### Mac 人声分离与活动质量层
 
-Mac Debug 默认执行以下路径：
+Mac 的 Debug 与 Release 都执行以下 `:8011/v1` 路径：
 
 ```text
 完整原视频（不受家长片头/片尾秒数裁剪）
@@ -135,7 +135,7 @@ Mac Debug 默认执行以下路径：
 
 Apple Silicon 分离一首 2–3 分钟儿歌需约 1–2 分钟，峰值内存约 5–6 GB；模型加载后会保留在进程中供后续歌曲复用。
 LaunchAgent 必须使用 `ProcessType=Interactive`，否则这台 Mac 上的 CoreML 可被 Background QoS 降速约一个数量级。
-这是 Mac 播放前离线质量路径，不可在 Apple TV 上本地运行，也尚未部署到 VPS Release 路径。
+这是 Mac 播放前离线质量路径，不在 Apple TV 上执行，也不依赖 VPS。
 
 ## API
 
@@ -200,7 +200,8 @@ cp Config/BabyPlayerSecrets.xcconfig.example Config/BabyPlayerSecrets.xcconfig
 ```
 
 然后只在被 Git 忽略的 `BabyPlayerSecrets.xcconfig` 中替换 `XX_BABYPLAYER_API_TOKEN`。
-DeepSeek Key 只存在 VPS `.env`，Apple TV 继续只持有 BabyPlayer Bearer Token。
+当前 Apple TV 不使用本节 VPS 部署。日常本地运行时，DeepSeek Key 只存在 Mac 项目内被忽略的
+`.env`，Apple TV 继续只持有 BabyPlayer Bearer Token。
 对于腾讯 ASR 已经配置好的服务器，可以只补 DeepSeek Key，不重新输入其他凭据：
 
 ```bash

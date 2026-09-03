@@ -423,28 +423,55 @@ enum BabyPlayerASRDateFormatter {
     }
 }
 
-// 【MODIFIED】ASR、旧 refine 与 D3 共用同一 URL 校验；Release 只允许 HTTPS，Debug 的 HTTP 只允许 Mac 局域网。
+// ASR、歌词校准、翻译与 D3 永远跟随当前 Jellyfin 所在的 Mac；8011/v1 是正式局域网服务入口。
 struct BabyPlayerServiceConfiguration {
     let baseURL: URL
     let apiToken: String
 
+    private static let jellyfinServerAddressKey = "BabyPlayer.Runtime.JellyfinServerAddress"
+
+    /// 保存当前已配对 Jellyfin 的非敏感地址，供后台服务客户端只取同一主机名。
+    static func updateJellyfinServerAddress(_ address: String?) {
+        let trimmed = address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: jellyfinServerAddressKey)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: jellyfinServerAddressKey)
+        }
+    }
+
+    /// 只复用 Jellyfin 主机，不复用其 8096 端口；AI 固定使用 Mac 的 8011/v1。
+    static func localBaseURL(forJellyfinServerAddress address: String) -> URL? {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let normalized = trimmed.contains("://") ? trimmed : "http://\(trimmed)"
+        guard let jellyfin = URLComponents(string: normalized),
+              let host = jellyfin.host, !host.isEmpty else { return nil }
+        var service = URLComponents()
+        service.scheme = "http"
+        service.host = host
+        service.port = 8011
+        service.path = "/v1"
+        guard let url = service.url, isAllowed(url) else { return nil }
+        return url
+    }
+
     static func load() throws -> BabyPlayerServiceConfiguration {
-        let rawURL = Bundle.main.object(forInfoDictionaryKey: "BabyPlayerASRBaseURL") as? String ?? ""
         let token = Bundle.main.object(forInfoDictionaryKey: "BabyPlayerASRAPIToken") as? String ?? ""
-        guard !rawURL.isEmpty, !token.isEmpty,
-              !rawURL.uppercased().contains("XX_"),
+        let jellyfinAddress = UserDefaults.standard.string(forKey: jellyfinServerAddressKey) ?? ""
+        guard !token.isEmpty,
               !token.uppercased().hasPrefix("XX_"),
-              let url = URL(string: rawURL), isAllowed(url) else {
+              let url = localBaseURL(forJellyfinServerAddress: jellyfinAddress) else {
             throw BabyPlayerASRError.notConfigured
         }
         return BabyPlayerServiceConfiguration(baseURL: url, apiToken: token)
     }
 
-    /// 校验服务地址；输入 URL，输出是否可用，不读写配置或网络。
+    /// 正式客户端仅允许回环、RFC1918 或 Bonjour 主机上的固定 8011/v1，不接受公网/VPS 回退。
     static func isAllowed(_ url: URL) -> Bool {
-        if url.scheme?.lowercased() == "https" { return true }
-        #if DEBUG
         guard url.scheme?.lowercased() == "http",
+              url.port == 8011,
+              url.path == "/v1",
               let host = url.host?.lowercased() else { return false }
         if host == "localhost" || host == "127.0.0.1" || host.hasSuffix(".local") {
             return true
@@ -454,18 +481,11 @@ struct BabyPlayerServiceConfiguration {
         return parts[0] == 10
             || (parts[0] == 172 && (16...31).contains(parts[1]))
             || (parts[0] == 192 && parts[1] == 168)
-        #else
-        return false
-        #endif
     }
 
-    /// 本地明文地址只存在于 Debug，代表由 Mac 直接读取媒体的开发链路。
+    /// Debug 与 Release 都只走 Mac 本地任务，由 Mac 直接读取 Jellyfin 提供的媒体 Path。
     var usesMacLocalAnalysisJobs: Bool {
-        #if DEBUG
-        return baseURL.scheme?.lowercased() == "http"
-        #else
-        return false
-        #endif
+        true
     }
 }
 
