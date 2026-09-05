@@ -10,11 +10,49 @@ import SwiftUI
 import UIKit
 
 /// 媒体源交给封面层的最小输入；来源可以是 Jellyfin、U 盘或 NAS。
-struct BabyPlayerCoverSource: Hashable {
+struct BabyPlayerCoverSource: @unchecked Sendable {
     let providerImageURL: URL?
     let videoURL: URL?
+    let smbPlaybackResource: SMBPlaybackResource?
     let duration: TimeInterval?
     let cacheKey: String
+
+    var viewIdentity: String {
+        "\(cacheKey)|\(providerImageURL != nil)|\(videoURL != nil)|\(smbPlaybackResource != nil)"
+    }
+}
+
+/// 所有本地抽帧共用一条串行队列，并按 cache key 合并重复请求。
+/// 这避免首页同时出现 12 张卡片时创建 12 个解码器或挤占 SMB 播放读取。
+private actor BabyPlayerCoverGenerationCoordinator {
+    private struct Entry {
+        let id: UUID
+        let task: Task<UIImage?, Never>
+    }
+
+    static let shared = BabyPlayerCoverGenerationCoordinator()
+    private var inFlight: [String: Entry] = [:]
+    private var tail: Task<Void, Never>?
+
+    func generate(for source: BabyPlayerCoverSource) async -> UIImage? {
+        if let existing = inFlight[source.cacheKey] {
+            return await existing.task.value
+        }
+        let predecessor = tail
+        let id = UUID()
+        let task: Task<UIImage?, Never> = Task(priority: .utility) {
+            if let predecessor { await predecessor.value }
+            guard !Task.isCancelled else { return nil }
+            return await BabyPlayerCoverGenerator.generateUncached(for: source)
+        }
+        inFlight[source.cacheKey] = Entry(id: id, task: task)
+        tail = Task { _ = await task.value }
+        let result = await task.value
+        if inFlight[source.cacheKey]?.id == id {
+            inFlight[source.cacheKey] = nil
+        }
+        return result
+    }
 }
 
 /// 生成并缓存本地视频封面；不会读取或写入媒体源的业务状态。
@@ -29,10 +67,32 @@ enum BabyPlayerCoverGenerator {
         if let cachedImage = loadCachedImage(for: source.cacheKey) {
             return cachedImage
         }
-        guard let videoURL = source.videoURL else { return nil }
+        return await BabyPlayerCoverGenerationCoordinator.shared.generate(for: source)
+    }
 
-        let asset = AVURLAsset(url: videoURL)
-        let duration = source.duration ?? asset.duration.seconds
+    fileprivate static func generateUncached(for source: BabyPlayerCoverSource) async -> UIImage? {
+        if let cachedImage = loadCachedImage(for: source.cacheKey) {
+            return cachedImage
+        }
+        let preparedSMBAsset = source.smbPlaybackResource?.makePreparedAsset()
+        let asset: AVAsset
+        if let preparedSMBAsset {
+            asset = preparedSMBAsset.asset
+        } else if let videoURL = source.videoURL {
+            asset = AVURLAsset(url: videoURL)
+        } else {
+            return nil
+        }
+        // AVAssetResourceLoader 的 delegate 是弱引用；抽帧结束前必须保留 SMB prepared asset。
+        defer { withExtendedLifetime(preparedSMBAsset) {} }
+        let duration: TimeInterval
+        if let knownDuration = source.duration {
+            duration = knownDuration
+        } else if let loadedDuration = try? await asset.load(.duration) {
+            duration = loadedDuration.seconds
+        } else {
+            return nil
+        }
         guard duration.isFinite, duration > 0.4 else { return nil }
 
         let generator = AVAssetImageGenerator(asset: asset)
@@ -40,17 +100,18 @@ enum BabyPlayerCoverGenerator {
         generator.maximumSize = CGSize(width: 800, height: 450)
 
         let ratios = shuffledSampleRatios(seed: source.cacheKey)
-        let candidates: [(UIImage, Double)] = ratios.compactMap { ratio in
+        var candidates: [(UIImage, Double)] = []
+        for ratio in ratios {
+            guard !Task.isCancelled else { return nil }
             let seconds = min(max(duration * ratio, 0.15), duration - 0.15)
-            guard seconds > 0 else { return nil }
+            guard seconds > 0 else { continue }
             do {
-                let image = try generator.copyCGImage(
-                    at: CMTime(seconds: seconds, preferredTimescale: 600),
-                    actualTime: nil
+                let generated = try await generator.image(
+                    at: CMTime(seconds: seconds, preferredTimescale: 600)
                 )
-                return (UIImage(cgImage: image), score(image))
+                candidates.append((UIImage(cgImage: generated.image), score(generated.image)))
             } catch {
-                return nil
+                continue
             }
         }
 
@@ -62,11 +123,16 @@ enum BabyPlayerCoverGenerator {
     }
 
     /// 【MODIFIED】扫描完成后预热所有缺少来源封面的项目；逐个处理，避免同时占满 Apple TV 解码资源。
-    static func prewarm(sources: [BabyPlayerCoverSource]) async {
+    @discardableResult
+    static func prewarm(sources: [BabyPlayerCoverSource]) async -> Int {
+        var readyCount = 0
         for source in sources where source.providerImageURL == nil {
-            guard !Task.isCancelled else { return }
-            _ = await generate(for: source)
+            guard !Task.isCancelled else { return readyCount }
+            if await generate(for: source) != nil {
+                readyCount += 1
+            }
         }
+        return readyCount
     }
 
     /// 生成稳定的伪随机顺序，让同一视频每次都从同一组 5 个内部位置取样。

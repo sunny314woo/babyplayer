@@ -299,6 +299,7 @@ struct SystemPlayerView: UIViewControllerRepresentable {
     let ratingFor: (String) -> BabyPlayerRating
     let onProgress: (String, Double, Double?) -> Void
     let onFinished: (String) -> Void
+    let onSmartSkipEnabledChange: (Bool) -> Void
 
     func makeUIViewController(context: Context) -> BabyPlaylistPlayerViewController {
         let controller = BabyPlaylistPlayerViewController()
@@ -308,7 +309,8 @@ struct SystemPlayerView: UIViewControllerRepresentable {
             onRate: onRate,
             ratingFor: ratingFor,
             onProgress: onProgress,
-            onFinished: onFinished
+            onFinished: onFinished,
+            onSmartSkipEnabledChange: onSmartSkipEnabledChange
         )
         return controller
     }
@@ -319,6 +321,7 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         controller.ratingFor = ratingFor
         controller.onProgress = onProgress
         controller.onFinished = onFinished
+        controller.onSmartSkipEnabledChange = onSmartSkipEnabledChange
     }
 
     static func dismantleUIViewController(
@@ -341,6 +344,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     var ratingFor: ((String) -> BabyPlayerRating)?
     var onProgress: ((String, Double, Double?) -> Void)?
     var onFinished: ((String) -> Void)?
+    var onSmartSkipEnabledChange: ((Bool) -> Void)?
 
     private var selection: SpikePlaybackSelection?
     private var originalQueueItems: [BabyPlayerQueueItem] = []
@@ -353,6 +357,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var sessionEndsAt: Date?
     private var timerDurationMinutes: Int?
     private var currentPlaybackRate = BabyPlayerPlaybackRatePolicy.defaultRate
+    private var isSmartSkipEnabled = true
     private var activePreparedSMBAsset: SMBSpikePreparedAsset?
     private var endObserver: NSObjectProtocol?
     private var analysisWorkflowObserver: NSObjectProtocol?
@@ -363,6 +368,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var lyricsSelectionTask: Task<Void, Never>?
     private var aiProgressHideTask: Task<Void, Never>?
     private var outroFadeTask: Task<Void, Never>?
+    private var recentSmartIntroApplication: (itemID: String, expiresAt: Date)?
     private var lyricLines: [TimedLyricLine] = []
     /// 仅用于展示；英文 lyricLines 继续独立承担全部时间轴计算和偏移。
     private var bilingualLyricLines: [BilingualLyricLine]?
@@ -396,7 +402,8 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         onRate: @escaping (String, BabyPlayerRating) -> Void,
         ratingFor: @escaping (String) -> BabyPlayerRating,
         onProgress: @escaping (String, Double, Double?) -> Void,
-        onFinished: @escaping (String) -> Void
+        onFinished: @escaping (String) -> Void,
+        onSmartSkipEnabledChange: @escaping (Bool) -> Void
     ) {
         self.selection = selection
         self.onExit = onExit
@@ -404,6 +411,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         self.ratingFor = ratingFor
         self.onProgress = onProgress
         self.onFinished = onFinished
+        self.onSmartSkipEnabledChange = onSmartSkipEnabledChange
         originalQueueItems = selection.items
         queueItems = selection.items
         currentIndex = selection.startIndex
@@ -418,6 +426,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             }
         }()
         currentLyricsMode = selection.lyricsMode
+        isSmartSkipEnabled = selection.smartSkipEnabled
         sessionEndsAt = selection.sessionDuration.map { Date().addingTimeInterval($0) }
         timerDurationMinutes = selection.sessionDuration.map { Int(($0 / 60).rounded()) }
         showsPlaybackControls = true
@@ -553,20 +562,6 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
     }
 
-    private func updateSmartSkipEnabled(
-        _ enabled: Bool,
-        mediaFingerprint: String
-    ) {
-        for index in queueItems.indices
-        where queueItems[index].lyricsMedia.asrFingerprint == mediaFingerprint {
-            queueItems[index].smartSkipEnabled = enabled
-        }
-        for index in originalQueueItems.indices
-        where originalQueueItems[index].lyricsMedia.asrFingerprint == mediaFingerprint {
-            originalQueueItems[index].smartSkipEnabled = enabled
-        }
-    }
-
     /// 判断当前播放媒体；输入为 media fingerprint，输出是否仍为同一声音来源，不修改状态。
     // 【MODIFIED】循环重建 queue item 时使用稳定 fingerprint，而不是播放器实例生命周期。
     private func isCurrentMedia(fingerprint: String) -> Bool {
@@ -607,10 +602,20 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         let introTarget = BabyPlayerPlaybackBoundaryPolicy.introTarget(
             chapter: queueItem.chapterIntroEndSeconds,
             smart: queueItem.smartIntroEndSeconds,
-            smartEnabled: queueItem.smartSkipEnabled,
+            smartEnabled: isSmartSkipEnabled,
             manualSkipSeconds: selection.introSkipSeconds,
             resumeTarget: resumeTarget
         )
+        let introTargetWithoutSmartSkip = BabyPlayerPlaybackBoundaryPolicy.introTarget(
+            chapter: queueItem.chapterIntroEndSeconds,
+            smart: queueItem.smartIntroEndSeconds,
+            smartEnabled: false,
+            manualSkipSeconds: selection.introSkipSeconds,
+            resumeTarget: resumeTarget
+        )
+        recentSmartIntroApplication = abs(introTarget - introTargetWithoutSmartSkip) > 0.01
+            ? (queueItem.id, Date().addingTimeInterval(30))
+            : nil
         if introTarget > 0 {
             player?.seek(
                 to: CMTime(seconds: introTarget, preferredTimescale: 600),
@@ -639,7 +644,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
         let duration = player?.currentItem?.duration.seconds
         onProgress?(
-            queueItem.id,
+            queueItem.preferenceID,
             elapsed,
             duration?.isFinite == true ? duration : queueItem.lyricsMedia.durationSeconds
         )
@@ -652,7 +657,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         let outroTarget = BabyPlayerPlaybackBoundaryPolicy.outroTarget(
             chapter: queueItem.chapterOutroStartSeconds,
             smart: queueItem.smartOutroStartSeconds,
-            smartEnabled: queueItem.smartSkipEnabled,
+            smartEnabled: isSmartSkipEnabled,
             manualSkipSeconds: selection.outroSkipSeconds,
             duration: player?.currentItem?.duration.seconds
         )
@@ -702,7 +707,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             return
         }
 
-        if let completedID = currentQueueItem?.id {
+        if let completedID = currentQueueItem?.preferenceID {
             onFinished?(completedID)
         }
 
@@ -950,10 +955,13 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
                 foundCandidates = Array(candidates.prefix(3))
                 self.lyricCandidates = foundCandidates
-                playback = await BabyLyricsRepository.shared.resolvedLyrics(
-                    for: item.lyricsMedia,
-                    candidates: candidates
-                )
+                // 已落盘的 DeepSeek/双语结果优先；普通搜索候选只在本地没有结果时兜底。
+                if playback == nil {
+                    playback = await BabyLyricsRepository.shared.resolvedLyrics(
+                        for: item.lyricsMedia,
+                        candidates: candidates
+                    )
+                }
             } catch {
                 guard !Task.isCancelled, self.isCurrentMedia(fingerprint: fingerprint) else { return }
                 self.lyricCandidates = []
@@ -1334,11 +1342,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         let adoptASR = analysisAdoptionAction(for: .asr)
         let adoptDeepSeek = analysisAdoptionAction(for: .deepSeek)
 
-        var children: [UIMenuElement] = []
-        if let smartSkip = smartSkipAction() {
-            children.append(smartSkip)
-        }
-        children.append(contentsOf: [
+        let children: [UIMenuElement] = [
             asr,
             deepSeek,
             rerunASR,
@@ -1348,7 +1352,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             currentResult,
             adoptASR,
             adoptDeepSeek
-        ])
+        ]
 
         return UIMenu(
             title: "AI 功能",
@@ -1357,46 +1361,66 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         )
     }
 
-    /// 只有当前歌曲已经生成可信边界时才显示，不为未分析或判断不足增加额外菜单状态。
-    private func smartSkipAction() -> UIAction? {
-        guard let item = currentQueueItem,
-              item.smartIntroEndSeconds != nil || item.smartOutroStartSeconds != nil else {
-            return nil
-        }
+    /// Apple TV 本机的全局播放偏好；始终展示，且只控制 AI 生成的边界。
+    private func smartSkipAction() -> UIAction {
         let action = UIAction(
             title: "智能跳过片头片尾",
-            image: UIImage(systemName: item.smartSkipEnabled ? "forward.end.circle.fill" : "forward.end.circle")
+            subtitle: isSmartSkipEnabled
+                ? "已启用：采用 AI 分析结果；所有媒体源通用"
+                : "已关闭：保留分析结果；固定跳过设置不受影响",
+            image: UIImage(systemName: isSmartSkipEnabled ? "forward.end.circle.fill" : "forward.end.circle")
         ) { [weak self] _ in
-            self?.toggleSmartSkipForCurrentItem()
+            self?.setSmartSkipEnabled(!(self?.isSmartSkipEnabled ?? true))
         }
-        action.state = item.smartSkipEnabled ? .on : .off
+        action.state = isSmartSkipEnabled ? .on : .off
         return action
     }
 
-    private func toggleSmartSkipForCurrentItem() {
-        guard let item = currentQueueItem,
-              item.smartIntroEndSeconds != nil || item.smartOutroStartSeconds != nil else { return }
-        let fingerprint = item.lyricsMedia.asrFingerprint
-        let previousValue = item.smartSkipEnabled
-        let newValue = !previousValue
-        updateSmartSkipEnabled(newValue, mediaFingerprint: fingerprint)
-        updateLyricsTransportMenu()
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let bundle = try await BabyLyricsRepository.shared.setSmartPlaybackEnabled(
-                    newValue,
-                    for: item.lyricsMedia
-                )
-                guard self.isCurrentMedia(fingerprint: fingerprint) else { return }
-                self.analysisBundle = bundle
-            } catch {
-                guard self.isCurrentMedia(fingerprint: fingerprint) else { return }
-                self.updateSmartSkipEnabled(previousValue, mediaFingerprint: fingerprint)
-                self.updateLyricsTransportMenu()
+    private func setSmartSkipEnabled(_ enabled: Bool) {
+        isSmartSkipEnabled = enabled
+        if !enabled {
+            undoRecentSmartIntroIfNeeded()
+            if isAdvancing {
+                outroFadeTask?.cancel()
+                outroFadeTask = nil
+                player?.volume = 1
+                isAdvancing = false
             }
         }
+        onSmartSkipEnabledChange?(enabled)
+        updateLyricsTransportMenu()
+    }
+
+    /// 用户刚进入播放便被智能片头跳转时，关闭开关应能撤销本次跳转。
+    /// 回退目标仍尊重 chapter、家长固定秒数和首曲续播点，只移除 AI 边界。
+    private func undoRecentSmartIntroIfNeeded() {
+        guard let application = recentSmartIntroApplication,
+              application.expiresAt >= Date(),
+              let selection,
+              let queueItem = currentQueueItem,
+              queueItem.id == application.itemID else {
+            recentSmartIntroApplication = nil
+            return
+        }
+        let initialItemID = selection.items.indices.contains(selection.startIndex)
+            ? selection.items[selection.startIndex].id
+            : nil
+        let resumeTarget = currentPlayNumber == 1 && queueItem.id == initialItemID
+            ? selection.startPositionSeconds
+            : nil
+        let fallbackTarget = BabyPlayerPlaybackBoundaryPolicy.introTarget(
+            chapter: queueItem.chapterIntroEndSeconds,
+            smart: queueItem.smartIntroEndSeconds,
+            smartEnabled: false,
+            manualSkipSeconds: selection.introSkipSeconds,
+            resumeTarget: resumeTarget
+        )
+        recentSmartIntroApplication = nil
+        player?.seek(
+            to: CMTime(seconds: fallbackTarget, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
     }
 
     /// 为 ASR/DeepSeek 分别创建可采用项；一个结果缺失不会阻塞另一个。
@@ -1427,7 +1451,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
 
     /// 创建当前视频的三态本地评分菜单；屏蔽后结束当前播放会话。
     private func ratingMenu() -> UIMenu {
-        let currentRating = currentQueueItem.flatMap { ratingFor?($0.id) } ?? .unrated
+        let currentRating = currentQueueItem.flatMap { ratingFor?($0.preferenceID) } ?? .unrated
         let like = ratingAction(
             title: "喜欢",
             rating: .liked,
@@ -1470,7 +1494,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             image: UIImage(systemName: symbol)
         ) { [weak self] _ in
             guard let self, let item = currentQueueItem else { return }
-            onRate?(item.id, rating)
+            onRate?(item.preferenceID, rating)
             if rating == .blocked {
                 finishPlayback()
             } else {
@@ -1534,13 +1558,18 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     }
 
     private func playbackRateMenu() -> UIMenu {
-        let actions = BabyPlayerPlaybackRatePolicy.availableRates.map { rate in
+        let rateActions = BabyPlayerPlaybackRatePolicy.availableRates.map { rate in
             playbackRateAction(rate)
         }
+        let rates = UIMenu(
+            title: "播放速度",
+            options: .displayInline,
+            children: rateActions
+        )
         return UIMenu(
             title: "倍速：\(BabyPlayerPlaybackRatePolicy.title(for: currentPlaybackRate))",
             image: UIImage(systemName: "speedometer"),
-            children: actions
+            children: [smartSkipAction(), rates]
         )
     }
 
@@ -2008,7 +2037,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             } else {
                 translation = try await BabyPlayerLyricsTranslationClient().translate(
                     english: english,
-                    mediaFingerprint: item.lyricsMedia.asrFingerprint
+                    mediaFingerprint: item.lyricsMedia.translationFingerprint
                 )
                 bundle = try await BabyLyricsRepository.shared.storeChineseTranslation(
                     translation,

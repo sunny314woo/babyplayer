@@ -23,6 +23,66 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertTrue(BabyPlayerBatchEligibilityPolicy.shouldInclude(rating: .unrated))
     }
 
+    func testContentIdentityConnectsSourcesAndRejectsDuplicateNames() {
+        let jellyfin = BabyPlayerContentIdentityResolver.mappings(for: [
+            .init(
+                sourceID: "jellyfin-10",
+                displayName: "10. Open Shut Them",
+                fileNameOrPath: "/Volumes/USB/sss73/10. Open Shut Them.mp4"
+            )
+        ])
+        let samba = BabyPlayerContentIdentityResolver.mappings(for: [
+            .init(
+                sourceID: "smb:/sss73/10. Open Shut Them.mp4",
+                displayName: "10. Open Shut Them",
+                fileNameOrPath: "10. Open Shut Them.mp4"
+            )
+        ])
+        XCTAssertEqual(jellyfin["jellyfin-10"], samba["smb:/sss73/10. Open Shut Them.mp4"])
+
+        let duplicates = BabyPlayerContentIdentityResolver.mappings(for: [
+            .init(sourceID: "smb:/a/song.mp4", displayName: "Song", fileNameOrPath: "/a/song.mp4"),
+            .init(sourceID: "smb:/b/song.mp4", displayName: "Song", fileNameOrPath: "/b/song.mp4")
+        ])
+        XCTAssertEqual(duplicates["smb:/a/song.mp4"], "smb:/a/song.mp4")
+        XCTAssertEqual(duplicates["smb:/b/song.mp4"], "smb:/b/song.mp4")
+    }
+
+    func testContentIdentityMigratesRatingsBlocksAndResume() throws {
+        let contentID = try XCTUnwrap(
+            BabyPlayerLocalMediaMigrationKey.make(fileNameOrPath: "Song.mp4")
+        )
+        let aliases = [
+            "jellyfin-song": contentID,
+            "smb:/songs/Song.mp4": contentID
+        ]
+        let blocked = BabyPlayerContentIdentityResolver.migratedRatings(
+            ["jellyfin-song": .blocked, "smb:/songs/Song.mp4": .liked],
+            aliases: aliases
+        )
+        XCTAssertEqual(blocked, [contentID: .blocked])
+
+        let conflicted = BabyPlayerContentIdentityResolver.migratedRatings(
+            ["jellyfin-song": .liked, "smb:/songs/Song.mp4": .disliked],
+            aliases: aliases
+        )
+        XCTAssertTrue(conflicted.isEmpty)
+
+        let legacyResume = BabyPlayerPlaybackResumeState(
+            itemID: "jellyfin-song",
+            positionSeconds: 42,
+            durationSeconds: 100,
+            updatedAt: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertEqual(
+            BabyPlayerContentIdentityResolver.migratedResumeState(
+                legacyResume,
+                aliases: aliases
+            )?.itemID,
+            contentID
+        )
+    }
+
     /// 播放器倍速菜单包含用于快速检查字幕的 3×，默认仍为正常 1×。
     func testPlaybackRateMenuUsesRequestedRatesIncludingThreeTimes() {
         XCTAssertEqual(BabyPlayerPlaybackRatePolicy.availableRates, [0.8, 1, 1.5, 2, 3])
@@ -101,9 +161,23 @@ final class LyricsAndASRTests: XCTestCase {
             ),
             .off
         )
+        XCTAssertEqual(
+            BabyPlayerLyricsDefaultPolicy.resolvedMode(
+                storedMode: .bilingual,
+                hasAppliedEnabledByDefaultMigration: true
+            ),
+            .bilingual
+        )
+        XCTAssertEqual(
+            BabyPlayerLyricsDefaultPolicy.resolvedMode(
+                storedMode: .chinese,
+                hasAppliedEnabledByDefaultMigration: true
+            ),
+            .chinese
+        )
     }
 
-    func testPerSongSmartSkipDefaultsOnAndRespectsStoredOff() {
+    func testDeviceWideSmartSkipDefaultsOnAndRespectsStoredValue() {
         XCTAssertTrue(BabyPlayerSmartSkipPreferencePolicy.resolvedValue(storedValue: nil))
         XCTAssertTrue(BabyPlayerSmartSkipPreferencePolicy.resolvedValue(storedValue: true))
         XCTAssertFalse(BabyPlayerSmartSkipPreferencePolicy.resolvedValue(storedValue: false))
@@ -168,6 +242,26 @@ final class LyricsAndASRTests: XCTestCase {
                 duration: 180
             ),
             170
+        )
+        XCTAssertEqual(
+            BabyPlayerPlaybackBoundaryPolicy.introTarget(
+                chapter: nil,
+                smart: 12,
+                smartEnabled: false,
+                manualSkipSeconds: 20,
+                resumeTarget: nil
+            ),
+            20
+        )
+        XCTAssertEqual(
+            BabyPlayerPlaybackBoundaryPolicy.introTarget(
+                chapter: 8,
+                smart: 12,
+                smartEnabled: false,
+                manualSkipSeconds: 20,
+                resumeTarget: nil
+            ),
+            8
         )
     }
 
@@ -599,7 +693,8 @@ final class LyricsAndASRTests: XCTestCase {
             durationSeconds: 170,
             songStartSeconds: 5,
             songEndSeconds: 165,
-            mediaSourceID: "source-whole-song"
+            mediaSourceID: "source-whole-song",
+            localMediaMigrationKey: nil
         )
 
         let window = BabyPlayerTemporaryASRAudioPolicy.songWindow(for: media)
@@ -702,7 +797,8 @@ final class LyricsAndASRTests: XCTestCase {
             durationSeconds: 155,
             songStartSeconds: 0,
             songEndSeconds: 155,
-            mediaSourceID: "rain-source"
+            mediaSourceID: "rain-source",
+            localMediaMigrationKey: nil
         )
 
         let submitted = try await client.submitLocalAnalysis(
@@ -1392,6 +1488,168 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertNil(changedBundle.chineseTranslation)
     }
 
+    /// 从同一文件的 Jellyfin 条目切到 SMB 路径时，Apple TV 本地的 DeepSeek 双语字幕应一次性迁移。
+    func testBilingualAnalysisMigratesFromLegacyJellyfinIDToUniqueSMBFileName() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let repository = makeRepository(storage)
+        let legacyMedia = LyricsMediaDescriptor(
+            id: "jellyfin-item-52",
+            title: "52. After A While Crocodile",
+            searchTitle: "After A While Crocodile",
+            artistName: "Super Simple Songs",
+            sourceHint: "Super Simple Songs",
+            versionHint: nil,
+            durationSeconds: 183.2,
+            songStartSeconds: 4,
+            songEndSeconds: 180,
+            mediaSourceID: "jellyfin-media-source-52",
+            localMediaMigrationKey: nil
+        )
+        let englishCandidate = makeEnglishTranslationCandidate()
+        let initialBundle = try await repository.storeDeepSeekResult(
+            englishCandidate,
+            asrEvidenceHash: "legacy-jellyfin-evidence",
+            for: legacyMedia
+        )
+        let english = try XCTUnwrap(initialBundle.deepSeekResult)
+        _ = try await repository.storeChineseTranslation(
+            makeTranslation(for: english, mediaFingerprint: legacyMedia.asrFingerprint),
+            for: legacyMedia
+        )
+
+        let recoveredAliases = await repository.persistedContentAliases()
+        XCTAssertEqual(
+            recoveredAliases.first(where: { $0.sourceID == legacyMedia.id })?.contentID,
+            BabyPlayerLocalMediaMigrationKey.make(fileNameOrPath: legacyMedia.title)
+        )
+
+        let smbMedia = LyricsMediaDescriptor(
+            id: "smb:/sss73/52. After A While Crocodile.mp4",
+            title: "52. After A While Crocodile",
+            searchTitle: "After A While Crocodile",
+            artistName: nil,
+            sourceHint: "Super Simple Songs",
+            versionHint: nil,
+            durationSeconds: nil,
+            songStartSeconds: nil,
+            songEndSeconds: nil,
+            mediaSourceID: "smb:/sss73/52. After A While Crocodile.mp4",
+            localMediaMigrationKey: BabyPlayerLocalMediaMigrationKey.make(
+                fileNameOrPath: "52. After A While Crocodile.mp4"
+            )
+        )
+        let reloaded = makeRepository(storage)
+
+        let migrated = await reloaded.analysisBundle(for: smbMedia)
+        let preferred = await reloaded.preferredStoredLyrics(for: smbMedia)
+        let translation: StoredLyricsTranslationResult?
+        if let migratedEnglish = migrated?.deepSeekResult {
+            translation = await reloaded.matchingChineseTranslation(
+                for: migratedEnglish,
+                media: smbMedia
+            )
+        } else {
+            translation = nil
+        }
+
+        XCTAssertEqual(migrated?.deepSeekResult?.candidate.lines.map(\.text), english.candidate.lines.map(\.text))
+        XCTAssertEqual(migrated?.mediaID, smbMedia.sharedContentID)
+        XCTAssertEqual(migrated?.chineseTranslation?.mediaFingerprint, smbMedia.translationFingerprint)
+        XCTAssertEqual(translation?.lines.map(\.chineseText), ["一闪一闪亮晶晶", "我想知道你是什么"])
+        XCTAssertEqual(preferred?.candidateID, english.candidate.id)
+
+        let secondReload = makeRepository(storage)
+        let persistedMigration = await secondReload.analysisBundle(for: smbMedia)
+        XCTAssertNotNil(persistedMigration?.chineseTranslation)
+
+        let jellyfinAfterMigration = LyricsMediaDescriptor(
+            id: legacyMedia.id,
+            title: legacyMedia.title,
+            searchTitle: legacyMedia.searchTitle,
+            artistName: legacyMedia.artistName,
+            sourceHint: legacyMedia.sourceHint,
+            versionHint: legacyMedia.versionHint,
+            durationSeconds: legacyMedia.durationSeconds,
+            songStartSeconds: legacyMedia.songStartSeconds,
+            songEndSeconds: legacyMedia.songEndSeconds,
+            mediaSourceID: legacyMedia.mediaSourceID,
+            localMediaMigrationKey: smbMedia.localMediaMigrationKey
+        )
+        let roundTrip = await secondReload.analysisBundle(for: jellyfinAfterMigration)
+        XCTAssertEqual(roundTrip?.mediaID, smbMedia.sharedContentID)
+        XCTAssertEqual(
+            roundTrip?.chineseTranslation?.mediaFingerprint,
+            jellyfinAfterMigration.translationFingerprint
+        )
+
+        _ = try await secondReload.setSmartPlaybackEnabled(false, for: smbMedia)
+        let manualPlayback = await secondReload.playback(
+            for: englishCandidate,
+            media: smbMedia,
+            selectionOrigin: .manual
+        )
+        _ = try await secondReload.confirm(manualPlayback, for: smbMedia)
+
+        let jellyfinReload = makeRepository(storage)
+        let sharedConfiguration = await jellyfinReload.smartPlaybackConfigurations(
+            for: [jellyfinAfterMigration]
+        )
+        let sharedBinding = await jellyfinReload.binding(for: jellyfinAfterMigration)
+        XCTAssertFalse(try XCTUnwrap(sharedConfiguration[jellyfinAfterMigration.id]).isEnabled)
+        XCTAssertEqual(sharedBinding?.selectedLyricIdentifier, manualPlayback.lyricIdentifier)
+    }
+
+    /// 两个旧条目同名时不能猜测对应关系，避免把另一个视频的字幕迁到当前 SMB 文件。
+    func testLegacySubtitleMigrationRejectsAmbiguousDuplicateFileNames() async throws {
+        let storage = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let repository = makeRepository(storage)
+        for index in 1...2 {
+            let legacy = LyricsMediaDescriptor(
+                id: "jellyfin-duplicate-\(index)",
+                title: "Duplicate Song",
+                searchTitle: "Duplicate Song \(index)",
+                artistName: "Artist \(index)",
+                sourceHint: nil,
+                versionHint: nil,
+                durationSeconds: Double(100 + index),
+                songStartSeconds: nil,
+                songEndSeconds: nil,
+                mediaSourceID: "jellyfin-source-\(index)",
+                localMediaMigrationKey: nil
+            )
+            _ = try await repository.storeDeepSeekResult(
+                makeCandidate(id: -100 - index, title: "Duplicate \(index)", words: "line one line two"),
+                asrEvidenceHash: "evidence-\(index)",
+                for: legacy
+            )
+        }
+        let smbMedia = LyricsMediaDescriptor(
+            id: "smb:/sss73/Duplicate Song.mp4",
+            title: "Duplicate Song",
+            searchTitle: "Duplicate Song",
+            artistName: nil,
+            sourceHint: nil,
+            versionHint: nil,
+            durationSeconds: nil,
+            songStartSeconds: nil,
+            songEndSeconds: nil,
+            mediaSourceID: "smb:/sss73/Duplicate Song.mp4",
+            localMediaMigrationKey: BabyPlayerLocalMediaMigrationKey.make(
+                fileNameOrPath: "Duplicate Song.mp4"
+            )
+        )
+
+        let reloaded = makeRepository(storage)
+        let ambiguousMatch = await reloaded.analysisBundle(for: smbMedia)
+        XCTAssertNil(ambiguousMatch)
+        let ambiguousAliases = await reloaded.persistedContentAliases()
+        XCTAssertFalse(ambiguousAliases.contains { alias in
+            alias.sourceID.hasPrefix("jellyfin-duplicate-")
+        })
+    }
+
     /// 批量页只把真正可播放的双语结果计为完成；可信片头片尾为空不会造成重复 ASR。
     func testBatchAnalysisCompletionRequiresChineseForEnglishButNotSmartBoundary() async throws {
         let storage = try makeStorage()
@@ -1437,6 +1695,7 @@ final class LyricsAndASRTests: XCTestCase {
             mediaID: "old-media",
             mediaFingerprint: "old-fingerprint",
             mediaSourceID: nil,
+            localMediaMigrationKey: nil,
             mediaTitle: "Old Song",
             pinnedOrdinaryPlayback: nil,
             asrResult: nil,
@@ -2089,7 +2348,11 @@ final class LyricsAndASRTests: XCTestCase {
             providerName: "LRCLIB"
         )
 
-        let result = try await BabyPlayerLyricsReconcilerClient(session: session).reconcile(
+        let result = try await BabyPlayerLyricsReconcilerClient(
+            baseURL: URL(string: "http://127.0.0.1:8011/v1")!,
+            apiToken: "unit-test-token",
+            session: session
+        ).reconcile(
             songTitle: "Twinkle Twinkle",
             mediaFingerprint: "test-media-fingerprint",
             candidates: [input]
@@ -2133,7 +2396,11 @@ final class LyricsAndASRTests: XCTestCase {
         let session = URLSession(configuration: configuration)
         defer { session.finishTasksAndInvalidate() }
 
-        let result = try await BabyPlayerLyricsReconcilerClient(session: session).reconcile(
+        let result = try await BabyPlayerLyricsReconcilerClient(
+            baseURL: URL(string: "http://127.0.0.1:8011/v1")!,
+            apiToken: "unit-test-token",
+            session: session
+        ).reconcile(
             songTitle: "Baby Shark",
             mediaFingerprint: "baby-shark-media-fingerprint",
             candidates: []
@@ -2216,7 +2483,8 @@ final class LyricsAndASRTests: XCTestCase {
             durationSeconds: 360,
             songStartSeconds: 10,
             songEndSeconds: 330,
-            mediaSourceID: "source-long"
+            mediaSourceID: "source-long",
+            localMediaMigrationKey: nil
         )
 
         let segments = BabyPlayerASRSegmentPolicy.segments(for: media)
@@ -2271,7 +2539,8 @@ final class LyricsAndASRTests: XCTestCase {
             durationSeconds: 30,
             songStartSeconds: songStart,
             songEndSeconds: 25,
-            mediaSourceID: "source-1"
+            mediaSourceID: "source-1",
+            localMediaMigrationKey: nil
         )
     }
 

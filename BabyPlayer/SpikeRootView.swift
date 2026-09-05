@@ -67,7 +67,8 @@ struct SpikeRootView: View {
                 },
                 ratingFor: model.rating(for:),
                 onProgress: model.updatePlaybackResume,
-                onFinished: model.clearPlaybackResume
+                onFinished: model.clearPlaybackResume,
+                onSmartSkipEnabledChange: { model.smartSkipEnabled = $0 }
             )
                 .ignoresSafeArea()
         }
@@ -80,9 +81,13 @@ struct SpikeRootView: View {
                 },
                 ratingFor: model.rating(for:),
                 onProgress: model.updatePlaybackResume,
-                onFinished: model.clearPlaybackResume
+                onFinished: model.clearPlaybackResume,
+                onSmartSkipEnabledChange: { model.smartSkipEnabled = $0 }
             )
             .ignoresSafeArea()
+        }
+        .onReceive(smbModel.$mediaItems) { items in
+            model.registerSMBMediaItems(items)
         }
     }
 
@@ -396,10 +401,14 @@ private struct SMBChildrenHomeView: View {
             preferences.rating(for: sourceID(for: $0)) != .blocked
         }
         guard let resumeID = preferences.playbackResumeState?.itemID,
-              let current = items.first(where: { sourceID(for: $0) == resumeID }) else {
+              let current = items.first(where: {
+                  preferences.preferenceID(for: sourceID(for: $0)) == resumeID
+              }) else {
             return items
         }
-        return [current] + items.filter { sourceID(for: $0) != resumeID }
+        return [current] + items.filter {
+            preferences.preferenceID(for: sourceID(for: $0)) != resumeID
+        }
     }
 
     private var pages: [[SMBSpikeMediaItem]] {
@@ -506,7 +515,10 @@ private struct SMBChildrenHomeView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(spacing: 0) {
                     ForEach(Array(pages.enumerated()), id: \.offset) { _, page in
-                        SMBMediaGridPage(items: page) { item in
+                        SMBMediaGridPage(
+                            items: page,
+                            coverSource: model.coverSource(for:)
+                        ) { item in
                             guard let index = visibleItems.firstIndex(where: { $0.id == item.id }) else { return }
                             play(items: visibleItems, startIndex: index, behavior: .repeatOne)
                         }
@@ -544,6 +556,7 @@ private struct SMBChildrenHomeView: View {
     ) {
         guard !items.isEmpty else { return }
         let selectedID = sourceID(for: items[min(max(0, startIndex), items.count - 1)])
+        let selectedPreferenceID = preferences.preferenceID(for: selectedID)
         model.play(
             items,
             startIndex: startIndex,
@@ -552,8 +565,15 @@ private struct SMBChildrenHomeView: View {
             introSkipSeconds: preferences.introSkipSeconds,
             outroSkipSeconds: preferences.outroSkipSeconds,
             lyricsMode: preferences.lyricsMode,
+            smartSkipEnabled: preferences.smartSkipEnabled,
+            preferenceID: { item in
+                preferences.preferenceID(for: sourceID(for: item))
+            },
+            localMediaMigrationKey: { item in
+                preferences.contentMigrationKey(for: sourceID(for: item))
+            },
             startPositionSeconds: preferences.playbackResumeState.flatMap {
-                $0.itemID == selectedID ? $0.positionSeconds : nil
+                $0.itemID == selectedPreferenceID ? $0.positionSeconds : nil
             }
         )
     }
@@ -561,6 +581,7 @@ private struct SMBChildrenHomeView: View {
 
 private struct SMBMediaGridPage: View {
     let items: [SMBSpikeMediaItem]
+    let coverSource: (SMBSpikeMediaItem) -> BabyPlayerCoverSource
     let play: (SMBSpikeMediaItem) -> Void
 
     private let columns = Array(
@@ -574,7 +595,7 @@ private struct SMBMediaGridPage: View {
                 Button { play(item) } label: {
                     MediaCard(
                         title: item.displayName,
-                        coverSource: nil,
+                        coverSource: coverSource(item),
                         tint: BabyPlayerPalette.coral
                     )
                 }
@@ -626,6 +647,7 @@ private struct MediaCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             MediaCoverView(source: coverSource, tint: tint)
+            .id(coverSource?.viewIdentity ?? "no-cover")
             .frame(width: 400, height: 225)
             .clipShape(RoundedRectangle(cornerRadius: 18))
             .overlay(alignment: .bottomTrailing) {
@@ -661,11 +683,17 @@ private struct ParentSettingsView: View {
     @State private var confirmClear = false
     @State private var showsBatchAnalysis = false
     @State private var showsMediaSourceSelection = false
+    @State private var showsSMBConnectionEditor = false
 
     var body: some View {
         ZStack {
             OrchardBackground()
-            if showsMediaSourceSelection {
+            if showsSMBConnectionEditor {
+                SMBSpikeView {
+                    showsSMBConnectionEditor = false
+                    smbModel.connectAndScan()
+                }
+            } else if showsMediaSourceSelection {
                 ParentMediaSourceSelectionView(
                     jellyfinSummary: model.connectionSummary,
                     activeMediaSource: activeMediaSource,
@@ -689,7 +717,10 @@ private struct ParentSettingsView: View {
             }
         }
         .onExitCommand {
-            if showsMediaSourceSelection {
+            if showsSMBConnectionEditor {
+                showsSMBConnectionEditor = false
+                smbModel.connectAndScan()
+            } else if showsMediaSourceSelection {
                 showsMediaSourceSelection = false
             } else if showsBatchAnalysis {
                 showsBatchAnalysis = false
@@ -740,6 +771,16 @@ private struct ParentSettingsView: View {
                                 title: "媒体源",
                                 value: "Jennifer · Jellyfin · \(model.connectionSummary)"
                             )
+                        }
+                        if BabyPlayerFeatureFlags.isSMBDirectPlaybackSpikeEnabled {
+                            Button {
+                                showsSMBConnectionEditor = true
+                            } label: {
+                                SettingsActionRow(
+                                    title: "编辑 Samba 连接",
+                                    value: "服务器、共享、目录与账号"
+                                )
+                            }
                         }
                         Button {
                             if activeMediaSource == .samba {
@@ -814,15 +855,15 @@ private struct ParentSettingsView: View {
     /// 家长可查看并解除屏蔽；儿童首页不会渲染这组记录。
     @ViewBuilder
     private var blockedRatingsSection: some View {
-        if model.blockedMediaItems.isEmpty {
+        if model.blockedContentItems.isEmpty {
             SettingsInfoRow(title: "屏蔽的视频", value: "暂无")
         } else {
-            SettingsInfoRow(title: "屏蔽的视频", value: "\(model.blockedMediaItems.count) 个")
-            ForEach(model.blockedMediaItems) { item in
+            SettingsInfoRow(title: "屏蔽的视频", value: "\(model.blockedContentItems.count) 个")
+            ForEach(model.blockedContentItems) { item in
                 Button {
-                    model.unblock(item)
+                    model.unblock(contentID: item.id)
                 } label: {
-                    SettingsActionRow(title: item.name, value: "解除屏蔽")
+                    SettingsActionRow(title: item.title, value: "解除屏蔽")
                 }
             }
         }

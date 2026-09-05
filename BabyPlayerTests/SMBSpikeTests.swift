@@ -114,6 +114,79 @@ final class SMBSpikeTests: XCTestCase {
         )
     }
 
+    func testLibraryIndexRoundTripsWithoutPersistingPasswordAndRejectsAnotherSource() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BabyPlayer-SMBIndex-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var configuration = SMBSpikeConfiguration.homeGatewayDefaults
+        configuration.password = "must-not-be-written"
+        let items = [
+            SMBSpikeMediaItem(
+                path: "/sss73/52. After A While Crocodile.mp4",
+                name: "52. After A While Crocodile.mp4",
+                fileSize: 42_000,
+                modifiedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            )
+        ]
+
+        try SMBSpikeLibraryIndexStore.save(
+            items,
+            configuration: configuration,
+            cacheDirectory: root
+        )
+        XCTAssertEqual(
+            SMBSpikeLibraryIndexStore.load(
+                configuration: configuration,
+                cacheDirectory: root
+            ),
+            items
+        )
+        let rawIndex = try String(
+            contentsOf: root
+                .appendingPathComponent("BabyPlayer", isDirectory: true)
+                .appendingPathComponent("SMBMediaIndex-v1.json"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(rawIndex.contains(configuration.password))
+
+        var otherSource = configuration
+        otherSource.rootPath = "/another-folder"
+        XCTAssertNil(SMBSpikeLibraryIndexStore.load(
+            configuration: otherSource,
+            cacheDirectory: root
+        ))
+    }
+
+    func testLibraryIndexRejectsCorruptAndUnsafeItems() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BabyPlayer-SMBIndexInvalid-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = SMBSpikeConfiguration.homeGatewayDefaults
+        let unsafeItems = [
+            SMBSpikeMediaItem(
+                path: "/sss73/../secret.mp4",
+                name: "secret.mp4",
+                fileSize: 10,
+                modifiedAt: nil
+            )
+        ]
+        XCTAssertThrowsError(try SMBSpikeLibraryIndexStore.save(
+            unsafeItems,
+            configuration: configuration,
+            cacheDirectory: root
+        ))
+
+        let folder = root.appendingPathComponent("BabyPlayer", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("not-json".utf8).write(
+            to: folder.appendingPathComponent("SMBMediaIndex-v1.json")
+        )
+        XCTAssertNil(SMBSpikeLibraryIndexStore.load(
+            configuration: configuration,
+            cacheDirectory: root
+        ))
+    }
+
     func testLiveHomeGatewayListsOnlyRealVideosAndReadsRanges() async throws {
         guard let password = UserDefaults.standard.string(
             forKey: Self.livePasswordDefaultsKey

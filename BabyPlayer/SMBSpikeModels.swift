@@ -6,6 +6,7 @@
 // 这些类型与现有 Jellyfin 主链隔离，Spike 通过后再提升为正式媒体源模型。
 //
 
+import CryptoKit
 import Foundation
 
 enum BabyPlayerFeatureFlags {
@@ -75,11 +76,11 @@ struct SMBSpikeConfiguration: Equatable, Sendable {
         share: "usb-0781-060116_1",
         rootPath: "/sss73",
         username: "admin",
-        password: "wgw125213"
+        password: ""
     )
 }
 
-struct SMBSpikeMediaItem: Identifiable, Equatable, Sendable {
+struct SMBSpikeMediaItem: Codable, Identifiable, Equatable, Sendable {
     let path: String
     let name: String
     let fileSize: Int64
@@ -97,6 +98,97 @@ struct SMBSpikeFileStat: Equatable, Sendable {
     let path: String
     let fileSize: Int64
     let modifiedAt: Date?
+}
+
+private struct SMBSpikeLibrarySnapshot: Codable {
+    let schemaVersion: Int
+    let sourceIdentity: String
+    let savedAt: Date
+    let items: [SMBSpikeMediaItem]
+}
+
+/// 可重建的 SMB 首页索引。密码从不进入缓存，来源不一致或内容损坏时直接忽略并重扫。
+enum SMBSpikeLibraryIndexStore {
+    private static let schemaVersion = 1
+
+    static func load(
+        configuration: SMBSpikeConfiguration,
+        cacheDirectory: URL? = nil,
+        fileManager: FileManager = .default
+    ) -> [SMBSpikeMediaItem]? {
+        let url = indexURL(cacheDirectory: cacheDirectory, fileManager: fileManager)
+        guard let data = try? Data(contentsOf: url),
+              let snapshot = try? JSONDecoder().decode(SMBSpikeLibrarySnapshot.self, from: data),
+              snapshot.schemaVersion == schemaVersion,
+              snapshot.sourceIdentity == sourceIdentity(for: configuration),
+              !snapshot.items.isEmpty,
+              snapshot.items.allSatisfy(isValidCachedItem) else { return nil }
+        return snapshot.items
+    }
+
+    static func save(
+        _ items: [SMBSpikeMediaItem],
+        configuration: SMBSpikeConfiguration,
+        cacheDirectory: URL? = nil,
+        fileManager: FileManager = .default
+    ) throws {
+        guard !items.isEmpty, items.allSatisfy(isValidCachedItem) else {
+            throw SMBSpikeError.noSupportedMedia
+        }
+        let snapshot = SMBSpikeLibrarySnapshot(
+            schemaVersion: schemaVersion,
+            sourceIdentity: sourceIdentity(for: configuration),
+            savedAt: Date(),
+            items: items
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(snapshot)
+        // 写入前回读编码结果，避免把不可解码的索引提交到首页缓存。
+        _ = try JSONDecoder().decode(SMBSpikeLibrarySnapshot.self, from: data)
+        let url = indexURL(cacheDirectory: cacheDirectory, fileManager: fileManager)
+        try fileManager.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: url, options: .atomic)
+    }
+
+    private static func indexURL(
+        cacheDirectory: URL?,
+        fileManager: FileManager
+    ) -> URL {
+        let base = cacheDirectory
+            ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        return base
+            .appendingPathComponent("BabyPlayer", isDirectory: true)
+            .appendingPathComponent("SMBMediaIndex-v1.json")
+    }
+
+    private static func sourceIdentity(for configuration: SMBSpikeConfiguration) -> String {
+        let normalizedRoot = (try? SMBSpikePath.normalize(configuration.rootPath))
+            ?? configuration.rootPath
+        let raw = [
+            "BabyPlayer.SMBSource.v1",
+            configuration.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            String(configuration.port),
+            configuration.share.trimmingCharacters(in: .whitespacesAndNewlines),
+            normalizedRoot,
+            configuration.username.trimmingCharacters(in: .whitespacesAndNewlines)
+        ].joined(separator: "\0")
+        return SHA256.hash(data: Data(raw.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func isValidCachedItem(_ item: SMBSpikeMediaItem) -> Bool {
+        guard item.fileSize > 0,
+              SMBSpikePath.isSupportedVideo(name: item.name),
+              !SMBSpikePath.shouldIgnore(name: item.name, isDirectory: false),
+              let normalized = try? SMBSpikePath.normalize(item.path),
+              normalized == item.path else { return false }
+        return true
+    }
 }
 
 struct SMBSpikeByteRangePlan: Equatable, Sendable {

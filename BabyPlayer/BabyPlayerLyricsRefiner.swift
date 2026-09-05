@@ -452,6 +452,12 @@ struct BabyPlayerLyricsReconcilerClient {
         self.session = session
     }
 
+    /// 允许隔离测试显式注入服务端点；正式 App 仍只通过 `load()` 读取用户配置。
+    init(baseURL: URL, apiToken: String, session: URLSession) {
+        configuration = LyricsRefinerConfiguration(baseURL: baseURL, apiToken: apiToken)
+        self.session = session
+    }
+
     func reconcile(
         songTitle: String,
         mediaFingerprint: String,

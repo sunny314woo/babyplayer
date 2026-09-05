@@ -92,11 +92,22 @@ final class SMBHomeViewModel: ObservableObject {
     @Published private(set) var isWorking = false
     @Published var activePlayback: SpikePlaybackSelection?
 
-    private var client: SMBSpikeClient?
+    private var libraryClient: SMBSpikeClient?
+    private var playbackClient: SMBSpikeClient?
     private var operationTask: Task<Void, Never>?
+    private var coverPrewarmTask: Task<Void, Never>?
+    private var playbackPreparationTask: Task<Void, Never>?
+
+    init() {
+        let configuration = SMBSpikeConfigurationStore.load()
+        if let cachedItems = SMBSpikeLibraryIndexStore.load(configuration: configuration) {
+            mediaItems = cachedItems
+            statusText = "已显示 \(cachedItems.count) 个缓存视频，正在连接 Samba 刷新…"
+        }
+    }
 
     func connectIfNeeded() {
-        guard client == nil || mediaItems.isEmpty else { return }
+        guard libraryClient == nil || mediaItems.isEmpty else { return }
         connectAndScan()
     }
 
@@ -106,24 +117,33 @@ final class SMBHomeViewModel: ObservableObject {
             do {
                 let configuration = SMBSpikeConfigurationStore.load()
                 self.statusText = "正在连接光猫 U 盘…"
-                let client = try SMBSpikeClient(configuration: configuration)
-                try await client.connect()
+                let libraryClient = try SMBSpikeClient(configuration: configuration)
+                try await libraryClient.connect()
                 self.statusText = "已连接，正在读取媒体目录…"
-                let items = try await client.listMedia()
+                let items = try await libraryClient.listMedia()
                 try Task.checkCancellation()
                 try SMBSpikeConfigurationStore.save(configuration)
-                let previousClient = self.client
-                self.client = client
+                try SMBSpikeLibraryIndexStore.save(items, configuration: configuration)
+                let playbackClient = try SMBSpikeClient(configuration: configuration)
+                let previousLibraryClient = self.libraryClient
+                let previousPlaybackClient = self.playbackClient
+                self.libraryClient = libraryClient
+                self.playbackClient = playbackClient
                 self.mediaItems = items
                 self.statusText = "光猫 U 盘 · Samba · \(items.count) 个视频"
+                self.prewarmCovers(for: items, client: libraryClient)
                 #if DEBUG
                 print("BABYPLAYER_SMB_HOME_RESULT ready count=\(items.count)")
                 #endif
-                await previousClient?.disconnect()
+                await previousLibraryClient?.disconnect()
+                await previousPlaybackClient?.disconnect()
             } catch is CancellationError {
                 return
             } catch {
-                self.statusText = Self.readableMessage(for: error)
+                let failure = Self.readableMessage(for: error)
+                self.statusText = self.mediaItems.isEmpty
+                    ? failure
+                    : "当前显示 \(self.mediaItems.count) 个缓存视频 · \(failure)"
             }
         }
     }
@@ -136,22 +156,24 @@ final class SMBHomeViewModel: ObservableObject {
         introSkipSeconds: Int,
         outroSkipSeconds: Int,
         lyricsMode: BabyPlayerLyricsMode,
+        smartSkipEnabled: Bool,
+        preferenceID: (SMBSpikeMediaItem) -> String,
+        localMediaMigrationKey: (SMBSpikeMediaItem) -> String?,
         startPositionSeconds: Double?
     ) {
-        guard let client, !items.isEmpty else {
+        guard let playbackClient, !items.isEmpty else {
             statusText = "媒体库尚未连接，请重试。"
             return
         }
-
-        let queue = items.map { item -> BabyPlayerQueueItem in
+        coverPrewarmTask?.cancel()
+        playbackPreparationTask?.cancel()
+        let prepared = items.map { item in
             let titleMetadata = LyricsTitleMetadata.parse(item.displayName)
             let identity = "smb:\(item.path)"
-            let placeholderURL = URL(string: "babyplayer-smb://media/\(identity.hashValue.magnitude)")!
-            return BabyPlayerQueueItem(
-                id: identity,
-                title: item.displayName,
-                url: placeholderURL,
-                smbPlaybackResource: SMBPlaybackResource(client: client, item: item),
+            return (
+                item: item,
+                identity: identity,
+                preferenceID: preferenceID(item),
                 lyricsMedia: LyricsMediaDescriptor(
                     id: identity,
                     title: item.displayName,
@@ -162,54 +184,134 @@ final class SMBHomeViewModel: ObservableObject {
                     durationSeconds: nil,
                     songStartSeconds: introSkipSeconds > 0 ? Double(introSkipSeconds) : nil,
                     songEndSeconds: nil,
-                    mediaSourceID: identity
-                ),
-                localMediaPath: nil,
-                chapterIntroEndSeconds: nil,
-                chapterOutroStartSeconds: nil,
-                smartIntroEndSeconds: nil,
-                smartOutroStartSeconds: nil,
-                smartSkipEnabled: true
+                    mediaSourceID: identity,
+                    localMediaMigrationKey: localMediaMigrationKey(item)
+                )
             )
         }
-        let boundedStartIndex = min(max(0, startIndex), queue.count - 1)
-        let repeatMode: BabyPlayerRepeatMode
-        switch behavior {
-        case .repeatOne:
-            repeatMode = .repeatOne
-        case .repeatAll:
-            repeatMode = .repeatAll
-        case .sequential, .shuffle:
-            repeatMode = .stopAtEnd
+        playbackPreparationTask = Task { [weak self] in
+            let configurations = await BabyLyricsRepository.shared.smartPlaybackConfigurations(
+                for: prepared.map(\.lyricsMedia)
+            )
+            guard let self, !Task.isCancelled else { return }
+            let queue = prepared.map { prepared -> BabyPlayerQueueItem in
+                let stored = configurations[prepared.identity]
+                let boundary = BabyPlayerSmartSkipBoundaryPolicy.validatedStoredBoundary(
+                    stored?.boundary,
+                    expectedMediaDuration: nil
+                )
+                let placeholderURL = URL(
+                    string: "babyplayer-smb://media/\(prepared.identity.hashValue.magnitude)"
+                )!
+                return BabyPlayerQueueItem(
+                    id: prepared.identity,
+                    preferenceID: prepared.preferenceID,
+                    title: prepared.item.displayName,
+                    url: placeholderURL,
+                    smbPlaybackResource: SMBPlaybackResource(
+                        client: playbackClient,
+                        item: prepared.item
+                    ),
+                    lyricsMedia: prepared.lyricsMedia,
+                    localMediaPath: nil,
+                    chapterIntroEndSeconds: nil,
+                    chapterOutroStartSeconds: nil,
+                    smartIntroEndSeconds: boundary?.introEndSeconds,
+                    smartOutroStartSeconds: boundary?.outroStartSeconds
+                )
+            }
+            let boundedStartIndex = min(max(0, startIndex), queue.count - 1)
+            let repeatMode: BabyPlayerRepeatMode
+            switch behavior {
+            case .repeatOne:
+                repeatMode = .repeatOne
+            case .repeatAll:
+                repeatMode = .repeatAll
+            case .sequential, .shuffle:
+                repeatMode = .stopAtEnd
+            }
+            self.activePlayback = SpikePlaybackSelection(
+                items: queue,
+                startIndex: boundedStartIndex,
+                repeatMode: repeatMode,
+                repeatCount: behavior == .repeatOne ? 0 : 1,
+                initialBehavior: behavior,
+                sessionDuration: playbackTimerMinutes == 0
+                    ? nil
+                    : TimeInterval(playbackTimerMinutes * 60),
+                introSkipSeconds: Double(introSkipSeconds),
+                outroSkipSeconds: Double(outroSkipSeconds),
+                lyricsMode: lyricsMode,
+                smartSkipEnabled: smartSkipEnabled,
+                startPositionSeconds: startPositionSeconds
+            )
+            self.playbackPreparationTask = nil
         }
-        activePlayback = SpikePlaybackSelection(
-            items: queue,
-            startIndex: boundedStartIndex,
-            repeatMode: repeatMode,
-            repeatCount: behavior == .repeatOne ? 0 : 1,
-            initialBehavior: behavior,
-            sessionDuration: playbackTimerMinutes == 0
-                ? nil
-                : TimeInterval(playbackTimerMinutes * 60),
-            introSkipSeconds: Double(introSkipSeconds),
-            outroSkipSeconds: Double(outroSkipSeconds),
-            lyricsMode: lyricsMode,
-            startPositionSeconds: startPositionSeconds
-        )
     }
 
     func endPlayback() {
+        playbackPreparationTask?.cancel()
+        playbackPreparationTask = nil
         activePlayback = nil
+        if let libraryClient {
+            prewarmCovers(for: mediaItems, client: libraryClient)
+        }
+    }
+
+    func coverSource(for item: SMBSpikeMediaItem) -> BabyPlayerCoverSource {
+        return BabyPlayerCoverSource(
+            providerImageURL: nil,
+            videoURL: nil,
+            smbPlaybackResource: libraryClient.map { SMBPlaybackResource(client: $0, item: item) },
+            duration: nil,
+            cacheKey: Self.coverCacheKey(for: item)
+        )
     }
 
     private func replaceOperation(_ operation: @escaping @MainActor () async -> Void) {
         operationTask?.cancel()
+        coverPrewarmTask?.cancel()
         isWorking = true
         operationTask = Task { [weak self] in
             await operation()
             guard !Task.isCancelled else { return }
             self?.isWorking = false
         }
+    }
+
+    private func prewarmCovers(for items: [SMBSpikeMediaItem], client: SMBSpikeClient) {
+        coverPrewarmTask?.cancel()
+        let sources = items.map { item in
+            return BabyPlayerCoverSource(
+                providerImageURL: nil,
+                videoURL: nil,
+                smbPlaybackResource: SMBPlaybackResource(client: client, item: item),
+                duration: nil,
+                cacheKey: Self.coverCacheKey(for: item)
+            )
+        }
+        coverPrewarmTask = Task.detached(priority: .utility) {
+            var readyCount = 0
+            for source in sources {
+                guard !Task.isCancelled else { return }
+                if await BabyPlayerCoverGenerator.generate(for: source) != nil {
+                    readyCount += 1
+                    #if DEBUG
+                    if readyCount == 1 {
+                        print("BABYPLAYER_SMB_COVER_RESULT first_ready=true")
+                    }
+                    #endif
+                }
+            }
+            #if DEBUG
+            print("BABYPLAYER_SMB_COVER_RESULT ready=\(readyCount) total=\(sources.count)")
+            #endif
+        }
+    }
+
+    private static func coverCacheKey(for item: SMBSpikeMediaItem) -> String {
+        let modifiedStamp = item.modifiedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown"
+        return "smb:v1:\(item.path)|\(item.fileSize)|\(modifiedStamp)"
     }
 
     private static func readableMessage(for error: Error) -> String {

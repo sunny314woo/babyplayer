@@ -11,7 +11,7 @@ import Foundation
 import UniformTypeIdentifiers
 
 /// 播放队列中的轻量 Samba 引用；只在该曲目真正开始播放时创建 loader/AVAsset。
-final class SMBPlaybackResource {
+final class SMBPlaybackResource: @unchecked Sendable {
     private let client: SMBSpikeClient
     private let item: SMBSpikeMediaItem
 
