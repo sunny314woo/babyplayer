@@ -14,6 +14,11 @@ struct BabyPlayerApp: App {
         WindowGroup {
             // 【MODIFIED】技术 Spike 暂时直接进入链路验证页；完整 V1 UI 在 Spike 通过后实现。
             SpikeRootView()
+                .task {
+                    #if DEBUG
+                    await SMBSpikeLaunchProbe.runIfRequested()
+                    #endif
+                }
         }
     }
 }

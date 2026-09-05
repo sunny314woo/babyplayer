@@ -353,6 +353,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var sessionEndsAt: Date?
     private var timerDurationMinutes: Int?
     private var currentPlaybackRate = BabyPlayerPlaybackRatePolicy.defaultRate
+    private var activePreparedSMBAsset: SMBSpikePreparedAsset?
     private var endObserver: NSObjectProtocol?
     private var analysisWorkflowObserver: NSObjectProtocol?
     private var timeObserver: Any?
@@ -485,6 +486,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
         analysisWorkflowObserver = nil
         player?.replaceCurrentItem(with: nil)
+        activePreparedSMBAsset = nil
         player = nil
     }
 
@@ -583,7 +585,15 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         outroFadeTask = nil
         player?.volume = 1
         isAdvancing = false
-        let playerItem = AVPlayerItem(url: queueItem.url)
+        let playerItem: AVPlayerItem
+        if let smbPlaybackResource = queueItem.smbPlaybackResource {
+            let preparedAsset = smbPlaybackResource.makePreparedAsset()
+            activePreparedSMBAsset = preparedAsset
+            playerItem = AVPlayerItem(asset: preparedAsset.asset)
+        } else {
+            activePreparedSMBAsset = nil
+            playerItem = AVPlayerItem(url: queueItem.url)
+        }
         playerItem.externalMetadata = [titleMetadataItem(queueItem.title)]
         player?.replaceCurrentItem(with: playerItem)
         prepareLyrics(for: queueItem, mode: currentLyricsMode)

@@ -14,3 +14,4 @@ BabyPlayerASRServer/.cache/
 
 # Local-only tvOS build secret. The committed example contains placeholders only.
 Config/BabyPlayerSecrets.xcconfig
+Config/BabyPlayerSMBSecrets.xcconfig

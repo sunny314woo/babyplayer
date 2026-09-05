@@ -255,7 +255,10 @@ enum BabyPlayerLyricsDefaultPolicy {
 struct BabyPlayerQueueItem: Identifiable {
     let id: String
     let title: String
+    /// HTTP/Jellyfin 播放地址；SMB 项使用自定义 scheme 作内存标识。
     let url: URL
+    /// Samba 的延迟播放引用；Jellyfin 为 nil。
+    let smbPlaybackResource: SMBPlaybackResource?
     let lyricsMedia: LyricsMediaDescriptor
     /// 【MODIFIED】仅作为 Mac 开发服务的本机文件定位，不写日志、不用于 Apple TV 直接读取。
     let localMediaPath: String?
@@ -1344,6 +1347,7 @@ final class SpikeViewModel: ObservableObject {
                 id: prepared.item.id,
                 title: prepared.item.name,
                 url: prepared.url,
+                smbPlaybackResource: nil,
                 lyricsMedia: prepared.lyricsMedia,
                 localMediaPath: prepared.item.path,
                 chapterIntroEndSeconds: prepared.chapterIntro,

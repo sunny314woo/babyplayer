@@ -28,7 +28,7 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>BabyPlayer 需要连接家庭局域网中的 Jellyfin 和 Mac 本地 AI 服务来播放视频及生成字幕。</string>
+	<string>BabyPlayer 需要连接家庭路由器上的 U 盘、Jellyfin 和可选的 Mac 字幕服务。</string>
 	<!-- The real Bearer token is supplied only by the Git-ignored local xcconfig. -->
 	<key>BabyPlayerASRAPIToken</key>
 	<string>$(BABYPLAYER_ASR_API_TOKEN)</string>
