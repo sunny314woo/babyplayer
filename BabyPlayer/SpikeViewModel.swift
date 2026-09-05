@@ -49,6 +49,71 @@ enum BabyPlayerRating: String, CaseIterable, Identifiable {
     }
 }
 
+/// 媒体源只负责定位文件；BabyPlayer 的评分、屏蔽、续播和字幕使用这个来源无关身份。
+/// 目前以规范化文件名建立兼容身份；同一目录出现重名时退回来源 ID，避免错误串数据。
+struct BabyPlayerContentIdentityInput: Equatable, Sendable {
+    let sourceID: String
+    let displayName: String
+    let fileNameOrPath: String
+}
+
+enum BabyPlayerContentIdentityResolver {
+    static func mappings(
+        for inputs: [BabyPlayerContentIdentityInput]
+    ) -> [String: String] {
+        let candidates = inputs.map { input in
+            (input, BabyPlayerLocalMediaMigrationKey.make(fileNameOrPath: input.fileNameOrPath))
+        }
+        let counts = Dictionary(grouping: candidates.compactMap(\.1), by: { $0 })
+            .mapValues(\.count)
+        return Dictionary(uniqueKeysWithValues: candidates.map { input, candidate in
+            let resolved = candidate.flatMap { counts[$0] == 1 ? $0 : nil }
+            return (input.sourceID, resolved ?? input.sourceID)
+        })
+    }
+
+    /// 把来源 ID 下的旧评分归并到内容 ID；屏蔽优先，喜欢/不喜欢冲突时不猜测。
+    static func migratedRatings(
+        _ ratings: [String: BabyPlayerRating],
+        aliases: [String: String]
+    ) -> [String: BabyPlayerRating] {
+        var grouped: [String: [BabyPlayerRating]] = [:]
+        for (storedID, rating) in ratings {
+            grouped[aliases[storedID] ?? storedID, default: []].append(rating)
+        }
+        return grouped.reduce(into: [:]) { result, entry in
+            let values = entry.value
+            if values.contains(.blocked) {
+                result[entry.key] = .blocked
+            } else if Set(values) == [.liked] {
+                result[entry.key] = .liked
+            } else if Set(values) == [.disliked] {
+                result[entry.key] = .disliked
+            }
+        }
+    }
+
+    static func migratedResumeState(
+        _ state: BabyPlayerPlaybackResumeState?,
+        aliases: [String: String]
+    ) -> BabyPlayerPlaybackResumeState? {
+        guard let state, let contentID = aliases[state.itemID], contentID != state.itemID else {
+            return state
+        }
+        return BabyPlayerPlaybackResumeState(
+            itemID: contentID,
+            positionSeconds: state.positionSeconds,
+            durationSeconds: state.durationSeconds,
+            updatedAt: state.updatedAt
+        )
+    }
+}
+
+struct BabyPlayerBlockedContentItem: Identifiable, Equatable {
+    let id: String
+    let title: String
+}
+
 /// 批量 AI 只跳过家长明确屏蔽的项目；“不喜欢”仍是可见内容偏好，不等同于拉黑。
 enum BabyPlayerBatchEligibilityPolicy {
     static func shouldInclude(rating: BabyPlayerRating) -> Bool {
@@ -72,7 +137,7 @@ enum BabyPlayerLyricsMode: String, CaseIterable, Identifiable {
 }
 
 enum BabyPlayerSmartSkipPreferencePolicy {
-    /// 每首歌曲默认开启；一旦用户在播放页保存选择，始终尊重该歌曲的选择。
+    /// Apple TV 本机的全局播放偏好默认开启；与媒体来源及当前歌曲无关。
     static func resolvedValue(storedValue: Bool?) -> Bool {
         storedValue ?? true
     }
@@ -247,15 +312,20 @@ enum BabyPlayerLyricsDefaultPolicy {
         hasAppliedEnabledByDefaultMigration: Bool
     ) -> BabyPlayerLyricsMode {
         if !hasAppliedEnabledByDefaultMigration { return .english }
-        return storedMode == .off ? .off : .english
+        return storedMode ?? .english
     }
 }
 
 /// 一条播放队列项；URL 可能包含授权信息，因此只保存在内存中。
 struct BabyPlayerQueueItem: Identifiable {
     let id: String
+    /// 评分、屏蔽和续播使用的跨来源身份；播放队列仍用 `id` 区分具体来源条目。
+    let preferenceID: String
     let title: String
+    /// HTTP/Jellyfin 播放地址；SMB 项使用自定义 scheme 作内存标识。
     let url: URL
+    /// Samba 的延迟播放引用；Jellyfin 为 nil。
+    let smbPlaybackResource: SMBPlaybackResource?
     let lyricsMedia: LyricsMediaDescriptor
     /// 【MODIFIED】仅作为 Mac 开发服务的本机文件定位，不写日志、不用于 Apple TV 直接读取。
     let localMediaPath: String?
@@ -263,7 +333,6 @@ struct BabyPlayerQueueItem: Identifiable {
     let chapterOutroStartSeconds: Double?
     var smartIntroEndSeconds: Double?
     var smartOutroStartSeconds: Double?
-    var smartSkipEnabled: Bool
 }
 
 /// 交给系统播放器的完整会话设置。
@@ -278,6 +347,8 @@ struct SpikePlaybackSelection: Identifiable {
     let introSkipSeconds: Double
     let outroSkipSeconds: Double
     let lyricsMode: BabyPlayerLyricsMode
+    /// 是否采用 AI 分析出的智能边界；这是 Apple TV 本机、跨媒体源的全局偏好。
+    let smartSkipEnabled: Bool
     /// 只用于会话首曲；自动切到后续曲目时始终从歌曲起点播放。
     let startPositionSeconds: Double?
 }
@@ -450,11 +521,14 @@ final class SpikeViewModel: ObservableObject {
     @Published private(set) var onboardingStep: BabyPlayerOnboardingStep = .welcome
     @Published private(set) var statusText = ""
     @Published private(set) var quickConnectCode: String?
-    @Published private(set) var mediaItems: [JellyfinMediaItem] = []
+    @Published private(set) var mediaItems: [JellyfinMediaItem] = [] {
+        didSet { registerJellyfinMediaItems(mediaItems) }
+    }
     @Published private(set) var isWorking = false
     @Published var activePlayback: SpikePlaybackSelection?
     @Published private(set) var playbackResumeState: BabyPlayerPlaybackResumeState?
     @Published private(set) var ratings: [String: BabyPlayerRating] = [:]
+    @Published private(set) var contentIdentityRevision = 0
     @Published var playbackTimerMinutes = 0 {
         didSet { UserDefaults.standard.set(playbackTimerMinutes, forKey: Self.playbackTimerKey) }
     }
@@ -466,6 +540,9 @@ final class SpikeViewModel: ObservableObject {
     }
     @Published var lyricsMode: BabyPlayerLyricsMode = .english {
         didSet { UserDefaults.standard.set(lyricsMode.rawValue, forKey: Self.lyricsModeKey) }
+    }
+    @Published var smartSkipEnabled = true {
+        didSet { UserDefaults.standard.set(smartSkipEnabled, forKey: Self.smartSkipEnabledKey) }
     }
     @Published private(set) var batchAnalysisItems: [BabyPlayerBatchAnalysisItem] = []
     @Published private(set) var batchAnalysisUsage: BabyPlayerASRUsage?
@@ -479,14 +556,19 @@ final class SpikeViewModel: ObservableObject {
     private var coverPrewarmTask: Task<Void, Never>?
     private var playbackPreparationTask: Task<Void, Never>?
     private var batchAnalysisTask: Task<Void, Never>?
+    private var contentAliases: [String: String] = [:]
+    private var contentTitles: [String: String] = [:]
 
     private static let playbackTimerKey = "BabyPlayer.PlaybackTimerMinutes"
     private static let introSkipKey = "BabyPlayer.IntroSkipSeconds"
     private static let outroSkipKey = "BabyPlayer.OutroSkipSeconds"
     private static let lyricsModeKey = "BabyPlayer.LyricsMode"
     private static let lyricsEnabledByDefaultMigrationKey = "BabyPlayer.LyricsEnabledByDefaultV1"
+    private static let smartSkipEnabledKey = "BabyPlayer.SmartSkipEnabledV1"
     private static let ratingsKey = "BabyPlayer.MediaRatings"
     private static let playbackResumeKey = "BabyPlayer.PlaybackResumeV1"
+    private static let contentAliasesKey = "BabyPlayer.ContentAliasesV1"
+    private static let contentTitlesKey = "BabyPlayer.ContentTitlesV1"
 
     var completedBatchAnalysisItems: [BabyPlayerBatchAnalysisItem] {
         batchAnalysisItems.filter { $0.state.isCompleted }
@@ -530,6 +612,18 @@ final class SpikeViewModel: ObservableObject {
             defaults.set(lyricsMode.rawValue, forKey: Self.lyricsModeKey)
             defaults.set(true, forKey: Self.lyricsEnabledByDefaultMigrationKey)
         }
+        let storedSmartSkipEnabled = defaults.object(forKey: Self.smartSkipEnabledKey).map { _ in
+            defaults.bool(forKey: Self.smartSkipEnabledKey)
+        }
+        smartSkipEnabled = BabyPlayerSmartSkipPreferencePolicy.resolvedValue(
+            storedValue: storedSmartSkipEnabled
+        )
+        if storedSmartSkipEnabled == nil {
+            defaults.set(smartSkipEnabled, forKey: Self.smartSkipEnabledKey)
+        }
+        #if DEBUG
+        print("BABYPLAYER_SMART_SKIP_SETTING enabled=\(smartSkipEnabled)")
+        #endif
         if let storedRatings = defaults.dictionary(forKey: Self.ratingsKey) as? [String: String] {
             ratings = storedRatings.reduce(into: [:]) { result, entry in
                 if let rating = BabyPlayerRating(rawValue: entry.value), rating != .unrated {
@@ -542,6 +636,13 @@ final class SpikeViewModel: ObservableObject {
                 BabyPlayerPlaybackResumeState.self,
                 from: data
             )
+        }
+        contentAliases = defaults.dictionary(forKey: Self.contentAliasesKey) as? [String: String] ?? [:]
+        contentTitles = defaults.dictionary(forKey: Self.contentTitlesKey) as? [String: String] ?? [:]
+        applyContentIdentityMigration()
+        Task { [weak self] in
+            let persistedAliases = await BabyLyricsRepository.shared.persistedContentAliases()
+            self?.registerPersistedContentAliases(persistedAliases)
         }
 
         guard let credentials = JellyfinCredentialStore.load() else { return }
@@ -559,15 +660,22 @@ final class SpikeViewModel: ObservableObject {
     var filteredMediaItems: [JellyfinMediaItem] {
         let visible = mediaItems.filter { rating(for: $0.id) != .blocked }
         guard let resumeID = playbackResumeState?.itemID,
-              let current = visible.first(where: { $0.id == resumeID }) else {
+              let current = visible.first(where: { preferenceID(for: $0.id) == resumeID }) else {
             return visible
         }
-        return [current] + visible.filter { $0.id != resumeID }
+        return [current] + visible.filter { preferenceID(for: $0.id) != resumeID }
     }
 
-    /// 当前媒体库中被家长屏蔽的项目；只在家长设置中展示。
-    var blockedMediaItems: [JellyfinMediaItem] {
-        mediaItems.filter { rating(for: $0.id) == .blocked }
+    /// 屏蔽清单按内容身份保存；当前媒体源离线时也能显示和解除。
+    var blockedContentItems: [BabyPlayerBlockedContentItem] {
+        ratings.compactMap { contentID, rating in
+            guard rating == .blocked else { return nil }
+            return BabyPlayerBlockedContentItem(
+                id: contentID,
+                title: contentTitles[contentID] ?? "已屏蔽视频"
+            )
+        }
+        .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
     }
 
     var connectionSummary: String {
@@ -766,6 +874,7 @@ final class SpikeViewModel: ObservableObject {
         return BabyPlayerCoverSource(
             providerImageURL: client.primaryImageURL(for: item, accessToken: accessToken),
             videoURL: videoURL,
+            smbPlaybackResource: nil,
             duration: duration,
             cacheKey: "jellyfin:\(item.id)"
         )
@@ -808,22 +917,146 @@ final class SpikeViewModel: ObservableObject {
 
     /// 返回视频当前的本地偏好；没有记录时返回未评分。
     func rating(for itemID: String) -> BabyPlayerRating {
-        ratings[itemID] ?? .unrated
+        ratings[preferenceID(for: itemID)] ?? .unrated
     }
 
     /// 【MODIFIED】保存本地偏好；不触碰 Jellyfin、U 盘或 NAS 中的原始视频。
     func setRating(_ rating: BabyPlayerRating, for itemID: String) {
+        let itemID = preferenceID(for: itemID)
         if rating == .unrated {
             ratings.removeValue(forKey: itemID)
         } else {
             ratings[itemID] = rating
         }
-        UserDefaults.standard.set(ratings.mapValues(\.rawValue), forKey: Self.ratingsKey)
+        persistRatings()
     }
 
     /// 家长从设置页解除屏蔽；解除后项目回到未评分状态，不自动提升排序。
-    func unblock(_ item: JellyfinMediaItem) {
-        setRating(.unrated, for: item.id)
+    func unblock(contentID: String) {
+        setRating(.unrated, for: contentID)
+    }
+
+    func preferenceID(for sourceID: String) -> String {
+        contentAliases[sourceID] ?? sourceID
+    }
+
+    func contentMigrationKey(for sourceID: String) -> String? {
+        let resolved = preferenceID(for: sourceID)
+        return resolved.hasPrefix("filename-sha256:") ? resolved : nil
+    }
+
+    /// 来源适配器在拿到目录后登记一次别名；之后运行只依赖 Apple TV 本地映射。
+    func registerSMBMediaItems(_ items: [SMBSpikeMediaItem]) {
+        registerContentItems(items.map {
+            BabyPlayerContentIdentityInput(
+                sourceID: "smb:\($0.path)",
+                displayName: $0.displayName,
+                fileNameOrPath: $0.name
+            )
+        })
+    }
+
+    private func registerJellyfinMediaItems(_ items: [JellyfinMediaItem]) {
+        registerContentItems(items.map {
+            BabyPlayerContentIdentityInput(
+                sourceID: $0.id,
+                displayName: $0.name,
+                fileNameOrPath: $0.path ?? $0.name
+            )
+        })
+    }
+
+    private func registerContentItems(_ items: [BabyPlayerContentIdentityInput]) {
+        guard !items.isEmpty else { return }
+        let resolved = BabyPlayerContentIdentityResolver.mappings(for: items)
+        var changed = false
+        for item in items {
+            let contentID = resolved[item.sourceID] ?? item.sourceID
+            if contentAliases[item.sourceID] != contentID {
+                contentAliases[item.sourceID] = contentID
+                changed = true
+            }
+            if contentTitles[contentID] != item.displayName {
+                contentTitles[contentID] = item.displayName
+                changed = true
+            }
+        }
+        guard changed else { return }
+        UserDefaults.standard.set(contentAliases, forKey: Self.contentAliasesKey)
+        UserDefaults.standard.set(contentTitles, forKey: Self.contentTitlesKey)
+        applyContentIdentityMigration()
+        contentIdentityRevision &+= 1
+        logSharedContentState()
+    }
+
+    private func registerPersistedContentAliases(
+        _ aliases: [BabyPlayerPersistedContentAlias]
+    ) {
+        guard !aliases.isEmpty else { return }
+        var changed = false
+        for alias in aliases {
+            if contentAliases[alias.sourceID] != alias.contentID {
+                contentAliases[alias.sourceID] = alias.contentID
+                changed = true
+            }
+            if contentTitles[alias.contentID] == nil {
+                contentTitles[alias.contentID] = alias.title
+                changed = true
+            }
+        }
+        guard changed else { return }
+        UserDefaults.standard.set(contentAliases, forKey: Self.contentAliasesKey)
+        UserDefaults.standard.set(contentTitles, forKey: Self.contentTitlesKey)
+        applyContentIdentityMigration()
+        contentIdentityRevision &+= 1
+        logSharedContentState()
+    }
+
+    private func applyContentIdentityMigration() {
+        let migratedRatings = BabyPlayerContentIdentityResolver.migratedRatings(
+            ratings,
+            aliases: contentAliases
+        )
+        if migratedRatings != ratings {
+            ratings = migratedRatings
+            persistRatings()
+        }
+        let migratedResume = BabyPlayerContentIdentityResolver.migratedResumeState(
+            playbackResumeState,
+            aliases: contentAliases
+        )
+        if migratedResume != playbackResumeState {
+            playbackResumeState = migratedResume
+            persistPlaybackResume()
+        }
+    }
+
+    private func persistRatings() {
+        UserDefaults.standard.set(ratings.mapValues(\.rawValue), forKey: Self.ratingsKey)
+    }
+
+    private func persistPlaybackResume() {
+        if let playbackResumeState,
+           let data = try? JSONEncoder().encode(playbackResumeState) {
+            UserDefaults.standard.set(data, forKey: Self.playbackResumeKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.playbackResumeKey)
+        }
+    }
+
+    private func logSharedContentState() {
+        #if DEBUG
+        let sharedRatings = ratings.keys.filter { $0.hasPrefix("filename-sha256:") }.count
+        let legacyRatings = ratings.count - sharedRatings
+        let blocked = ratings.values.filter { $0 == .blocked }.count
+        let resumeShared = playbackResumeState?.itemID.hasPrefix("filename-sha256:") ?? true
+        print(
+            "BABYPLAYER_SHARED_STATE_RESULT "
+                + "aliases=\(contentAliases.count) ratings=\(ratings.count) "
+                + "shared_ratings=\(sharedRatings) legacy_ratings=\(legacyRatings) "
+                + "blocked=\(blocked) resume_shared=\(resumeShared)"
+        )
+        #endif
     }
 
     func endPlayback() {
@@ -859,9 +1092,7 @@ final class SpikeViewModel: ObservableObject {
             updatedAt: Date()
         )
         playbackResumeState = state
-        if let data = try? JSONEncoder().encode(state) {
-            UserDefaults.standard.set(data, forKey: Self.playbackResumeKey)
-        }
+        persistPlaybackResume()
     }
 
     func clearPlaybackResume(for itemID: String) {
@@ -1095,7 +1326,7 @@ final class SpikeViewModel: ObservableObject {
                     ) { _ in
                         try await BabyPlayerLyricsTranslationClient().translate(
                             english: english,
-                            mediaFingerprint: item.lyricsMedia.asrFingerprint
+                            mediaFingerprint: item.lyricsMedia.translationFingerprint
                         )
                     }
                     bundle = try await BabyLyricsRepository.shared.storeChineseTranslation(
@@ -1299,8 +1530,9 @@ final class SpikeViewModel: ObservableObject {
             introSkipSeconds: Double(introSkipSeconds),
             outroSkipSeconds: Double(outroSkipSeconds),
             lyricsMode: lyricsMode,
+            smartSkipEnabled: smartSkipEnabled,
             startPositionSeconds: playbackResumeState.flatMap { state in
-                state.itemID == queue[queueStartIndex].id ? state.positionSeconds : nil
+                state.itemID == queue[queueStartIndex].preferenceID ? state.positionSeconds : nil
             }
         )
     }
@@ -1342,17 +1574,16 @@ final class SpikeViewModel: ObservableObject {
             )
             return BabyPlayerQueueItem(
                 id: prepared.item.id,
+                preferenceID: preferenceID(for: prepared.item.id),
                 title: prepared.item.name,
                 url: prepared.url,
+                smbPlaybackResource: nil,
                 lyricsMedia: prepared.lyricsMedia,
                 localMediaPath: prepared.item.path,
                 chapterIntroEndSeconds: prepared.chapterIntro,
                 chapterOutroStartSeconds: prepared.chapterOutro,
                 smartIntroEndSeconds: storedSmartBoundary?.introEndSeconds,
-                smartOutroStartSeconds: storedSmartBoundary?.outroStartSeconds,
-                smartSkipEnabled: BabyPlayerSmartSkipPreferencePolicy.resolvedValue(
-                    storedValue: storedConfiguration?.isEnabled
-                )
+                smartOutroStartSeconds: storedSmartBoundary?.outroStartSeconds
             )
         }
     }
@@ -1371,14 +1602,16 @@ final class SpikeViewModel: ObservableObject {
         return Self.lyricsDescriptor(
             from: item,
             songStartSeconds: inferredSongStart,
-            songEndSeconds: inferredSongEnd
+            songEndSeconds: inferredSongEnd,
+            localMediaMigrationKey: contentMigrationKey(for: item.id)
         )
     }
 
     private static func lyricsDescriptor(
         from item: JellyfinMediaItem,
         songStartSeconds: Double?,
-        songEndSeconds: Double?
+        songEndSeconds: Double?,
+        localMediaMigrationKey: String?
     ) -> LyricsMediaDescriptor {
         let titleMetadata = LyricsTitleMetadata.parse(item.name)
         return LyricsMediaDescriptor(
@@ -1391,7 +1624,8 @@ final class SpikeViewModel: ObservableObject {
             durationSeconds: item.runTimeTicks.map { Double($0) / 10_000_000 },
             songStartSeconds: songStartSeconds,
             songEndSeconds: songEndSeconds,
-            mediaSourceID: item.mediaSources?.first?.id
+            mediaSourceID: item.mediaSources?.first?.id,
+            localMediaMigrationKey: localMediaMigrationKey
         )
     }
 

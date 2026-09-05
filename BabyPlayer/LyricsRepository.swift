@@ -20,6 +20,9 @@ struct LyricsMediaDescriptor: Codable, Identifiable, Sendable {
     let songStartSeconds: Double?
     let songEndSeconds: Double?
     let mediaSourceID: String?
+    /// 当前已知同一媒体库内的来源无关兼容键，用于共享字幕、评分和智能跳过。
+    /// 它受目录内文件名唯一性约束，不是可跨任意住宅复用的强内容哈希。
+    let localMediaMigrationKey: String?
 
     /// 有 Jellyfin 章节或家长设置时，用真正的歌曲段时长代替整段 MP4 时长。
     var expectedSongDurationSeconds: Double? {
@@ -32,6 +35,37 @@ struct LyricsMediaDescriptor: Codable, Identifiable, Sendable {
 
     var hasSongBoundaryHint: Bool {
         songStartSeconds != nil || songEndSeconds != nil
+    }
+
+    /// 字幕、人工校时和智能跳过的持久化身份。存在跨来源内容键时不再按服务器条目分仓。
+    var sharedContentID: String {
+        localMediaMigrationKey ?? id
+    }
+
+    /// 中文翻译绑定英文内容哈希和内容身份，不绑定 Jellyfin/SMB 的运输方式。
+    var translationFingerprint: String {
+        guard let localMediaMigrationKey else { return asrFingerprint }
+        let raw = "babyplayer-lyrics-content-v1|\(localMediaMigrationKey)"
+        return SHA256.hash(data: Data(raw.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
+/// 为同一台 Apple TV 上、同一已知媒体库的不同来源生成保守兼容键。
+/// 只使用原始文件名（去扩展名、Unicode NFC）并做 SHA-256；同名不唯一时拒绝迁移。
+enum BabyPlayerLocalMediaMigrationKey {
+    static func make(fileNameOrPath rawValue: String) -> String? {
+        let lastComponent = (rawValue as NSString).lastPathComponent
+        let stem = (lastComponent as NSString).deletingPathExtension
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .precomposedStringWithCanonicalMapping
+        guard !stem.isEmpty else { return nil }
+        let framed = "BabyPlayer.LocalMediaMigration.v1\0" + stem
+        let digest = SHA256.hash(data: Data(framed.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "filename-sha256:\(digest)"
     }
 }
 
@@ -233,6 +267,7 @@ struct StoredLyricsAnalysisBundle: Codable, Sendable {
     let mediaID: String
     let mediaFingerprint: String
     let mediaSourceID: String?
+    let localMediaMigrationKey: String?
     let mediaTitle: String
     var pinnedOrdinaryPlayback: LyricsPlayback?
     var asrResult: StoredLyricsAnalysisResult?
@@ -254,6 +289,20 @@ struct StoredLyricsAnalysisBundle: Codable, Sendable {
     var bestAvailableResult: StoredLyricsAnalysisResult? {
         deepSeekResult ?? asrResult
     }
+}
+
+struct BabyPlayerPersistedContentAlias: Equatable, Sendable {
+    let sourceID: String
+    let contentID: String
+    let title: String
+}
+
+private struct BabyPlayerPersistedContentIdentityRecord {
+    let sourceID: String
+    let contentID: String
+    let title: String
+    let hasExplicitContentID: Bool
+    let updatedAt: Date
 }
 
 // 【MODIFIED】歌词哈希用于去重和标识采用版本，不代替媒体内容哈希。
@@ -389,6 +438,7 @@ struct LyricsBinding: Codable, Identifiable, Sendable {
     let mediaID: String
     let mediaFingerprint: String
     let mediaSourceID: String?
+    let localMediaMigrationKey: String?
     let mediaTitle: String
     let sourceCandidateID: Int
     let sourceTrackName: String
@@ -667,40 +717,31 @@ actor BabyLyricsRepository {
     // 【MODIFIED】分析结果位于 Application Support，只有 App 卸载或确认媒体已删除时才清理。
     /// 读取媒体的持久分析结果；输入媒体描述，输出 ASR/DeepSeek bundle，不改变默认歌词。
     func analysisBundle(for media: LyricsMediaDescriptor) -> StoredLyricsAnalysisBundle? {
-        if let cached = analysisMemoryCache[media.id] { return cached }
-        if let exact = try? loadAnalysisBundleFromDisk(mediaID: media.id) {
-            analysisMemoryCache[media.id] = exact
-            return exact
+        let storageID = media.sharedContentID
+        if let cached = analysisMemoryCache[storageID] { return cached }
+        if let exact = try? loadAnalysisBundleFromDisk(mediaID: storageID) {
+            let normalized = canonicalAnalysisBundle(exact, for: media)
+            if needsCanonicalAnalysisWrite(exact, normalized: normalized) {
+                try? saveAnalysisBundleToDisk(normalized)
+            }
+            analysisMemoryCache[storageID] = normalized
+            return normalized
         }
-        if let fallback = try? loadAllAnalysisBundles().first(where: { stored in
-            let sourceMatches = media.mediaSourceID.map { $0 == stored.mediaSourceID } ?? false
-            return sourceMatches
-                || stored.mediaFingerprint == mediaFingerprint(for: media)
-                || stored.mediaFingerprint == legacyMediaFingerprint(for: media)
-        }) {
-            let migrated = StoredLyricsAnalysisBundle(
-                mediaID: media.id,
-                mediaFingerprint: mediaFingerprint(for: media),
-                mediaSourceID: media.mediaSourceID,
-                mediaTitle: media.title,
-                pinnedOrdinaryPlayback: fallback.pinnedOrdinaryPlayback,
-                asrResult: fallback.asrResult,
-                deepSeekResult: fallback.deepSeekResult,
-                chineseTranslation: fallback.chineseTranslation.flatMap { translation in
-                    guard translation.mediaFingerprint == media.asrFingerprint,
-                          translation.englishLyricsContentHash
-                            == fallback.deepSeekResult?.lyricsContentHash else { return nil }
-                    return translation
-                },
-                smartPlaybackBoundary: fallback.smartPlaybackBoundary,
-                smartPlaybackEnabled: fallback.smartPlaybackEnabled,
-                updatedAt: Date()
-            )
+        if let storedBundles = try? loadAllAnalysisBundles(),
+           let fallback = matchingAnalysisBundle(for: media, in: storedBundles) {
+            let migrated = canonicalAnalysisBundle(fallback, for: media, isMigration: true)
             try? saveAnalysisBundleToDisk(migrated)
-            analysisMemoryCache[media.id] = migrated
+            analysisMemoryCache[storageID] = migrated
+            #if DEBUG
+            print(
+                "BABYPLAYER_SUBTITLE_MIGRATION_RESULT "
+                + "deepseek=\(migrated.deepSeekResult != nil) "
+                + "bilingual=\(migrated.chineseTranslation != nil)"
+            )
+            #endif
             return migrated
         }
-        analysisMemoryCache[media.id] = nil
+        analysisMemoryCache[storageID] = nil
         return nil
     }
 
@@ -712,15 +753,7 @@ actor BabyLyricsRepository {
               let storedBundles = try? loadAllAnalysisBundles() else { return [:] }
         var result: [String: StoredSmartPlaybackConfiguration] = [:]
         for media in mediaItems {
-            let fingerprint = mediaFingerprint(for: media)
-            let legacyFingerprint = legacyMediaFingerprint(for: media)
-            let match = storedBundles.first { stored in
-                stored.mediaID == media.id
-                    || (media.mediaSourceID.map { $0 == stored.mediaSourceID } ?? false)
-                    || stored.mediaFingerprint == fingerprint
-                    || stored.mediaFingerprint == legacyFingerprint
-            }
-            if let match {
+            if let match = resolvedAnalysisBundle(for: media, in: storedBundles) {
                 result[media.id] = StoredSmartPlaybackConfiguration(
                     boundary: match.smartPlaybackBoundary,
                     isEnabled: match.smartPlaybackEnabled ?? true
@@ -728,6 +761,83 @@ actor BabyLyricsRepository {
             }
         }
         return result
+    }
+
+    /// 队列批量读取共用一次目录快照，避免 78 首视频逐项重复解析整个字幕目录。
+    private func resolvedAnalysisBundle(
+        for media: LyricsMediaDescriptor,
+        in storedBundles: [StoredLyricsAnalysisBundle]
+    ) -> StoredLyricsAnalysisBundle? {
+        let storageID = media.sharedContentID
+        if let cached = analysisMemoryCache[storageID] { return cached }
+        if let exact = storedBundles.first(where: { $0.mediaID == storageID }) {
+            let normalized = canonicalAnalysisBundle(exact, for: media)
+            if needsCanonicalAnalysisWrite(exact, normalized: normalized) {
+                try? saveAnalysisBundleToDisk(normalized)
+            }
+            analysisMemoryCache[storageID] = normalized
+            return normalized
+        }
+        guard let fallback = matchingAnalysisBundle(for: media, in: storedBundles) else {
+            analysisMemoryCache[storageID] = nil
+            return nil
+        }
+        let migrated = canonicalAnalysisBundle(fallback, for: media, isMigration: true)
+        try? saveAnalysisBundleToDisk(migrated)
+        analysisMemoryCache[storageID] = migrated
+        return migrated
+    }
+
+    /// 从本机旧字幕/绑定中恢复来源别名，供评分、屏蔽和续播迁移使用；不访问网络。
+    func persistedContentAliases() -> [BabyPlayerPersistedContentAlias] {
+        var records: [BabyPlayerPersistedContentIdentityRecord] = []
+        if let bundles = try? loadAllAnalysisBundles() {
+            records.append(contentsOf: bundles.compactMap { stored in
+                guard let contentID = storedMigrationKey(
+                    explicitKey: stored.localMediaMigrationKey,
+                    legacyTitle: stored.mediaTitle
+                ) else { return nil }
+                return BabyPlayerPersistedContentIdentityRecord(
+                    sourceID: stored.mediaID,
+                    contentID: contentID,
+                    title: stored.mediaTitle,
+                    hasExplicitContentID: stored.localMediaMigrationKey != nil,
+                    updatedAt: stored.updatedAt
+                )
+            })
+        }
+        if let bindings = try? loadAllBindings() {
+            records.append(contentsOf: bindings.compactMap { stored in
+                guard let contentID = storedMigrationKey(
+                    explicitKey: stored.localMediaMigrationKey,
+                    legacyTitle: stored.mediaTitle
+                ) else { return nil }
+                return BabyPlayerPersistedContentIdentityRecord(
+                    sourceID: stored.mediaID,
+                    contentID: contentID,
+                    title: stored.mediaTitle,
+                    hasExplicitContentID: stored.localMediaMigrationKey != nil,
+                    updatedAt: stored.updatedAt
+                )
+            })
+        }
+
+        return Dictionary(grouping: records, by: \.contentID)
+            .flatMap { contentID, matches -> [BabyPlayerPersistedContentAlias] in
+                let legacySourceIDs = Set(matches.filter {
+                    !$0.hasExplicitContentID && $0.sourceID != contentID
+                }.map(\.sourceID))
+                guard legacySourceIDs.count <= 1 else { return [] }
+                var seen = Set<String>()
+                return matches.sorted { $0.updatedAt > $1.updatedAt }.compactMap { match in
+                    guard seen.insert(match.sourceID).inserted else { return nil }
+                    return BabyPlayerPersistedContentAlias(
+                        sourceID: match.sourceID,
+                        contentID: contentID,
+                        title: match.title
+                    )
+                }
+            }
     }
 
     /// 保存当前歌曲的智能跳过开关；只改变播放偏好，不修改歌词或智能边界。
@@ -740,7 +850,7 @@ actor BabyLyricsRepository {
         bundle.smartPlaybackEnabled = enabled
         bundle.updatedAt = Date()
         try saveAnalysisBundleToDisk(bundle)
-        analysisMemoryCache[media.id] = bundle
+        analysisMemoryCache[media.sharedContentID] = bundle
         return bundle
     }
 
@@ -768,7 +878,7 @@ actor BabyLyricsRepository {
         bundle.smartPlaybackBoundary = smartPlaybackBoundary
         bundle.updatedAt = Date()
         try saveAnalysisBundleToDisk(bundle)
-        analysisMemoryCache[media.id] = bundle
+        analysisMemoryCache[media.sharedContentID] = bundle
         return bundle
     }
 
@@ -793,7 +903,7 @@ actor BabyLyricsRepository {
         bundle.deepSeekResult = result
         bundle.updatedAt = Date()
         try saveAnalysisBundleToDisk(bundle)
-        analysisMemoryCache[media.id] = bundle
+        analysisMemoryCache[media.sharedContentID] = bundle
         return bundle
     }
 
@@ -805,7 +915,7 @@ actor BabyLyricsRepository {
     ) throws -> StoredLyricsAnalysisBundle {
         var bundle = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
         guard let english = bundle.deepSeekResult,
-              translation.mediaFingerprint == media.asrFingerprint,
+              translation.mediaFingerprint == media.translationFingerprint,
               translation.englishLyricsContentHash == english.lyricsContentHash,
               BabyPlayerLyricsTranslationContract.isCompatible(translation),
               BabyPlayerBilingualLyricsComposer.compose(
@@ -817,7 +927,7 @@ actor BabyLyricsRepository {
         bundle.chineseTranslation = translation
         bundle.updatedAt = Date()
         try saveAnalysisBundleToDisk(bundle)
-        analysisMemoryCache[media.id] = bundle
+        analysisMemoryCache[media.sharedContentID] = bundle
         return bundle
     }
 
@@ -827,7 +937,7 @@ actor BabyLyricsRepository {
         media: LyricsMediaDescriptor
     ) -> StoredLyricsTranslationResult? {
         guard let translation = analysisBundle(for: media)?.chineseTranslation,
-              translation.mediaFingerprint == media.asrFingerprint,
+              translation.mediaFingerprint == media.translationFingerprint,
               translation.englishLyricsContentHash == english.lyricsContentHash,
               BabyPlayerLyricsTranslationContract.isCompatible(translation),
               BabyPlayerBilingualLyricsComposer.compose(
@@ -884,7 +994,7 @@ actor BabyLyricsRepository {
         for media: LyricsMediaDescriptor,
         forceRefresh: Bool = false
     ) async throws -> [LyricsCandidate] {
-        let key = mediaFingerprint(for: media)
+        let key = media.localMediaMigrationKey ?? mediaFingerprint(for: media)
         if !forceRefresh {
             if let cached = candidateMemoryCache[key] { return cached }
             if let cached = try? loadCandidatesFromDisk(key: key) {
@@ -1017,42 +1127,28 @@ actor BabyLyricsRepository {
     }
 
     func binding(for media: LyricsMediaDescriptor) -> LyricsBinding? {
-        if let cached = bindingMemoryCache[media.id] { return cached }
-        if let exact = try? loadBindingFromDisk(mediaID: media.id) {
-            bindingMemoryCache[media.id] = exact
-            return exact
+        let storageID = media.sharedContentID
+        if let cached = bindingMemoryCache[storageID] { return cached }
+        if let exact = try? loadBindingFromDisk(mediaID: storageID) {
+            let normalized = canonicalBinding(exact, for: media)
+            if exact.mediaID != normalized.mediaID
+                || exact.localMediaMigrationKey != normalized.localMediaMigrationKey {
+                try? saveBindingToDisk(normalized)
+            }
+            bindingMemoryCache[storageID] = normalized
+            return normalized
         }
 
         // Jellyfin 重建条目时 ID 可能变化；标题、演唱者和时长均一致时恢复原绑定。
-        if let fallback = try? loadAllBindings().first(where: { stored in
-            let sourceMatches = media.mediaSourceID.map { $0 == stored.mediaSourceID } ?? false
-            return sourceMatches
-                || stored.mediaFingerprint == mediaFingerprint(for: media)
-                || stored.mediaFingerprint == legacyMediaFingerprint(for: media)
-        }) {
-            let migrated = LyricsBinding(
-                mediaID: media.id,
-                mediaFingerprint: fallback.mediaFingerprint,
-                mediaSourceID: media.mediaSourceID,
-                mediaTitle: media.title,
-                sourceCandidateID: fallback.sourceCandidateID,
-                sourceTrackName: fallback.sourceTrackName,
-                sourceArtistName: fallback.sourceArtistName,
-                sourceDuration: fallback.sourceDuration,
-                lines: fallback.lines,
-                offsetSeconds: fallback.offsetSeconds,
-                selectionOrigin: fallback.selectionOrigin,
-                selectedLyricIdentifier: fallback.selectedLyricIdentifier,
-                timingAdjustments: fallback.timingAdjustments,
-                confirmedAt: fallback.confirmedAt,
-                updatedAt: Date()
-            )
+        if let storedBindings = try? loadAllBindings(),
+           let fallback = matchingBinding(for: media, in: storedBindings) {
+            let migrated = canonicalBinding(fallback, for: media, isMigration: true)
             try? saveBindingToDisk(migrated)
-            bindingMemoryCache[media.id] = migrated
+            bindingMemoryCache[storageID] = migrated
             return migrated
         }
 
-        bindingMemoryCache[media.id] = nil
+        bindingMemoryCache[storageID] = nil
         return nil
     }
 
@@ -1082,9 +1178,10 @@ actor BabyLyricsRepository {
         }
         timings[playback.lyricIdentifier] = playback.timingAdjustment
         let binding = LyricsBinding(
-            mediaID: media.id,
+            mediaID: media.sharedContentID,
             mediaFingerprint: mediaFingerprint(for: media),
             mediaSourceID: media.mediaSourceID,
+            localMediaMigrationKey: media.localMediaMigrationKey,
             mediaTitle: media.title,
             sourceCandidateID: playback.candidateID,
             sourceTrackName: playback.trackName,
@@ -1099,13 +1196,13 @@ actor BabyLyricsRepository {
             updatedAt: Date()
         )
         try saveBindingToDisk(binding)
-        bindingMemoryCache[media.id] = binding
+        bindingMemoryCache[media.sharedContentID] = binding
         if playback.selectionOrigin == .manual {
             var analysis = analysisBundle(for: media) ?? emptyAnalysisBundle(for: media)
             analysis.pinnedOrdinaryPlayback = playback
             analysis.updatedAt = Date()
             try saveAnalysisBundleToDisk(analysis)
-            analysisMemoryCache[media.id] = analysis
+            analysisMemoryCache[media.sharedContentID] = analysis
         }
         return binding
     }
@@ -1130,7 +1227,7 @@ actor BabyLyricsRepository {
         binding.offsetSeconds = adjustment.effectiveOffsetSeconds
         binding.updatedAt = Date()
         try saveBindingToDisk(binding)
-        bindingMemoryCache[media.id] = binding
+        bindingMemoryCache[media.sharedContentID] = binding
         return binding
     }
 
@@ -1148,15 +1245,23 @@ actor BabyLyricsRepository {
                 guard let data = try? Data(contentsOf: url),
                       let stored = try? JSONDecoder().decode(LyricsBinding.self, from: data) else { continue }
                 let sourceMatches = media.mediaSourceID.map { $0 == stored.mediaSourceID } ?? false
-                guard stored.mediaID == media.id
+                let contentMatches = media.localMediaMigrationKey.map {
+                    storedMigrationKey(
+                        explicitKey: stored.localMediaMigrationKey,
+                        legacyTitle: stored.mediaTitle
+                    ) == $0
+                } ?? false
+                guard stored.mediaID == media.sharedContentID
+                        || stored.mediaID == media.id
                         || sourceMatches
+                        || contentMatches
                         || stored.mediaFingerprint == fingerprint
                         || stored.mediaFingerprint == legacyFingerprint else { continue }
                 try fileManager.removeItem(at: url)
                 bindingMemoryCache[stored.mediaID] = nil
             }
         }
-        bindingMemoryCache[media.id] = nil
+        bindingMemoryCache[media.sharedContentID] = nil
     }
 
     private func playback(from binding: LyricsBinding) -> LyricsPlayback {
@@ -1396,6 +1501,153 @@ actor BabyLyricsRepository {
         .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private func canonicalAnalysisBundle(
+        _ stored: StoredLyricsAnalysisBundle,
+        for media: LyricsMediaDescriptor,
+        isMigration: Bool = false
+    ) -> StoredLyricsAnalysisBundle {
+        StoredLyricsAnalysisBundle(
+            mediaID: media.sharedContentID,
+            mediaFingerprint: isMigration ? mediaFingerprint(for: media) : stored.mediaFingerprint,
+            mediaSourceID: isMigration ? media.mediaSourceID : stored.mediaSourceID,
+            localMediaMigrationKey: media.localMediaMigrationKey,
+            mediaTitle: isMigration ? media.title : stored.mediaTitle,
+            pinnedOrdinaryPlayback: stored.pinnedOrdinaryPlayback,
+            asrResult: stored.asrResult,
+            deepSeekResult: stored.deepSeekResult,
+            chineseTranslation: migratedTranslation(
+                stored.chineseTranslation,
+                deepSeekResult: stored.deepSeekResult,
+                for: media
+            ),
+            smartPlaybackBoundary: stored.smartPlaybackBoundary,
+            smartPlaybackEnabled: stored.smartPlaybackEnabled,
+            updatedAt: isMigration ? Date() : stored.updatedAt
+        )
+    }
+
+    private func needsCanonicalAnalysisWrite(
+        _ stored: StoredLyricsAnalysisBundle,
+        normalized: StoredLyricsAnalysisBundle
+    ) -> Bool {
+        stored.mediaID != normalized.mediaID
+            || stored.localMediaMigrationKey != normalized.localMediaMigrationKey
+            || stored.chineseTranslation?.mediaFingerprint
+                != normalized.chineseTranslation?.mediaFingerprint
+    }
+
+    private func canonicalBinding(
+        _ stored: LyricsBinding,
+        for media: LyricsMediaDescriptor,
+        isMigration: Bool = false
+    ) -> LyricsBinding {
+        LyricsBinding(
+            mediaID: media.sharedContentID,
+            mediaFingerprint: isMigration ? mediaFingerprint(for: media) : stored.mediaFingerprint,
+            mediaSourceID: isMigration ? media.mediaSourceID : stored.mediaSourceID,
+            localMediaMigrationKey: media.localMediaMigrationKey,
+            mediaTitle: isMigration ? media.title : stored.mediaTitle,
+            sourceCandidateID: stored.sourceCandidateID,
+            sourceTrackName: stored.sourceTrackName,
+            sourceArtistName: stored.sourceArtistName,
+            sourceDuration: stored.sourceDuration,
+            lines: stored.lines,
+            offsetSeconds: stored.offsetSeconds,
+            selectionOrigin: stored.selectionOrigin,
+            selectedLyricIdentifier: stored.selectedLyricIdentifier,
+            timingAdjustments: stored.timingAdjustments,
+            confirmedAt: stored.confirmedAt,
+            updatedAt: isMigration ? Date() : stored.updatedAt
+        )
+    }
+
+    /// 先使用来源无关内容键；旧版本只有来源字段时仍保留严格兼容匹配。
+    private func matchingAnalysisBundle(
+        for media: LyricsMediaDescriptor,
+        in storedBundles: [StoredLyricsAnalysisBundle]
+    ) -> StoredLyricsAnalysisBundle? {
+        if let migrationKey = media.localMediaMigrationKey {
+            let matches = storedBundles.filter {
+                storedMigrationKey(
+                    explicitKey: $0.localMediaMigrationKey,
+                    legacyTitle: $0.mediaTitle
+                ) == migrationKey
+            }
+            if matches.count == 1 { return matches[0] }
+            let explicitMatches = matches.filter { $0.localMediaMigrationKey == migrationKey }
+            // 一份已经过新版显式迁移的数据优先于同内容遗留的来源副本。
+            if explicitMatches.count == 1 { return explicitMatches[0] }
+            return nil
+        }
+        let fingerprint = mediaFingerprint(for: media)
+        let legacyFingerprint = legacyMediaFingerprint(for: media)
+        if let exact = storedBundles.first(where: { stored in
+            stored.mediaID == media.id
+                || (media.mediaSourceID.map { $0 == stored.mediaSourceID } ?? false)
+                || stored.mediaFingerprint == fingerprint
+                || stored.mediaFingerprint == legacyFingerprint
+        }) {
+            return exact
+        }
+        return nil
+    }
+
+    private func matchingBinding(
+        for media: LyricsMediaDescriptor,
+        in storedBindings: [LyricsBinding]
+    ) -> LyricsBinding? {
+        if let migrationKey = media.localMediaMigrationKey {
+            let matches = storedBindings.filter {
+                storedMigrationKey(
+                    explicitKey: $0.localMediaMigrationKey,
+                    legacyTitle: $0.mediaTitle
+                ) == migrationKey
+            }
+            if matches.count == 1 { return matches[0] }
+            let explicitMatches = matches.filter { $0.localMediaMigrationKey == migrationKey }
+            if explicitMatches.count == 1 { return explicitMatches[0] }
+            return nil
+        }
+        let fingerprint = mediaFingerprint(for: media)
+        let legacyFingerprint = legacyMediaFingerprint(for: media)
+        if let exact = storedBindings.first(where: { stored in
+            stored.mediaID == media.id
+                || (media.mediaSourceID.map { $0 == stored.mediaSourceID } ?? false)
+                || stored.mediaFingerprint == fingerprint
+                || stored.mediaFingerprint == legacyFingerprint
+        }) {
+            return exact
+        }
+        return nil
+    }
+
+    private func storedMigrationKey(
+        explicitKey: String?,
+        legacyTitle: String
+    ) -> String? {
+        explicitKey ?? BabyPlayerLocalMediaMigrationKey.make(fileNameOrPath: legacyTitle)
+    }
+
+    /// 本地文件唯一匹配成功后，中文文本可随英文内容一起迁移；媒体 fingerprint 必须改写为新来源。
+    private func migratedTranslation(
+        _ translation: StoredLyricsTranslationResult?,
+        deepSeekResult: StoredLyricsAnalysisResult?,
+        for media: LyricsMediaDescriptor
+    ) -> StoredLyricsTranslationResult? {
+        guard let translation,
+              translation.englishLyricsContentHash == deepSeekResult?.lyricsContentHash,
+              BabyPlayerLyricsTranslationContract.isCompatible(translation) else { return nil }
+        return StoredLyricsTranslationResult(
+            mediaFingerprint: media.translationFingerprint,
+            englishLyricsContentHash: translation.englishLyricsContentHash,
+            translationVersion: translation.translationVersion,
+            targetLanguage: translation.targetLanguage,
+            model: translation.model,
+            lines: translation.lines,
+            createdAt: translation.createdAt
+        )
+    }
+
     private func mediaFingerprint(for media: LyricsMediaDescriptor) -> String {
         let duration = Int((media.durationSeconds ?? 0).rounded())
         let source = normalized(media.sourceHint ?? "")
@@ -1530,9 +1782,10 @@ actor BabyLyricsRepository {
 
     private func emptyAnalysisBundle(for media: LyricsMediaDescriptor) -> StoredLyricsAnalysisBundle {
         StoredLyricsAnalysisBundle(
-            mediaID: media.id,
+            mediaID: media.sharedContentID,
             mediaFingerprint: mediaFingerprint(for: media),
             mediaSourceID: media.mediaSourceID,
+            localMediaMigrationKey: media.localMediaMigrationKey,
             mediaTitle: media.title,
             pinnedOrdinaryPlayback: nil,
             asrResult: nil,

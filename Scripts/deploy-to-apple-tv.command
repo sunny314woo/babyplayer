@@ -269,7 +269,7 @@ echo "正在使用 Automatic Signing 构建并重新签名……"
   -allowProvisioningDeviceRegistration \
   CODE_SIGN_STYLE=Automatic \
   DEVELOPMENT_TEAM="$team_id" \
-  PRODUCT_BUNDLE_IDENTIFIER="$bundle_id" \
+  BABYPLAYER_PRODUCT_BUNDLE_IDENTIFIER="$bundle_id" \
   build
 
 app_path="${derived_data}/Build/Products/${configuration}-appletvos/${scheme}.app"

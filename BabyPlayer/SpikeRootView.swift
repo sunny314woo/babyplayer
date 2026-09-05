@@ -20,28 +20,43 @@ enum BabyPlayerPalette {
 
 struct SpikeRootView: View {
     @StateObject private var model = SpikeViewModel()
+    @StateObject private var smbModel = SMBHomeViewModel()
     @State private var showSettings = false
+    @State private var activeMediaSource = BabyPlayerMediaSourcePreference.load()
 
     var body: some View {
         Group {
-            switch model.appState {
-            case .onboarding:
-                OnboardingView(model: model)
-            case .loading:
-                LoadingLibraryView(repair: model.startRePairing)
-            case .home:
-                ChildrenHomeView(model: model, showSettings: $showSettings)
-            case .unavailable:
-                UnavailableLibraryView(
-                    retry: model.retryLoading,
-                    repair: model.startRePairing
+            if activeMediaSource == .samba {
+                SMBChildrenHomeView(
+                    model: smbModel,
+                    preferences: model,
+                    showSettings: $showSettings
                 )
+            } else {
+                switch model.appState {
+                case .onboarding:
+                    OnboardingView(model: model)
+                case .loading:
+                    LoadingLibraryView(repair: model.startRePairing)
+                case .home:
+                    ChildrenHomeView(model: model, showSettings: $showSettings)
+                case .unavailable:
+                    UnavailableLibraryView(
+                        retry: model.retryLoading,
+                        repair: model.startRePairing
+                    )
+                }
             }
         }
         .fullScreenCover(isPresented: $showSettings) {
-            ParentSettingsView(model: model) {
-                showSettings = false
-            }
+            ParentSettingsView(
+                model: model,
+                smbModel: smbModel,
+                activeMediaSource: activeMediaSource,
+                selectJellyfin: { selectMediaSource(.jellyfin) },
+                selectSamba: { selectMediaSource(.samba) },
+                close: { showSettings = false }
+            )
         }
         .fullScreenCover(item: $model.activePlayback) { selection in
             SystemPlayerView(
@@ -52,9 +67,36 @@ struct SpikeRootView: View {
                 },
                 ratingFor: model.rating(for:),
                 onProgress: model.updatePlaybackResume,
-                onFinished: model.clearPlaybackResume
+                onFinished: model.clearPlaybackResume,
+                onSmartSkipEnabledChange: { model.smartSkipEnabled = $0 }
             )
                 .ignoresSafeArea()
+        }
+        .fullScreenCover(item: $smbModel.activePlayback) { selection in
+            SystemPlayerView(
+                selection: selection,
+                onExit: smbModel.endPlayback,
+                onRate: { itemID, rating in
+                    model.setRating(rating, for: itemID)
+                },
+                ratingFor: model.rating(for:),
+                onProgress: model.updatePlaybackResume,
+                onFinished: model.clearPlaybackResume,
+                onSmartSkipEnabledChange: { model.smartSkipEnabled = $0 }
+            )
+            .ignoresSafeArea()
+        }
+        .onReceive(smbModel.$mediaItems) { items in
+            model.registerSMBMediaItems(items)
+        }
+    }
+
+    private func selectMediaSource(_ source: BabyPlayerMediaSourceKind) {
+        BabyPlayerMediaSourcePreference.save(source)
+        activeMediaSource = source
+        showSettings = false
+        if source == .samba {
+            smbModel.connectIfNeeded()
         }
     }
 }
@@ -347,6 +389,225 @@ private struct ChildrenHomeView: View {
 
 }
 
+/// Samba 与 Jennifer 共用同一个 BabyPlayer 首页信息架构。
+/// 区别只在数据来源和 AVAsset 构建方式，儿童不会进入服务器设置页播放。
+private struct SMBChildrenHomeView: View {
+    @ObservedObject var model: SMBHomeViewModel
+    @ObservedObject var preferences: SpikeViewModel
+    @Binding var showSettings: Bool
+
+    private var visibleItems: [SMBSpikeMediaItem] {
+        let items = model.mediaItems.filter {
+            preferences.rating(for: sourceID(for: $0)) != .blocked
+        }
+        guard let resumeID = preferences.playbackResumeState?.itemID,
+              let current = items.first(where: {
+                  preferences.preferenceID(for: sourceID(for: $0)) == resumeID
+              }) else {
+            return items
+        }
+        return [current] + items.filter {
+            preferences.preferenceID(for: sourceID(for: $0)) != resumeID
+        }
+    }
+
+    private var pages: [[SMBSpikeMediaItem]] {
+        stride(from: 0, to: visibleItems.count, by: 12).map { start in
+            Array(visibleItems[start..<min(start + 12, visibleItems.count)])
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            OrchardBackground()
+            VStack(alignment: .leading, spacing: 14) {
+                header
+                mediaPages
+                footer
+            }
+            .padding(.horizontal, 4)
+        }
+        .task { model.connectIfNeeded() }
+        .onExitCommand { }
+    }
+
+    private var header: some View {
+        HStack(spacing: 14) {
+            Text("音乐视频")
+                .font(.system(size: 31, weight: .bold, design: .rounded))
+            Text("\(visibleItems.count) 首")
+                .font(.system(size: 18, weight: .medium, design: .rounded))
+                .foregroundStyle(BabyPlayerPalette.muted)
+            Button {
+                play(items: visibleItems, startIndex: 0, behavior: .sequential)
+            } label: {
+                Label("顺序播放", systemImage: "play.fill")
+                    .font(.system(size: 19, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 16)
+                    .frame(height: 52)
+            }
+            .buttonStyle(LowContrastButtonStyle())
+            .disabled(visibleItems.isEmpty)
+            Button {
+                play(items: visibleItems, startIndex: 0, behavior: .shuffle)
+            } label: {
+                Label("随机播放", systemImage: "shuffle")
+                    .font(.system(size: 19, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 16)
+                    .frame(height: 52)
+            }
+            .buttonStyle(LowContrastButtonStyle())
+            .disabled(visibleItems.isEmpty)
+            Button {
+                let liked = visibleItems.filter {
+                    preferences.rating(for: sourceID(for: $0)) == .liked
+                }.shuffled()
+                let unrated = visibleItems.filter {
+                    preferences.rating(for: sourceID(for: $0)) == .unrated
+                }.shuffled()
+                let disliked = visibleItems.filter {
+                    preferences.rating(for: sourceID(for: $0)) == .disliked
+                }.shuffled()
+                play(items: liked + unrated + disliked, startIndex: 0, behavior: .sequential)
+            } label: {
+                Label("偏好优先", systemImage: "heart.fill")
+                    .font(.system(size: 19, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 16)
+                    .frame(height: 52)
+            }
+            .buttonStyle(LowContrastButtonStyle())
+            .disabled(visibleItems.isEmpty)
+            Spacer()
+            Button(action: model.connectAndScan) {
+                Label(model.isWorking ? "扫描中" : "刷新媒体库", systemImage: "arrow.clockwise")
+                    .font(.system(size: 19, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 16)
+                    .frame(height: 52)
+            }
+            .buttonStyle(LowContrastButtonStyle())
+            .disabled(model.isWorking)
+            Button { showSettings = true } label: {
+                Label("家长设置", systemImage: "gearshape.fill")
+                    .font(.system(size: 19, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 16)
+                    .frame(height: 52)
+            }
+            .buttonStyle(LowContrastButtonStyle())
+        }
+    }
+
+    @ViewBuilder
+    private var mediaPages: some View {
+        if pages.isEmpty {
+            VStack(spacing: 22) {
+                if model.isWorking { ProgressView() }
+                Text(model.statusText)
+                    .font(.title2)
+                    .foregroundStyle(BabyPlayerPalette.muted)
+                    .multilineTextAlignment(.center)
+                if !model.isWorking {
+                    Button("重新连接", action: model.connectAndScan)
+                        .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.coral))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView(.vertical, showsIndicators: false) {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(pages.enumerated()), id: \.offset) { _, page in
+                        SMBMediaGridPage(
+                            items: page,
+                            coverSource: model.coverSource(for:)
+                        ) { item in
+                            guard let index = visibleItems.firstIndex(where: { $0.id == item.id }) else { return }
+                            play(items: visibleItems, startIndex: index, behavior: .repeatOne)
+                        }
+                        .containerRelativeFrame(.vertical)
+                    }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollTargetBehavior(.paging)
+            .background(BabyPlayerPalette.dayPanel.opacity(0.92), in: RoundedRectangle(cornerRadius: 26))
+            .clipShape(RoundedRectangle(cornerRadius: 28))
+        }
+    }
+
+    private var footer: some View {
+        HStack {
+            Text(model.statusText)
+                .font(.system(size: 17, weight: .medium, design: .rounded))
+                .foregroundStyle(BabyPlayerPalette.muted)
+            Spacer()
+            Text("光猫 U 盘 · Samba · 播放不经过 Mac")
+                .font(.system(size: 17, weight: .medium, design: .rounded))
+                .foregroundStyle(BabyPlayerPalette.muted)
+        }
+    }
+
+    private func sourceID(for item: SMBSpikeMediaItem) -> String {
+        "smb:\(item.path)"
+    }
+
+    private func play(
+        items: [SMBSpikeMediaItem],
+        startIndex: Int,
+        behavior: BabyPlayerPlaybackBehavior
+    ) {
+        guard !items.isEmpty else { return }
+        let selectedID = sourceID(for: items[min(max(0, startIndex), items.count - 1)])
+        let selectedPreferenceID = preferences.preferenceID(for: selectedID)
+        model.play(
+            items,
+            startIndex: startIndex,
+            behavior: behavior,
+            playbackTimerMinutes: preferences.playbackTimerMinutes,
+            introSkipSeconds: preferences.introSkipSeconds,
+            outroSkipSeconds: preferences.outroSkipSeconds,
+            lyricsMode: preferences.lyricsMode,
+            smartSkipEnabled: preferences.smartSkipEnabled,
+            preferenceID: { item in
+                preferences.preferenceID(for: sourceID(for: item))
+            },
+            localMediaMigrationKey: { item in
+                preferences.contentMigrationKey(for: sourceID(for: item))
+            },
+            startPositionSeconds: preferences.playbackResumeState.flatMap {
+                $0.itemID == selectedPreferenceID ? $0.positionSeconds : nil
+            }
+        )
+    }
+}
+
+private struct SMBMediaGridPage: View {
+    let items: [SMBSpikeMediaItem]
+    let coverSource: (SMBSpikeMediaItem) -> BabyPlayerCoverSource
+    let play: (SMBSpikeMediaItem) -> Void
+
+    private let columns = Array(
+        repeating: GridItem(.fixed(414), spacing: 14, alignment: .top),
+        count: 4
+    )
+
+    var body: some View {
+        LazyVGrid(columns: columns, alignment: .center, spacing: 12) {
+            ForEach(items) { item in
+                Button { play(item) } label: {
+                    MediaCard(
+                        title: item.displayName,
+                        coverSource: coverSource(item),
+                        tint: BabyPlayerPalette.coral
+                    )
+                }
+                .buttonStyle(MediaCardButtonStyle(tint: BabyPlayerPalette.coral))
+                .accessibilityLabel("播放 \(item.displayName)")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+}
+
 private struct MediaGridPage: View {
     let items: [JellyfinMediaItem]
     let coverSource: (JellyfinMediaItem) -> BabyPlayerCoverSource?
@@ -386,6 +647,7 @@ private struct MediaCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             MediaCoverView(source: coverSource, tint: tint)
+            .id(coverSource?.viewIdentity ?? "no-cover")
             .frame(width: 400, height: 225)
             .clipShape(RoundedRectangle(cornerRadius: 18))
             .overlay(alignment: .bottomTrailing) {
@@ -411,16 +673,41 @@ private struct MediaCard: View {
 
 private struct ParentSettingsView: View {
     @ObservedObject var model: SpikeViewModel
+    @ObservedObject var smbModel: SMBHomeViewModel
+    let activeMediaSource: BabyPlayerMediaSourceKind
+    let selectJellyfin: () -> Void
+    let selectSamba: () -> Void
     let close: () -> Void
     // 【MODIFIED】额度读取与临时分段生命周期解耦，不展示已取消的完整音频库。
     @StateObject private var asrUsage = BabyPlayerASRUsageViewModel()
     @State private var confirmClear = false
     @State private var showsBatchAnalysis = false
+    @State private var showsMediaSourceSelection = false
+    @State private var showsSMBConnectionEditor = false
 
     var body: some View {
         ZStack {
             OrchardBackground()
-            if showsBatchAnalysis {
+            if showsSMBConnectionEditor {
+                SMBSpikeView {
+                    showsSMBConnectionEditor = false
+                    smbModel.connectAndScan()
+                }
+            } else if showsMediaSourceSelection {
+                ParentMediaSourceSelectionView(
+                    jellyfinSummary: model.connectionSummary,
+                    activeMediaSource: activeMediaSource,
+                    selectJellyfin: {
+                        showsMediaSourceSelection = false
+                        selectJellyfin()
+                    },
+                    selectSMB: {
+                        showsMediaSourceSelection = false
+                        selectSamba()
+                    },
+                    close: { showsMediaSourceSelection = false }
+                )
+            } else if showsBatchAnalysis {
                 BabyPlayerBatchAnalysisView(
                     model: model,
                     close: { showsBatchAnalysis = false }
@@ -430,7 +717,12 @@ private struct ParentSettingsView: View {
             }
         }
         .onExitCommand {
-            if showsBatchAnalysis {
+            if showsSMBConnectionEditor {
+                showsSMBConnectionEditor = false
+                smbModel.connectAndScan()
+            } else if showsMediaSourceSelection {
+                showsMediaSourceSelection = false
+            } else if showsBatchAnalysis {
                 showsBatchAnalysis = false
             } else {
                 close()
@@ -463,11 +755,46 @@ private struct ParentSettingsView: View {
 
                 ScrollView {
                     VStack(spacing: 2) {
-                        SettingsInfoRow(title: "Jellyfin 连接", value: model.connectionSummary)
+                        if BabyPlayerFeatureFlags.isSMBDirectPlaybackSpikeEnabled {
+                            Button {
+                                showsMediaSourceSelection = true
+                            } label: {
+                                SettingsActionRow(
+                                    title: "媒体源",
+                                    value: activeMediaSource == .samba
+                                        ? "光猫 U 盘 · Samba · \(smbModel.mediaItems.isEmpty ? "连接中" : "已连接")"
+                                        : "Jennifer · Jellyfin · \(model.connectionSummary)"
+                                )
+                            }
+                        } else {
+                            SettingsInfoRow(
+                                title: "媒体源",
+                                value: "Jennifer · Jellyfin · \(model.connectionSummary)"
+                            )
+                        }
+                        if BabyPlayerFeatureFlags.isSMBDirectPlaybackSpikeEnabled {
+                            Button {
+                                showsSMBConnectionEditor = true
+                            } label: {
+                                SettingsActionRow(
+                                    title: "编辑 Samba 连接",
+                                    value: "服务器、共享、目录与账号"
+                                )
+                            }
+                        }
                         Button {
-                            model.rescanLibrary()
+                            if activeMediaSource == .samba {
+                                smbModel.connectAndScan()
+                            } else {
+                                model.rescanLibrary()
+                            }
                         } label: {
-                            SettingsActionRow(title: "扫描并刷新媒体库", value: "\(model.mediaItems.count) 个视频")
+                            SettingsActionRow(
+                                title: activeMediaSource == .samba
+                                    ? "刷新光猫 U 盘"
+                                    : "刷新 Jennifer 媒体库",
+                                value: "\(activeMediaSource == .samba ? smbModel.mediaItems.count : model.mediaItems.count) 个视频"
+                            )
                         }
                         Button {
                             close()
@@ -528,18 +855,134 @@ private struct ParentSettingsView: View {
     /// 家长可查看并解除屏蔽；儿童首页不会渲染这组记录。
     @ViewBuilder
     private var blockedRatingsSection: some View {
-        if model.blockedMediaItems.isEmpty {
+        if model.blockedContentItems.isEmpty {
             SettingsInfoRow(title: "屏蔽的视频", value: "暂无")
         } else {
-            SettingsInfoRow(title: "屏蔽的视频", value: "\(model.blockedMediaItems.count) 个")
-            ForEach(model.blockedMediaItems) { item in
+            SettingsInfoRow(title: "屏蔽的视频", value: "\(model.blockedContentItems.count) 个")
+            ForEach(model.blockedContentItems) { item in
                 Button {
-                    model.unblock(item)
+                    model.unblock(contentID: item.id)
                 } label: {
-                    SettingsActionRow(title: item.name, value: "解除屏蔽")
+                    SettingsActionRow(title: item.title, value: "解除屏蔽")
                 }
             }
         }
+    }
+}
+
+/// 家长手工选择播放轨道；SMB 模式直接进入路由器 U 盘媒体库。
+private struct ParentMediaSourceSelectionView: View {
+    let jellyfinSummary: String
+    let activeMediaSource: BabyPlayerMediaSourceKind
+    let selectJellyfin: () -> Void
+    let selectSMB: () -> Void
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            HStack {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("选择媒体源")
+                        .font(.system(size: 52, weight: .bold, design: .rounded))
+                    Text("手工切换播放轨道；播放中不会自动跳到另一个来源。")
+                        .font(.system(size: 21, weight: .medium, design: .rounded))
+                        .foregroundStyle(BabyPlayerPalette.muted)
+                }
+                Spacer()
+                Button("返回", action: close)
+                    .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.berry))
+            }
+
+            VStack(spacing: 16) {
+                Button(action: selectJellyfin) {
+                    MediaSourceChoiceLabel(
+                        icon: "desktopcomputer",
+                        title: "Jennifer",
+                        subtitle: "Jellyfin · \(jellyfinSummary) · 需要 Mac 服务",
+                        badge: activeMediaSource == .jellyfin ? "当前默认" : "选择"
+                    )
+                }
+                Button(action: selectSMB) {
+                    MediaSourceChoiceLabel(
+                        icon: "externaldrive.connected.to.line.below",
+                        title: "光猫 U 盘（Samba）",
+                        subtitle: "192.168.1.1 · usb-0781-060116_1/sss73 · 播放不经过 Mac",
+                        badge: activeMediaSource == .samba ? "当前默认" : "选择"
+                    )
+                }
+            }
+            .buttonStyle(MediaSourceChoiceButtonStyle())
+
+            Text("字幕生成仍可使用 Mac；Mac 离线时只影响新字幕任务，不影响 U 盘视频和已有字幕。")
+                .font(.system(size: 20, weight: .medium, design: .rounded))
+                .foregroundStyle(BabyPlayerPalette.muted)
+            Spacer()
+        }
+        .foregroundStyle(BabyPlayerPalette.ink)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 10)
+    }
+}
+
+private struct MediaSourceChoiceLabel: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    let badge: String
+
+    var body: some View {
+        HStack(spacing: 24) {
+            Image(systemName: icon)
+                .font(.system(size: 42, weight: .semibold))
+                .frame(width: 76)
+            VStack(alignment: .leading, spacing: 7) {
+                Text(title)
+                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                Text(subtitle)
+                    .font(.system(size: 20, weight: .medium, design: .rounded))
+                    .foregroundStyle(BabyPlayerPalette.muted)
+            }
+            Spacer()
+            Text(badge)
+                .font(.system(size: 19, weight: .bold, design: .rounded))
+                .padding(.horizontal, 18)
+                .frame(height: 42)
+                .background(BabyPlayerPalette.leaf.opacity(0.3), in: Capsule())
+            Image(systemName: "chevron.right")
+                .foregroundStyle(BabyPlayerPalette.muted)
+        }
+        .padding(.horizontal, 28)
+        .frame(maxWidth: .infinity, minHeight: 116)
+        .contentShape(RoundedRectangle(cornerRadius: 24))
+    }
+}
+
+private struct MediaSourceChoiceButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        MediaSourceChoiceFocusLabel(configuration: configuration)
+    }
+}
+
+private struct MediaSourceChoiceFocusLabel: View {
+    let configuration: ButtonStyle.Configuration
+    @Environment(\.isFocused) private var isFocused
+
+    var body: some View {
+        configuration.label
+            .background(
+                isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 24)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 24)
+                    .stroke(
+                        isFocused ? BabyPlayerPalette.coral : Color.white.opacity(0.18),
+                        lineWidth: isFocused ? 4 : 2
+                    )
+            }
+            .scaleEffect(isFocused ? 1.018 : (configuration.isPressed ? 0.985 : 1))
+            .shadow(color: isFocused ? BabyPlayerPalette.coral.opacity(0.25) : .clear, radius: 18, y: 8)
+            .animation(.easeOut(duration: 0.16), value: isFocused)
     }
 }
 

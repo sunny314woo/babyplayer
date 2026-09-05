@@ -1,3 +1,4 @@
 // Safe committed defaults. A local optional file overrides only this app target.
 BABYPLAYER_ASR_API_TOKEN = XX_BABYPLAYER_API_TOKEN
+BABYPLAYER_PRODUCT_BUNDLE_IDENTIFIER = com.wufengyu.BabyPlayer
 #include? "BabyPlayerSecrets.xcconfig"
