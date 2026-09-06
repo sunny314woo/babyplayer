@@ -1,7 +1,9 @@
 import hashlib
 import hmac
 import logging
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -260,6 +262,80 @@ def create_app(
             subject_hash=subject_hash,
             request=request,
         )
+
+    @application.post(
+        "/v1/local-analysis/upload-jobs", response_model=LocalAnalysisJobResponse
+    )
+    def submit_uploaded_local_analysis(
+        media_fingerprint: str = Form(..., min_length=8, max_length=512),
+        media_title: str = Form("", max_length=500),
+        duration_seconds: float = Form(..., gt=0, le=1200),
+        force_refresh: bool = Form(False),
+        audio: UploadFile = File(...),
+        subject_hash: str = Depends(require_babyplayer_token),
+    ) -> dict:
+        """Accept one short-lived Apple TV M4A and run the full Mac quality path."""
+        if config.product_env == "production":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "LOCAL_ANALYSIS_DISABLED"},
+            )
+        if not config.provider_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "TENCENT_ASR_NOT_CONFIGURED"},
+            )
+
+        maximum_upload_bytes = 64 * 1024 * 1024
+        temporary_path: Path | None = None
+        handed_off = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="babyplayer-apple-tv-",
+                suffix=".m4a",
+                delete=False,
+            ) as destination:
+                temporary_path = Path(destination.name)
+                total = 0
+                while chunk := audio.file.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > maximum_upload_bytes:
+                        raise HTTPException(
+                            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            detail={
+                                "code": "UPLOADED_AUDIO_TOO_LARGE",
+                                "message": "Apple TV 提取的临时音频超过 64 MB",
+                            },
+                        )
+                    destination.write(chunk)
+            if total == 0 or temporary_path is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "code": "INVALID_AUDIO_SAMPLE",
+                        "message": "Apple TV 上传的临时音频为空",
+                    },
+                )
+            request = LocalAnalysisJobRequest(
+                media_fingerprint=media_fingerprint,
+                media_title=media_title,
+                media_path=str(temporary_path),
+                duration_seconds=duration_seconds,
+                song_start_seconds=0,
+                song_end_seconds=None,
+                force_refresh=force_refresh,
+            )
+            result = local_jobs.submit(
+                subject_hash=subject_hash,
+                request=request,
+                uploaded_source=temporary_path,
+            )
+            handed_off = True
+            return result
+        finally:
+            audio.file.close()
+            if temporary_path is not None and not handed_off:
+                temporary_path.unlink(missing_ok=True)
 
     @application.get(
         "/v1/local-analysis/jobs/{job_id}", response_model=LocalAnalysisJobResponse

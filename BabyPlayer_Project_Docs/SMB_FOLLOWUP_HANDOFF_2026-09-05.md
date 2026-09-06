@@ -1,6 +1,6 @@
 # BabyPlayer Samba 后续优化接力说明
 
-> 更新：2026-09-05
+> 更新：2026-09-06
 > 用户现场确认：Apple TV 显示光猫 U 盘媒体库，可从 BabyPlayer 首页正常起播。歌词、封面、进度/续播、喜欢/屏蔽和跳过已完成 Debug，当前测试可正常使用。
 > 统一现状见 `DEVELOPMENT_STATUS_2026-09-05.md`。
 
@@ -13,7 +13,7 @@
 - Samba 已进入正常 BabyPlayer 首页，使用原有全屏 `SystemPlayerView`；退出播放回 Samba 首页，不回设置页。
 - 家长设置中手工选中 Samba 或 Jennifer 后，最后选择持久为下次启动默认源。已有旧 SMB 成功配置而无 active-source key 的设备会一次性迁移到 Samba。
 - 当前 Debug 包已安装到“客厅” Apple TV 并正常启动；正常 App 路径日志已确认 `BABYPLAYER_SMB_HOME_RESULT ready count=78`。
-- Samba 卡片已恢复 Apple TV 本机的五帧抽取、质量评分和持久缓存；实体机日志已确认 `BABYPLAYER_SMB_COVER_RESULT ready=78 total=78`。
+- Samba 卡片已恢复 Apple TV 本机的五帧抽取与质量评分；候选帧只在选择过程中存在，最终只保存一张 640×360、JPEG 0.70 的压缩封面到 Apple TV 私有 Caches。
 - 旧 Jellyfin 媒体 ID 下保存的普通/DeepSeek/双语字幕，可在同一 Apple TV 上按唯一文件名迁移到新的 Samba 媒体 ID；重名时拒绝猜测。
 - 歌词/字幕、封面、本地进度/续播、喜欢/不喜欢/屏蔽、手工/智能片头片尾跳过已完成 Debug 功能验证。
 
@@ -26,25 +26,29 @@
 - `BabyPlayer/SpikeRootView.swift`：双轨根路由、Samba 正常首页、家长媒体源切换和返回路径。
 - `BabyPlayer/SpikeViewModel.swift` / `BabyPlayer/SystemPlayerView.swift`：播放队列增加延迟 Samba asset，播放器按当前条目创建并保持 loader。
 - `BabyPlayer/MediaCoverLoader.swift`：HTTP/本地/SMB 共用封面入口，五帧评分、本地缓存和串行去重预热。
+- `BabyPlayer/BabyPlayerASR.swift`：独立 Jennifer AI 服务地址、SMB asset 音频导出、file-backed multipart 上传与原 Mac job 轮询。
 - `BabyPlayer/LyricsRepository.swift`：Jellyfin → Samba 的本地字幕兼容迁移；DeepSeek 与中文翻译一并保留。
+- `BabyPlayerASRServer/app/main.py` / `local_analysis.py`：接收 Apple TV 的短命 M4A，然后交给已有 `LocalAnalysisJobManager` 质量链，没有另造 ASR 或 DeepSeek 实现。
 - `BabyPlayerTests/SMBSpikeTests.swift`：过滤、路径、range、默认源迁移和可选实时共享测试。
 
 ## 本轮已完成的后续修复
 
-1. Samba 封面接入原五帧抽取与评分算法；封面写入 Apple TV 的 Application Support，不依赖 Jennifer。预热串行执行，并与播放使用不同 SMB 会话，避免封面读取阻塞起播。
+1. Samba 封面接入原五帧抽取与评分算法；封面写入 Apple TV 已验证可写的私有 Caches，不依赖 Jennifer。预热串行执行，并与播放使用不同 SMB 会话，避免封面读取阻塞起播。旧代码向 Application Support 写入时吞掉了失败，会导致日志显示生成成功但真机容器没有封面文件；现已修正并保留旧目录的兼容读取。
 2. 新增原子冷启动索引。索引只保存媒体元数据和来源摘要，不保存密码；连接刷新失败时仍可先显示缓存卡片。
 3. 家长设置新增正式“编辑 Samba 连接”入口；儿童首页继续只显示内容。
 4. 切换 Jellyfin/Samba 后，本机已生成字幕使用保守的唯一文件名迁移键恢复；已有 DeepSeek/双语结果优先于普通在线歌词，不再被后到的普通候选覆盖。
 5. 两个 D3 reconciler 测试改为显式注入 mock analysis-service，不再依赖运行时配置，`notConfigured` 失败已消除。
 6. 默认配置不再携带明文 Samba 密码；实体机继续从 Keychain 读取已保存凭据。
+7. AI 服务地址已从当前媒体源拆开：旧设备首次从 Jennifer/Jellyfin host 迁移一次，后续切换到 Samba 不会把地址改成光猫。Mac 关机仍可播放和查看已有字幕，只有新 AI 任务会失败。
+8. Samba 新字幕不再要求 Mac 挂载 U 盘：Apple TV 用现有 SMB AVAsset 临时导出 M4A，以文件形式上传 `/v1/local-analysis/upload-jobs`；Mac 继续执行原来已打通的 FFmpeg、人声分离、VAD、腾讯 ASR、DeepSeek 和缓存链。上传音频与 multipart 临时文件在成功、失败或取消时删除。
+9. 封面键改为来源无关的本地 `contentID`，Jellyfin/Samba 可命中同一张封面；旧来源键命中时会迁移、压缩并删除旧封面。缓存文件名使用 SHA-256，不暴露媒体路径。
 
 ## 仍需继续验证/实现
 
-1. 现有 Mac ASR 音频提取仍假设 HTTP/本地 URL；Samba 播放不受影响，但对 Samba 文件手工生成全新字幕需增加 SMB asset 提取或云端适配。
-2. 目前是 Samba/Jennifer 两轨手工选择；多个 Samba 住宅 profile、可达性探测和自动切换尚未实现。
-3. 需继续执行冷/热起播、seek、暂停/恢复、切歌、睡眠、断网、拔盘、文件替换和内存矩阵。
-4. 公开发行前需完成 AMSMB2/libsmb2 许可证结论。
-5. 字幕、封面、进度和共享状态已完成自动化、实体容器回归及用户真机播放确认；若未来文件名变化或 Apple TV 缓存被清除，迁移仍不会猜测命中。
+1. 目前是 Samba/Jennifer 两轨手工选择；多个 Samba 住宅 profile、可达性探测和自动切换尚未实现。
+2. 需继续执行冷/热起播、seek、暂停/恢复、切歌、睡眠、断网、拔盘、文件替换和内存矩阵。
+3. 公开发行前需完成 AMSMB2/libsmb2 许可证结论。
+4. 字幕、封面、进度和共享状态已完成自动化、实体容器回归及用户真机播放确认；若未来文件名变化或 Apple TV 缓存被清除，迁移仍不会猜测命中。
 
 ## 测试状态
 
@@ -53,6 +57,9 @@
 - 字幕跨源迁移、重名拒绝和两个 D3 reconciler fixture 用例均已通过。
 - 2026-09-05 本轮全量 tvOS 模拟器测试通过；实体“客厅” Apple TV 已重新安装并验证 78 个媒体索引及 78/78 个本机封面。
 - 只读导出实体机 App 私有字幕目录核验：旧数据仍含 62 份 DeepSeek 结果和 59 份中文翻译；本轮已生成 2 份 `smb:` 迁移记录，两份均保留 DeepSeek、中文翻译及一致的英文内容哈希。字幕数据迁移和屏幕呈现已完成真机确认。
+- 2026-09-06 服务端全量 78 项测试通过；全量 tvOS 模拟器测试通过，包含 Samba 上传、跨源 ASR/封面键、限制和两个 D3 `notConfigured` 回归。
+- 2026-09-06 实体“客厅” Apple TV 端到端探针：`count=78 bytes=196608 playable=true playback_seconds=4.24 asr_upload_queued=true`；Jennifer `8011` 收到 `POST /v1/local-analysis/upload-jobs` 200，进入旧人声分离/VAD 链并按旧质量门对 3 秒无人声探针返回 `NO_VOCALS_DETECTED`，服务端上传临时文件剩余为 0。该探针使用独立测试指纹，不污染真实字幕。
+- 用户重新打开 Apple TV 后，2026-09-06 最新实时目录已从原冻结基线 78 项变为 81 项。新封面位置完整预热后，真机容器为 `count=81 sha256=81 bytes=3189438 dimensions=640x360`；只读导出全量核对 `invalid_dimensions=0`。重启 App 后立即得到 `ready=81 total=81`，证明不再重做五帧抽取。同次起播探针为 `playback_seconds=4.57`。
 
 ## 跨来源共享状态补充（2026-09-05）
 

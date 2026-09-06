@@ -41,12 +41,33 @@ class FakeProvider:
 class FakeLocalMediaExtractor:
     def __init__(self):
         self.calls = 0
+        self.upload_calls = 0
+        self.uploaded_paths = []
         self.audio = b"audio"
         self.media_content_sha256 = "source-content-hash"
 
     def extract(self, request):
         self.calls += 1
         assert request.media_path == "/allowed/song.mp4"
+        return ExtractedAudio(
+            data=self.audio,
+            duration_seconds=2.0,
+            media_content_sha256=self.media_content_sha256,
+            chunks=(AsrAudioChunk(
+                index=0,
+                offset_seconds=0,
+                duration_seconds=2,
+                audio=self.audio + b"-chunk",
+            ),),
+        )
+
+    def extract_uploaded(self, source_path, request):
+        self.upload_calls += 1
+        self.uploaded_paths.append(source_path)
+        assert source_path.is_file()
+        assert source_path.read_bytes() == b"apple-tv-m4a"
+        assert request.song_start_seconds == 0
+        assert request.duration_seconds == 2
         return ExtractedAudio(
             data=self.audio,
             duration_seconds=2.0,
@@ -293,6 +314,39 @@ def test_local_analysis_job_extracts_on_mac_and_reuses_cache(tmp_path) -> None:
     assert changed_finished["analysis"]["cache_hit"] is False
     assert changed_finished["analysis"]["media_content_sha256"] == "changed-source-content-hash"
     assert provider.calls == 2
+
+
+def test_uploaded_local_analysis_runs_same_job_and_deletes_temporary_audio(tmp_path) -> None:
+    """Samba 音频只短暂落盘，随后复用 Mac 完整分析任务并删除上传原件。"""
+    config = configured(tmp_path)
+    provider = FakeProvider()
+    extractor = FakeLocalMediaExtractor()
+    client = TestClient(create_app(
+        config,
+        provider_client=provider,
+        local_media_extractor=extractor,
+    ))
+    headers = {"Authorization": "Bearer test-babyplayer-token"}
+
+    submitted = client.post(
+        "/v1/local-analysis/upload-jobs",
+        headers=headers,
+        data={
+            "media_fingerprint": "media-samba-upload",
+            "media_title": "Samba Song",
+            "duration_seconds": "2",
+            "force_refresh": "false",
+        },
+        files={"audio": ("song.m4a", b"apple-tv-m4a", "audio/mp4")},
+    )
+
+    assert submitted.status_code == 200
+    finished = wait_for_local_job(client, headers, submitted.json()["job_id"])
+    assert finished["status"] == "completed"
+    assert finished["analysis"]["transcript"] == "twinkle twinkle little star"
+    assert extractor.upload_calls == 1
+    assert extractor.uploaded_paths
+    assert all(not path.exists() for path in extractor.uploaded_paths)
 
 
 def test_local_analysis_is_disabled_in_production(tmp_path) -> None:

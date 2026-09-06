@@ -6,6 +6,7 @@
 //
 
 import AVFoundation
+import CryptoKit
 import SwiftUI
 import UIKit
 
@@ -16,9 +17,55 @@ struct BabyPlayerCoverSource: @unchecked Sendable {
     let smbPlaybackResource: SMBPlaybackResource?
     let duration: TimeInterval?
     let cacheKey: String
+    /// 旧版本按来源保存的单张封面键；命中后会迁移并删除旧缓存文件。
+    let legacyCacheKeys: [String]
+
+    init(
+        providerImageURL: URL?,
+        videoURL: URL?,
+        smbPlaybackResource: SMBPlaybackResource?,
+        duration: TimeInterval?,
+        cacheKey: String,
+        legacyCacheKeys: [String] = []
+    ) {
+        self.providerImageURL = providerImageURL
+        self.videoURL = videoURL
+        self.smbPlaybackResource = smbPlaybackResource
+        self.duration = duration
+        self.cacheKey = cacheKey
+        self.legacyCacheKeys = legacyCacheKeys
+    }
 
     var viewIdentity: String {
         "\(cacheKey)|\(providerImageURL != nil)|\(videoURL != nil)|\(smbPlaybackResource != nil)"
+    }
+}
+
+enum BabyPlayerCoverCacheIdentity {
+    static func shared(contentID: String) -> String {
+        "content:v2:\(contentID)"
+    }
+
+    static func jellyfinLegacy(itemID: String) -> String {
+        "jellyfin:\(itemID)"
+    }
+
+    static func smbLegacy(
+        path: String,
+        fileSize: Int64,
+        modifiedAt: Date?
+    ) -> String {
+        let modifiedStamp = modifiedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown"
+        return "smb:v1:\(path)|\(fileSize)|\(modifiedStamp)"
+    }
+}
+
+/// 封面是可重建数据；tvOS 真机已验证 App 私有 Caches 可写且覆盖安装保留。
+enum BabyPlayerCoverStoragePolicy {
+    static func writableStorageBase(
+        fileManager: FileManager = .default
+    ) -> URL {
+        fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
     }
 }
 
@@ -58,20 +105,28 @@ private actor BabyPlayerCoverGenerationCoordinator {
 /// 生成并缓存本地视频封面；不会读取或写入媒体源的业务状态。
 enum BabyPlayerCoverGenerator {
     private static let cacheDirectoryURL: URL = {
-        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let baseURL = BabyPlayerCoverStoragePolicy.writableStorageBase()
         return baseURL.appendingPathComponent("BabyPlayer/Covers", isDirectory: true)
+    }()
+
+    /// 2026-09-06 以前的版本尝试写入此目录；部分 tvOS 环境未创建它。
+    /// 只作兼容读取，新封面始终写入已验证的 Caches。
+    private static let legacyApplicationSupportDirectoryURL: URL? = {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first?
+            .appendingPathComponent("BabyPlayer/Covers", isDirectory: true)
     }()
 
     /// 【MODIFIED】为无来源封面的媒体生成本地封面；扫描后可后台调用，卡片首次显示时也可调用。
     static func generate(for source: BabyPlayerCoverSource) async -> UIImage? {
-        if let cachedImage = loadCachedImage(for: source.cacheKey) {
+        if let cachedImage = loadCachedImage(for: source) {
             return cachedImage
         }
         return await BabyPlayerCoverGenerationCoordinator.shared.generate(for: source)
     }
 
     fileprivate static func generateUncached(for source: BabyPlayerCoverSource) async -> UIImage? {
-        if let cachedImage = loadCachedImage(for: source.cacheKey) {
+        if let cachedImage = loadCachedImage(for: source) {
             return cachedImage
         }
         let preparedSMBAsset = source.smbPlaybackResource?.makePreparedAsset()
@@ -97,10 +152,11 @@ enum BabyPlayerCoverGenerator {
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 800, height: 450)
+        generator.maximumSize = CGSize(width: 640, height: 360)
 
         let ratios = shuffledSampleRatios(seed: source.cacheKey)
-        var candidates: [(UIImage, Double)] = []
+        var bestCandidate: UIImage?
+        var bestScore = -Double.infinity
         for ratio in ratios {
             guard !Task.isCancelled else { return nil }
             let seconds = min(max(duration * ratio, 0.15), duration - 0.15)
@@ -109,17 +165,22 @@ enum BabyPlayerCoverGenerator {
                 let generated = try await generator.image(
                     at: CMTime(seconds: seconds, preferredTimescale: 600)
                 )
-                candidates.append((UIImage(cgImage: generated.image), score(generated.image)))
+                let candidateScore = score(generated.image)
+                if candidateScore > bestScore {
+                    bestScore = candidateScore
+                    bestCandidate = UIImage(cgImage: generated.image)
+                }
             } catch {
                 continue
             }
         }
 
-        guard let bestCandidate = candidates.max(by: { $0.1 < $1.1 })?.0 else {
+        guard let bestCandidate else {
             return nil
         }
-        saveCachedImage(bestCandidate, for: source.cacheKey)
-        return bestCandidate
+        let optimized = optimizedCover(bestCandidate)
+        _ = saveCachedImage(optimized, for: source.cacheKey)
+        return optimized
     }
 
     /// 【MODIFIED】扫描完成后预热所有缺少来源封面的项目；逐个处理，避免同时占满 Apple TV 解码资源。
@@ -186,8 +247,15 @@ enum BabyPlayerCoverGenerator {
         return exposureScore * 0.55 + contrastScore * 0.25 + saturationScore * 0.20
     }
 
-    /// 从稳定 key 得到文件名，避免媒体源 ID 直接出现在文件系统路径中。
+    /// 从稳定内容 key 得到 SHA-256 文件名，避免来源路径直接出现在文件系统中。
     private static func filename(for key: String) -> String {
+        SHA256.hash(data: Data(key.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined() + ".jpg"
+    }
+
+    /// 兼容 2026-08 版本的 FNV 文件名，只用于一次性读取迁移。
+    private static func legacyFilename(for key: String) -> String {
         var hash: UInt64 = 1_469_598_103_934_665_603
         for byte in key.utf8 {
             hash ^= UInt64(byte)
@@ -196,20 +264,106 @@ enum BabyPlayerCoverGenerator {
         return String(format: "%016llx.jpg", hash)
     }
 
-    private static func loadCachedImage(for key: String) -> UIImage? {
-        let url = cacheDirectoryURL.appendingPathComponent(filename(for: key))
-        return UIImage(contentsOfFile: url.path)
+    private static func loadCachedImage(for source: BabyPlayerCoverSource) -> UIImage? {
+        let currentURL = cacheDirectoryURL.appendingPathComponent(filename(for: source.cacheKey))
+        if let image = UIImage(contentsOfFile: currentURL.path) {
+            return image
+        }
+
+        var migrationURLs: [URL] = []
+        if let legacyApplicationSupportDirectoryURL {
+            migrationURLs.append(
+                legacyApplicationSupportDirectoryURL.appendingPathComponent(
+                    filename(for: source.cacheKey)
+                )
+            )
+        }
+        for legacyKey in source.legacyCacheKeys {
+            migrationURLs.append(
+                cacheDirectoryURL.appendingPathComponent(legacyFilename(for: legacyKey))
+            )
+            if let legacyApplicationSupportDirectoryURL {
+                migrationURLs.append(
+                    legacyApplicationSupportDirectoryURL.appendingPathComponent(
+                        legacyFilename(for: legacyKey)
+                    )
+                )
+            }
+        }
+
+        for legacyURL in migrationURLs {
+            guard let legacyImage = UIImage(contentsOfFile: legacyURL.path) else { continue }
+            let optimized = optimizedCover(legacyImage)
+            if saveCachedImage(optimized, for: source.cacheKey) {
+                try? FileManager.default.removeItem(at: legacyURL)
+            }
+            return optimized
+        }
+        return nil
     }
 
-    private static func saveCachedImage(_ image: UIImage, for key: String) {
-        guard let data = image.jpegData(compressionQuality: 0.86) else { return }
-        try? FileManager.default.createDirectory(
-            at: cacheDirectoryURL,
-            withIntermediateDirectories: true
-        )
-        let url = cacheDirectoryURL.appendingPathComponent(filename(for: key))
-        try? data.write(to: url, options: .atomic)
+    /// 只在原子写入成功后返回 true，迁移时据此决定能否删除旧文件。
+    @discardableResult
+    private static func saveCachedImage(_ image: UIImage, for key: String) -> Bool {
+        guard let data = image.jpegData(compressionQuality: 0.70) else { return false }
+        do {
+            try FileManager.default.createDirectory(
+                at: cacheDirectoryURL,
+                withIntermediateDirectories: true
+            )
+            let url = cacheDirectoryURL.appendingPathComponent(filename(for: key))
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
     }
+
+    /// 卡片最终只保存一张 16:9 小图；五张候选不会写盘，也不会在评分后继续占内存。
+    private static func optimizedCover(_ image: UIImage) -> UIImage {
+        let target = CGSize(width: 640, height: 360)
+        let sourceSize = image.size
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return image }
+        let scale = max(target.width / sourceSize.width, target.height / sourceSize.height)
+        let drawnSize = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
+        let origin = CGPoint(
+            x: (target.width - drawnSize.width) / 2,
+            y: (target.height - drawnSize.height) / 2
+        )
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        return UIGraphicsImageRenderer(size: target, format: format).image { context in
+            UIColor.black.setFill()
+            context.fill(CGRect(origin: .zero, size: target))
+            image.draw(in: CGRect(origin: origin, size: drawnSize))
+        }
+    }
+
+    #if DEBUG
+    /// 真机验收只汇总数量、像素和字节，不打印媒体标题、来源路径或缓存文件名。
+    static func debugCacheSummary() -> String {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: cacheDirectoryURL,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ))?.filter { $0.pathExtension.lowercased() == "jpg" } ?? []
+        var totalBytes = 0
+        var dimensions = Set<String>()
+        var sha256Names = 0
+        for url in urls {
+            totalBytes += (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if let image = UIImage(contentsOfFile: url.path) {
+                dimensions.insert("\(Int(image.size.width))x\(Int(image.size.height))")
+            }
+            let stem = url.deletingPathExtension().lastPathComponent
+            if stem.count == 64, stem.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) {
+                sha256Names += 1
+            }
+        }
+        return "count=\(urls.count) sha256=\(sha256Names) bytes=\(totalBytes) dimensions=\(dimensions.sorted().joined(separator: ","))"
+    }
+    #endif
 }
 
 /// 单张媒体卡片的封面状态；来源封面失败时自动切换到本地抽帧结果。

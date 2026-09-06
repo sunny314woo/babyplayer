@@ -549,15 +549,17 @@ SMB 没有 Jellyfin 封面时：
 3. 在视频 12%、30%、50%、70%、88% 位置沿用现有评分算法选择封面。
 4. 强 `contentIdentity` 已就绪时以它作为缓存 key；尚未就绪时暂用实例 `id`，强身份生成后通过 alias 迁移，不能阻塞首屏封面。
 5. 每次只生成一张封面；播放开始后暂停后台生成。
+6. 五张候选不落盘，遍历时只保留当前最佳帧；选定后统一缩放/裁切为 640×360，只落盘一张 JPEG 0.70 压缩成品。
+7. 当前已落地的兼容身份是 Apple TV 本地 `contentID`；Jellyfin/Samba 同一内容共用封面 key。缓存文件名是 key 的 SHA-256，它用于隐藏路径与稳定命名，不得误报为已完成的全视频强哈希。旧 Jellyfin/SMB 键命中后会重压缩、迁移并删除旧封面。
 
-可重建数据保存在 Caches：
+可重建数据中，以下仍保存在 Caches：
 
 - 媒体目录索引。
 - 文件 stat 信息。
 - 内容指纹。
-- 本地封面。
+- 媒体目录扫描中间状态。
 
-不可依赖 Caches 永久存在。被 tvOS 清理后，应用能够重新扫描和生成。
+已选定的单张压缩封面保存在 App 私有 Caches。2026-09-06 真机容器核对确认该目录可写且覆盖安装保留；旧 Application Support 写入在当前 tvOS 容器中未落盘，且错误被 `try?` 吞掉。新实现只在原子写入成功后才删除旧文件，并兼容读取旧目录。Caches 仍可被 tvOS 在存储压力下清理；封面始终是可重建数据，缺封面不得阻断浏览或播放。
 
 ## 10. 字幕和 AI 服务解耦
 
@@ -596,7 +598,7 @@ struct BabyPlayerAnalysisServiceProfile: Codable {
 
 ### 10.3 当前阶段行为
 
-- 在启用 SMB 产品入口之前，先把 `BabyPlayerServiceConfiguration` 改为直接读取独立的 analysis profile，不再从 Jellyfin host 推导地址；这项最小解耦属于 Phase B。
+- `BabyPlayerServiceConfiguration` 已使用独立的 `BabyPlayer.Runtime.AnalysisServiceAddress.v1`。现有设备在该键不存在时，仅从已配对 Jellyfin host 迁移一次 `:8011/v1`；之后媒体切源或 Jellyfin 地址变化不再覆盖 AI 地址。
 - Mac 在线：允许发起 ASR/DeepSeek。
 - Mac 离线：播放、已有字幕、本地歌本和 LRCLIB 普通歌词继续工作；新分析入口显示“电脑端字幕服务当前不可用”。
 - App 启动不等待 AI 服务健康检查，AI 失败不改变媒体源状态。
@@ -604,14 +606,15 @@ struct BabyPlayerAnalysisServiceProfile: Codable {
 
 ### 10.4 SMB 视频如何交给 Mac 分析
 
-现有 Mac job 依赖 `BabyPlayerQueueItem.localMediaPath`，SMB 文件在 Apple TV 上没有 Mac 本机路径。推荐分两阶段：
+现有 Mac job 依赖 `BabyPlayerQueueItem.localMediaPath`，SMB 文件在 Apple TV 上没有 Mac 本机路径。已落地为两种输入共用同一个后台任务管理器：
 
-1. SMB 首个可播放版本：复用已有字幕和普通歌词；暂不对 SMB 新视频发起本机 path job。
-2. 字幕兼容阶段：Apple TV 通过 SMB asset 临时提取所需 M4A 音频片段，调用现有 `/analyze` 上传接口。Mac 只接收短命音频，不需要挂载路由器 U 盘。
+1. Jellyfin 继续提交 Mac 白名单内的本机 path job，行为不变。
+2. Samba 由 Apple TV 通过现有 `SMBPlaybackResource`/AVAsset 临时导出歌曲 M4A，提交 `/v1/local-analysis/upload-jobs`。Mac 只接收短命音频，不需要挂载路由器 U 盘。
+3. 上传入口只是 `LocalAnalysisJobManager` 的新 adapter；音频仍交给原 FFmpeg、人声分离、Silero VAD、Voice Window Planner、腾讯分片 ASR、DeepSeek reconciler、SQLite 缓存和导出产物链，不复制任何识别/校准逻辑。
 
-沿用现有 `/v1/analyze` 合同：Bearer token；`multipart/form-data` 中包含 `operation_id`、`media_fingerprint`、`media_title`、`duration_seconds`、`voice_format=m4a`、`force_refresh` 和 `audio`；响应仍解码为 `BabyPlayerASRAnalysis`。客户端把每个上传单元限制为不超过 20 分钟且不超过 32 MiB，超出时按现有 segment policy 分段。Phase F 必须把当前 `Data(contentsOf:)` 拼装 multipart body 改为 file-backed/streamed upload，避免音频与请求体同时常驻内存。临时 M4A 和 multipart 文件在成功、失败或取消后立即删除；App 启动时清理残留超过 1 小时的 `BabyPlayer-ASR-Segments` 文件。服务端任务只保留结果缓存，不把上传音频当永久媒体库。
+新合同仍使用 Bearer token；`multipart/form-data` 包含 `media_fingerprint`、`media_title`、`duration_seconds`、`force_refresh` 和 `audio`，立即返回与 path job 相同的 job ID，Apple TV 继续轮询 `/v1/local-analysis/jobs/{job_id}`。客户端和服务端均限制不超过 20 分钟、64 MiB；multipart 请求体在 Apple TV 临时文件中构建，并使用 file-backed `URLSession.upload(fromFile:)`，服务端以 1 MiB 块流式写入临时文件。成功、失败、取消和活跃 job 去重均删除本次上传。服务端不把上传原件当作永久媒体库。
 
-代码中已经保留 `BabyPlayerASRAudioSegmentPreparer` 和 `/analyze` 上传路径，可以复用；只需让 ASR coordinator 根据媒体的 `analysisInput` 选择“Mac 本机 path job”或“客户端提取并上传”。
+`BabyPlayerASRCoordinator` 已根据 `localMediaPath` 选择“Mac 本机 path job”或“Apple TV 提取并上传”。ASR/DeepSeek/中文翻译的最终结果继续由现有播放器 workflow 写回 Apple TV `BabyLyricsRepository`，键为来源无关的 `sharedContentID`。
 
 未来迁移云端时，继续复用同一上传接口和 `BabyPlayerAnalysisServiceProfile`，不再修改媒体 provider。
 
@@ -828,8 +831,8 @@ enum MediaSourceFailure: Error, Equatable {
 
 ### Phase F：SMB 的 Mac 字幕上传与云端预留
 
-- SMB 视频使用 Apple TV 临时音频提取 + `/analyze` 上传。
-- 落实 20 分钟/32 MiB 单元上限、取消删除和启动残留清理。
+- SMB 视频已使用 Apple TV 临时音频提取 + `/v1/local-analysis/upload-jobs`上传，并复用原 Mac job 轮询与质量链。
+- 已落实 20 分钟/64 MiB 单元上限、file-backed 上传和正常/失败/取消删除。
 - Mac 离线时降级但不阻断播放。
 - 保持未来 cloud baseURL 替换能力。
 

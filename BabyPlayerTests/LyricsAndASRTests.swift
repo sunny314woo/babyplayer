@@ -48,6 +48,51 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertEqual(duplicates["smb:/b/song.mp4"], "smb:/b/song.mp4")
     }
 
+    func testSharedContentIdentityAlsoSharesASRAndCoverKeysAcrossSources() throws {
+        let contentID = try XCTUnwrap(
+            BabyPlayerLocalMediaMigrationKey.make(fileNameOrPath: "Open Shut Them.mp4")
+        )
+        let jellyfin = LyricsMediaDescriptor(
+            id: "jellyfin-item",
+            title: "Open Shut Them",
+            searchTitle: "Open Shut Them",
+            artistName: nil,
+            sourceHint: nil,
+            versionHint: nil,
+            durationSeconds: 125,
+            songStartSeconds: 5,
+            songEndSeconds: 120,
+            mediaSourceID: "jellyfin-media-source",
+            localMediaMigrationKey: contentID
+        )
+        let samba = LyricsMediaDescriptor(
+            id: "smb:/sss73/Open Shut Them.mp4",
+            title: "Open Shut Them",
+            searchTitle: "Open Shut Them",
+            artistName: nil,
+            sourceHint: nil,
+            versionHint: nil,
+            durationSeconds: nil,
+            songStartSeconds: nil,
+            songEndSeconds: nil,
+            mediaSourceID: "smb:/sss73/Open Shut Them.mp4",
+            localMediaMigrationKey: contentID
+        )
+
+        XCTAssertEqual(jellyfin.asrFingerprint, samba.asrFingerprint)
+        XCTAssertEqual(
+            BabyPlayerCoverCacheIdentity.shared(contentID: jellyfin.sharedContentID),
+            BabyPlayerCoverCacheIdentity.shared(contentID: samba.sharedContentID)
+        )
+    }
+
+    func testCoverStorageUsesWritableCachesDirectory() {
+        let base = BabyPlayerCoverStoragePolicy.writableStorageBase()
+
+        XCTAssertEqual(base.lastPathComponent, "Caches")
+        XCTAssertFalse(base.path.contains("Application Support"))
+    }
+
     func testContentIdentityMigratesRatingsBlocksAndResume() throws {
         let contentID = try XCTUnwrap(
             BabyPlayerLocalMediaMigrationKey.make(fileNameOrPath: "Song.mp4")
@@ -829,6 +874,71 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertNotEqual(completed.analysis?.evidenceHash, "video-content-hash")
     }
 
+    func testSambaAnalysisUploadsTemporaryM4AIntoMacBackgroundJob() async throws {
+        let capture = BabyPlayerMockRequestCapture()
+        BabyPlayerMockURLProtocol.setHandler { request in
+            let body = try requestBodyData(request)
+            capture.record(request, body: body)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (
+                response,
+                Data(#"{"job_id":"upload-job-1","status":"queued","message":"任务已提交到 Mac"}"#.utf8)
+            )
+        }
+        defer { BabyPlayerMockURLProtocol.setHandler(nil) }
+
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BabyPlayer-Upload-Test-\(UUID().uuidString).m4a")
+        let audio = Data("temporary-samba-audio".utf8)
+        try audio.write(to: temporaryURL)
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BabyPlayerMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        let client = BabyPlayerASRClient(
+            baseURL: URL(string: "http://192.168.3.33:8011/v1")!,
+            apiToken: "mock-token",
+            session: session
+        )
+
+        let job = try await client.submitUploadedAnalysis(
+            sampleURL: temporaryURL,
+            durationSeconds: 120,
+            fileSize: Int64(audio.count),
+            mediaFingerprint: "shared-media-fingerprint",
+            mediaTitle: "Open Shut Them",
+            forceRefresh: true
+        )
+
+        XCTAssertEqual(job.jobID, "upload-job-1")
+        XCTAssertEqual(capture.path, "/v1/local-analysis/upload-jobs")
+        XCTAssertEqual(capture.authorization, "Bearer mock-token")
+        XCTAssertTrue(capture.bodyText.contains("shared-media-fingerprint"))
+        XCTAssertTrue(capture.bodyText.contains("temporary-samba-audio"))
+        XCTAssertTrue(capture.bodyText.contains("name=\"force_refresh\""))
+    }
+
+    func testUploadedAnalysisPolicyKeepsMacTransferBounded() {
+        XCTAssertNoThrow(try BabyPlayerUploadedAnalysisPolicy.validate(
+            durationSeconds: 180,
+            fileSize: 4 * 1024 * 1024
+        ))
+        XCTAssertThrowsError(try BabyPlayerUploadedAnalysisPolicy.validate(
+            durationSeconds: 1201,
+            fileSize: 4 * 1024 * 1024
+        ))
+        XCTAssertThrowsError(try BabyPlayerUploadedAnalysisPolicy.validate(
+            durationSeconds: 180,
+            fileSize: 65 * 1024 * 1024
+        ))
+    }
+
     /// 验证 ASR 计划只包含临时短分段；输入为 320 秒歌曲，输出为多个不超过集中时长的 segment，不修改状态。
     // 【MODIFIED】Tencent ASR 不得再等待完整歌曲 M4A 建立完成。
     func testASRPlanningUsesTemporarySegmentsInsteadOfCompleteM4A() {
@@ -875,6 +985,12 @@ final class LyricsAndASRTests: XCTestCase {
         XCTAssertNil(BabyPlayerServiceConfiguration.localBaseURL(
             forJellyfinServerAddress: "https://player.example.test"
         ))
+        XCTAssertEqual(
+            BabyPlayerServiceConfiguration.localBaseURL(
+                forAnalysisServiceAddress: "http://jennifer.local:8011/v1"
+            )?.absoluteString,
+            "http://jennifer.local:8011/v1"
+        )
     }
 
     /// 验证第一段可独立成为一次识别工作；输入为 150 秒歌曲，输出第一段元数据，不依赖后续 segment 或完整音频状态。

@@ -64,7 +64,7 @@ Apple TV → Samba       成功
 
 ## 2026-09-05 后续回归
 
-- Samba 首页已重新接入原有的本机五帧抽取、画面质量评分和 Application Support 封面缓存；“客厅” Apple TV 日志确认 `ready=78 total=78`。
+- Samba 首页已重新接入原有的本机五帧抽取与画面质量评分；“客厅” Apple TV 日志曾确认 `ready=78 total=78`。后续容器核对发现旧 Application Support 写入错误被 `try?` 静默吞掉，日志不等于已落盘；2026-09-06 已改用真机验证可写的 App 私有 Caches，并增加直接容器验收。
 - 冷启动媒体索引已落地：先显示本机缓存，再连接共享刷新；索引不包含密码并按 Samba 来源隔离。
 - 家长设置已增加正式的 Samba 连接编辑入口。
 - 切换来源后，旧 Jellyfin ID 下的普通、DeepSeek 和中文翻译结果会在文件名唯一匹配时迁移到 Samba ID；普通在线歌词不会再覆盖已落盘的 DeepSeek/双语结果。
@@ -72,3 +72,13 @@ Apple TV → Samba       成功
 - 新 Debug 包已部署到实体“客厅” Apple TV；扫描和全部封面已验证。只读容器核验还确认旧 62 份 DeepSeek、59 份中文翻译没有丢失，并已有 2 份真实 `smb:` 记录成功携带双语结果。屏幕字幕呈现仍需用户打开其中一部影片做最后肉眼确认。
 - 后续已将评分、偏好、屏蔽、续播、歌词/双语字幕、人工校时和智能片头片尾统一到来源无关内容 ID。真机确认 Jellyfin/Samba 共 156 条来源别名，10 条现有内容偏好全部迁移，遗留来源评分为 0；两个屏蔽和续播状态均保留。
 - 定时关闭、手工片头/片尾和字幕显示模式继续共用同一份全局设置；修复了中文/双语模式在重启后回退英文的问题。
+
+## 2026-09-06 AI 回传与封面缓存回归
+
+- Jennifer AI 地址已从活动媒体源解耦；旧配置仅首次从 Jellyfin host 迁移，切到 Samba 后仍连 Mac `8011/v1`，不会误连光猫。
+- Apple TV 通过现有 SMB AVAsset 临时导出 M4A，以 file-backed multipart 提交 `/v1/local-analysis/upload-jobs`。服务端只新增了上传桥接，之后进入原 `LocalAnalysisJobManager`，继续复用原有 FFmpeg、人声分离、VAD、腾讯 ASR、DeepSeek、SQLite 缓存和 SRT 链路。
+- Mac 不需要挂载 Samba U 盘，也不会成为浏览/播放依赖；Mac 离线只影响“新建 AI 字幕”，Apple TV 中已有的普通、DeepSeek 和双语字幕继续可用。
+- 真机探针在 78 项 Samba 库上完成 3 秒 M4A 导出和上传，Jennifer 返回 200 并进入原人声质量链；无人声样本按原规则终止为 `NO_VOCALS_DETECTED`，没有额外调用 ASR/DeepSeek，上传临时文件已清理。
+- 封面仍从 12%/30%/50%/70%/88% 五个视频位置评分，但内存中只保留当前最佳候选，落盘时只保存一张 640×360、JPEG 0.70 成品。Jellyfin/Samba 以相同本地 `contentID` 共用封面，旧来源键会自动迁移并删除旧文件。
+- 服务端 78 项测试与全量 tvOS 模拟器测试通过；两个 D3 `notConfigured` 回归均通过。
+- 用户重新打开“客厅”后，光猫共享最新实时扫描为 81 个真实视频（原 78 项冻结基线仍保留作为历史测量）。App 私有 Caches 有且仅有 81 张 SHA-256 命名 JPEG，全部 640×360，文件字节合计 3,189,438；重启后立即完成 `ready=81 total=81`。

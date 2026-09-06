@@ -1,7 +1,8 @@
-"""Mac 本地媒体分析任务。
+"""Mac 媒体分析任务。
 
-Apple TV 只提交 Jellyfin 返回的本机路径；本模块校验目录边界、调用本机 FFmpeg，
-再复用现有 ASR 服务。任务在后台线程运行，不占用 Apple TV 的播放线程。
+Jellyfin 项目可提交白名单内的 Mac 本机路径；Samba 项目可提交由 Apple TV 临时
+提取的 M4A。两条入口复用同一套 FFmpeg、人声分离、VAD、分片 ASR 与缓存流程。
+任务在后台线程运行，不占用 Apple TV 的播放线程。
 """
 
 from __future__ import annotations
@@ -450,6 +451,29 @@ class LocalMediaAudioExtractor:
 
     def extract(self, request: LocalAnalysisJobRequest) -> ExtractedAudio:
         source = self._validated_source(request.media_path)
+        return self._extract_source(source, request)
+
+    def extract_uploaded(
+        self,
+        source_path: Path,
+        request: LocalAnalysisJobRequest,
+    ) -> ExtractedAudio:
+        """Analyze only a server-created upload, without widening media root access."""
+        try:
+            source = source_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise LocalMediaValidationError("Mac 找不到 Apple TV 上传的临时音频") from exc
+        if not source.is_file() or source.suffix.lower() not in ALLOWED_MEDIA_EXTENSIONS:
+            raise LocalMediaValidationError("Apple TV 上传的音频格式不受支持")
+        # 上传 M4A 远小于原视频，先算强哈希即可在强制刷新时复用昂贵的人声分离/VAD。
+        self.content_hash_cache.compute(source)
+        return self._extract_source(source, request)
+
+    def _extract_source(
+        self,
+        source: Path,
+        request: LocalAnalysisJobRequest,
+    ) -> ExtractedAudio:
         media_duration = request.duration_seconds
         timeline_start = request.song_start_seconds
         timeline_end = request.song_end_seconds or media_duration
@@ -966,12 +990,15 @@ class LocalAnalysisJobManager:
         *,
         subject_hash: str,
         request: LocalAnalysisJobRequest,
+        uploaded_source: Path | None = None,
     ) -> dict:
         key = (subject_hash, request.media_fingerprint)
         with self._lock:
             if not request.force_refresh:
                 active_id = self._active.get(key)
                 if active_id and active_id in self._jobs:
+                    if uploaded_source is not None:
+                        uploaded_source.unlink(missing_ok=True)
                     return dict(self._jobs[active_id])
             job_id = uuid.uuid4().hex
             response = {
@@ -987,7 +1014,7 @@ class LocalAnalysisJobManager:
 
         thread = threading.Thread(
             target=self._run,
-            args=(job_id, key, subject_hash, request),
+            args=(job_id, key, subject_hash, request, uploaded_source),
             name=f"babyplayer-local-asr-{job_id[:8]}",
             daemon=True,
         )
@@ -1007,6 +1034,7 @@ class LocalAnalysisJobManager:
         key: tuple[str, str],
         subject_hash: str,
         request: LocalAnalysisJobRequest,
+        uploaded_source: Path | None,
     ) -> None:
         self._work_slots.acquire()
         try:
@@ -1016,7 +1044,10 @@ class LocalAnalysisJobManager:
                 else "Mac 正在从原视频提取音频"
             )
             self._update(job_id, status="extracting", message=extraction_message)
-            extracted = self.extractor.extract(request)
+            if uploaded_source is None:
+                extracted = self.extractor.extract(request)
+            else:
+                extracted = self.extractor.extract_uploaded(uploaded_source, request)
             self._update(job_id, status="recognizing", message="腾讯 ASR 正在识别")
             if extracted.chunks:
                 result = self.service.analyze_chunked(
@@ -1074,6 +1105,8 @@ class LocalAnalysisJobManager:
                 message=message,
             )
         finally:
+            if uploaded_source is not None:
+                uploaded_source.unlink(missing_ok=True)
             with self._lock:
                 if self._active.get(key) == job_id:
                     self._active.pop(key, None)

@@ -1,10 +1,10 @@
 # BabyPlayer
 
-BabyPlayer 是一个给 Apple TV 使用的儿童音乐视频播放器。它从家里电脑上的 Jellyfin 读取“音乐视频”库，在电视上显示封面、播放视频，并在本机缓存在线同步歌词。
+BabyPlayer 是一个给 Apple TV 使用的儿童音乐视频播放器。它可从家里电脑上的 Jellyfin，或从同局域网的 Samba U 盘读取视频，在电视上显示封面、播放视频，并在 Apple TV 保存歌词与已生成的双语字幕。
 
 当前版本的主要能力：
 
-- 从 Jellyfin 的“音乐视频”库浏览并播放儿童音乐视频；
+- 从 Jellyfin 的“音乐视频”库或 Samba U 盘浏览并播放儿童音乐视频；
 - 普通同步歌词、ASR 识别歌词、DeepSeek 歌词校准，以及按已有结果生成简体中文双语字幕；
 - 播放页和家长设置中的双语菜单：可自动按“双语优先”选择，也可手动切换英文、中文、双语或关闭；
 - 识别到可信人声边界后，按歌曲保存智能跳过片头/片尾的设置；没有分析结果时仍可使用 Jellyfin 章节或家长手工秒数。
@@ -12,12 +12,12 @@ BabyPlayer 是一个给 Apple TV 使用的儿童音乐视频播放器。它从�
 简单理解：
 
 ```text
-电脑：运行 Jellyfin，保存和管理视频
-Apple TV：安装 BabyPlayer，浏览和播放视频
-互联网：BabyPlayer 从 LRCLIB 搜索同步歌词；可选通过独立 ASR 服务做人声识别、歌词校准和翻译
+视频源：Jellyfin，或光猫/路由器上的 Samba U 盘
+Apple TV：安装 BabyPlayer，直接浏览和播放当前媒体源
+Jennifer/Mac：只在家长主动生成新 AI 字幕时执行原 ASR/DeepSeek 流程
 ```
 
-Jellyfin 不需要、也不能作为服务器安装在 Apple TV 上。平时播放时，电脑和 Jellyfin 需要保持开机运行。
+Jellyfin 不需要、也不能作为服务器安装在 Apple TV 上。选择 Samba 时，平时浏览和播放不需要 Mac/Jennifer 开机；只有新的 AI 字幕任务需要 Jennifer。
 
 ## 一、准备 Jellyfin
 
@@ -275,18 +275,14 @@ ASR、DeepSeek 和固定的普通歌词可以共存并反复切换。DeepSeek �
 BabyPlayer Bearer Token；该文件已被 Git 忽略。腾讯与 DeepSeek 密钥只填入这台 Mac 的
 `BabyPlayerASRServer/.env`，不进入 Apple TV 安装包。
 
-- `8011/v1` 不是 Debug 补丁，而是 Debug 与 Release 共用的正式 Mac 本地 AI 服务入口。
-  App 不保存固定 ASR IP，也不配置 VPS Base URL。
-- Apple TV 会从当前已配对的 Jellyfin 地址只取主机名：若 Jellyfin 是
-  `http://192.168.1.14:8096`，ASR、DeepSeek 和翻译自动使用
-  `http://192.168.1.14:8011/v1`。没有任何静默 VPS 回退。
-- 更换 Wi-Fi 或路由器时，先用 `ipconfig getifaddr en0` 查看 Mac 新 IP，再仅更新并重新配对
-  Apple TV 中的 Jellyfin `:8096` 地址；AI 服务会同步换到同一主机的 `:8011/v1`，无需改工程配置。
+- `8011/v1` 不是 Debug 补丁，而是 Debug 与 Release 共用的正式 Mac 本地 AI 服务入口；没有任何静默 VPS 回退。
+- AI 服务地址与当前媒体源分开保存。旧用户首次升级时，仅从已配对 Jellyfin host 迁移一次 `:8011/v1`；之后切换 Jellyfin/Samba 不会改写 Jennifer 地址。
+- Samba 做新 AI 字幕时，Apple TV 只上传临时 M4A，Jennifer 继续走既有的人声分离、VAD、腾讯 ASR 和 DeepSeek 链。完成的 ASR/DeepSeek/双语结果依旧回存 Apple TV，不要求 Mac 挂载 U 盘。
 - 首次配置 Mac 后运行 `BabyPlayerASRServer/scripts/install-local-development-service.sh`，让
   `8011` 服务随登录启动并在异常退出后自动恢复。`-1004` 表示 Apple TV 无法连接 Mac 的
   `8011`，应检查同一局域网、LaunchAgent、防火墙和路由器客户端隔离。
-- Apple TV 不建立永久音频库。双语字幕、人工绑定和片头片尾结果会按媒体 ID/内容指纹写入
-  tvOS 私有 Caches；正常退出设置、播放或覆盖安装不会重新生成。Mac 本地 SQLite 同时保存
+- Apple TV 不建立永久音频库。双语字幕、人工绑定和片头片尾结果会按来源无关的本地 `contentID` 写入
+  tvOS 私有存储；正常退出设置、播放或覆盖安装不会重新生成。Mac 本地 SQLite 同时保存
   可重建的 ASR/DeepSeek 结果；只有卸载 App 或 tvOS 清理 Caches 时，电视副本才可能需要恢复。
 - Mac 本地服务不保存 Jellyfin URL。ASR 模块缓存不可逆指纹、转写文字与时间戳；D3 缓存最终
   AI Lyrics。D3 缓存现已绑定实际 ASR word timeline/VAD 标记和候选内容哈希，
@@ -301,9 +297,7 @@ BabyPlayer Bearer Token；该文件已被 Git 忽略。腾讯与 DeepSeek 密钥
 
 ### 智能跳过片头片尾
 
-当一次声音分析得到可信的首句和末句人声位置后，BabyPlayer 会保存保守的智能边界，并在
-该歌曲的“AI 功能”菜单中显示“智能跳过片头片尾”。每首歌默认开启；家长可以在播放页
-对当前歌曲单独关闭或重新开启，选择会持久保存。
+当一次声音分析得到可信的首句和末句人声位置后，BabyPlayer 会保存保守的智能边界。是否采用 AI 边界由播放器“倍速”菜单顶部的“智能跳过片头片尾”控制；该开关是 Apple TV 本机全局偏好，Jellyfin、Samba 和后续媒体源共用，切源和重启后保持。
 
 边界的优先级如下：
 
@@ -312,7 +306,7 @@ BabyPlayer Bearer Token；该文件已被 Git 忽略。腾讯与 DeepSeek 密钥
 3. 家长设置中的“手工片头（备用）”和“手工片尾（备用）”。
 
 智能边界只影响播放起点和接近片尾时的自动结束，不会重复叠加到歌词时间轴。重新分析或
-媒体时长发生明显变化时，旧边界会被拒绝；如果分析不足以确认边界，则不显示智能跳过开关。
+媒体时长发生明显变化时，旧边界会被拒绝。即使当前视频尚无分析边界，全局开关仍固定可见；关闭不删除已分析结果，重新开启即可恢复。
 
 本地开发模式可在 `BabyPlayerASRServer/LyricsTestOutputs/` 保存完整提取音频、ASR/DeepSeek JSON
 和 SRT。该目录已被 Git 忽略，但包含媒体和歌词内容，只应用于受控调试并定期清理。

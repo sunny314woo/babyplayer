@@ -15,6 +15,7 @@ import SwiftUI
 enum SMBSpikeLaunchProbe {
     private static let enabledEnvironmentKey = "BABYPLAYER_SMB_SPIKE_AUTOPROBE"
     private static let passwordEnvironmentKey = "BABYPLAYER_SMB_SPIKE_PASSWORD"
+    private static let asrUploadEnvironmentKey = "BABYPLAYER_SMB_ASR_UPLOAD_PROBE"
 
     static func runIfRequested() async {
         let environment = ProcessInfo.processInfo.environment
@@ -30,6 +31,7 @@ enum SMBSpikeLaunchProbe {
 
         print("BABYPLAYER_SMB_SPIKE_RESULT started")
         var stage = "configuration"
+        var asrUploadQueued = false
 
         do {
             stage = "client"
@@ -61,11 +63,70 @@ enum SMBSpikeLaunchProbe {
                 throw SMBSpikeLaunchProbeError.playbackDidNotAdvance
             }
 
+            if environment[asrUploadEnvironmentKey] == "1" {
+                stage = "asr_audio_extraction"
+                let probeDuration = min(3, durationSeconds)
+                let probeStart = min(
+                    max(0, durationSeconds * 0.30),
+                    max(0, durationSeconds - probeDuration)
+                )
+                let probeID = "smb-asr-probe-\(UUID().uuidString)"
+                let descriptor = LyricsMediaDescriptor(
+                    id: probeID,
+                    title: "Samba ASR Probe",
+                    searchTitle: "Samba ASR Probe",
+                    artistName: nil,
+                    sourceHint: nil,
+                    versionHint: nil,
+                    durationSeconds: durationSeconds,
+                    songStartSeconds: probeStart,
+                    songEndSeconds: probeStart + probeDuration,
+                    mediaSourceID: probeID,
+                    localMediaMigrationKey: nil
+                )
+                let queueItem = BabyPlayerQueueItem(
+                    id: probeID,
+                    preferenceID: probeID,
+                    title: descriptor.title,
+                    url: URL(string: "babyplayer-smb://probe/\(UUID().uuidString)")!,
+                    smbPlaybackResource: SMBPlaybackResource(client: client, item: items[0]),
+                    lyricsMedia: descriptor,
+                    localMediaPath: nil,
+                    chapterIntroEndSeconds: nil,
+                    chapterOutroStartSeconds: nil,
+                    smartIntroEndSeconds: nil,
+                    smartOutroStartSeconds: nil
+                )
+                let prepared = try await BabyPlayerASRAudioSegmentPreparer.shared
+                    .prepareCompleteSong(item: queueItem)
+                do {
+                    stage = "asr_upload"
+                    let job = try await BabyPlayerASRClient().submitUploadedAnalysis(
+                        sampleURL: prepared.fileURL,
+                        durationSeconds: prepared.generatedDurationSeconds,
+                        fileSize: prepared.fileSize,
+                        mediaFingerprint: descriptor.asrFingerprint,
+                        mediaTitle: descriptor.searchTitle,
+                        forceRefresh: true
+                    )
+                    await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
+                    asrUploadQueued = ["queued", "extracting", "recognizing", "completed"]
+                        .contains(job.status)
+                    guard asrUploadQueued else {
+                        throw SMBSpikeLaunchProbeError.asrUploadNotQueued
+                    }
+                } catch {
+                    await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
+                    throw error
+                }
+            }
+
             await client.disconnect()
             print(
                 "BABYPLAYER_SMB_SPIKE_RESULT success " +
                 "count=\(items.count) bytes=\(rangeReport.bytesRead) " +
-                "playable=true playback_seconds=\(String(format: "%.2f", playbackSeconds))"
+                "playable=true playback_seconds=\(String(format: "%.2f", playbackSeconds)) " +
+                "asr_upload_queued=\(asrUploadQueued)"
             )
         } catch {
             let cocoaError = error as NSError
@@ -80,6 +141,7 @@ enum SMBSpikeLaunchProbe {
 private enum SMBSpikeLaunchProbeError: Error {
     case assetNotPlayable
     case playbackDidNotAdvance
+    case asrUploadNotQueued
 }
 #endif
 
@@ -97,11 +159,13 @@ final class SMBHomeViewModel: ObservableObject {
     private var operationTask: Task<Void, Never>?
     private var coverPrewarmTask: Task<Void, Never>?
     private var playbackPreparationTask: Task<Void, Never>?
+    private var coverContentIDs: [String: String] = [:]
 
     init() {
         let configuration = SMBSpikeConfigurationStore.load()
         if let cachedItems = SMBSpikeLibraryIndexStore.load(configuration: configuration) {
             mediaItems = cachedItems
+            updateCoverContentIDs(for: cachedItems)
             statusText = "已显示 \(cachedItems.count) 个缓存视频，正在连接 Samba 刷新…"
         }
     }
@@ -130,6 +194,7 @@ final class SMBHomeViewModel: ObservableObject {
                 self.libraryClient = libraryClient
                 self.playbackClient = playbackClient
                 self.mediaItems = items
+                self.updateCoverContentIDs(for: items)
                 self.statusText = "光猫 U 盘 · Samba · \(items.count) 个视频"
                 self.prewarmCovers(for: items, client: libraryClient)
                 #if DEBUG
@@ -259,12 +324,16 @@ final class SMBHomeViewModel: ObservableObject {
     }
 
     func coverSource(for item: SMBSpikeMediaItem) -> BabyPlayerCoverSource {
+        let sourceID = Self.sourceID(for: item)
         return BabyPlayerCoverSource(
             providerImageURL: nil,
             videoURL: nil,
             smbPlaybackResource: libraryClient.map { SMBPlaybackResource(client: $0, item: item) },
             duration: nil,
-            cacheKey: Self.coverCacheKey(for: item)
+            cacheKey: BabyPlayerCoverCacheIdentity.shared(
+                contentID: coverContentIDs[sourceID] ?? sourceID
+            ),
+            legacyCacheKeys: [Self.legacyCoverCacheKey(for: item)]
         )
     }
 
@@ -282,12 +351,16 @@ final class SMBHomeViewModel: ObservableObject {
     private func prewarmCovers(for items: [SMBSpikeMediaItem], client: SMBSpikeClient) {
         coverPrewarmTask?.cancel()
         let sources = items.map { item in
+            let sourceID = Self.sourceID(for: item)
             return BabyPlayerCoverSource(
                 providerImageURL: nil,
                 videoURL: nil,
                 smbPlaybackResource: SMBPlaybackResource(client: client, item: item),
                 duration: nil,
-                cacheKey: Self.coverCacheKey(for: item)
+                cacheKey: BabyPlayerCoverCacheIdentity.shared(
+                    contentID: coverContentIDs[sourceID] ?? sourceID
+                ),
+                legacyCacheKeys: [Self.legacyCoverCacheKey(for: item)]
             )
         }
         coverPrewarmTask = Task.detached(priority: .utility) {
@@ -305,13 +378,31 @@ final class SMBHomeViewModel: ObservableObject {
             }
             #if DEBUG
             print("BABYPLAYER_SMB_COVER_RESULT ready=\(readyCount) total=\(sources.count)")
+            print("BABYPLAYER_SMB_COVER_CACHE \(BabyPlayerCoverGenerator.debugCacheSummary())")
             #endif
         }
     }
 
-    private static func coverCacheKey(for item: SMBSpikeMediaItem) -> String {
-        let modifiedStamp = item.modifiedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "unknown"
-        return "smb:v1:\(item.path)|\(item.fileSize)|\(modifiedStamp)"
+    private func updateCoverContentIDs(for items: [SMBSpikeMediaItem]) {
+        coverContentIDs = BabyPlayerContentIdentityResolver.mappings(for: items.map {
+            BabyPlayerContentIdentityInput(
+                sourceID: Self.sourceID(for: $0),
+                displayName: $0.displayName,
+                fileNameOrPath: $0.name
+            )
+        })
+    }
+
+    private static func sourceID(for item: SMBSpikeMediaItem) -> String {
+        "smb:\(item.path)"
+    }
+
+    private static func legacyCoverCacheKey(for item: SMBSpikeMediaItem) -> String {
+        BabyPlayerCoverCacheIdentity.smbLegacy(
+            path: item.path,
+            fileSize: item.fileSize,
+            modifiedAt: item.modifiedAt
+        )
     }
 
     private static func readableMessage(for error: Error) -> String {

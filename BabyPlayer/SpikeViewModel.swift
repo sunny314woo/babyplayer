@@ -876,7 +876,10 @@ final class SpikeViewModel: ObservableObject {
             videoURL: videoURL,
             smbPlaybackResource: nil,
             duration: duration,
-            cacheKey: "jellyfin:\(item.id)"
+            cacheKey: BabyPlayerCoverCacheIdentity.shared(
+                contentID: preferenceID(for: item.id)
+            ),
+            legacyCacheKeys: [BabyPlayerCoverCacheIdentity.jellyfinLegacy(itemID: item.id)]
         )
     }
 

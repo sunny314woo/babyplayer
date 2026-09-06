@@ -423,12 +423,13 @@ enum BabyPlayerASRDateFormatter {
     }
 }
 
-// ASR、歌词校准、翻译与 D3 永远跟随当前 Jellyfin 所在的 Mac；8011/v1 是正式局域网服务入口。
+// ASR、歌词校准、翻译与 D3 使用独立的 Mac 服务地址；切换媒体来源不会清除它。
 struct BabyPlayerServiceConfiguration {
     let baseURL: URL
     let apiToken: String
 
     private static let jellyfinServerAddressKey = "BabyPlayer.Runtime.JellyfinServerAddress"
+    private static let analysisServiceAddressKey = "BabyPlayer.Runtime.AnalysisServiceAddress.v1"
 
     /// 保存当前已配对 Jellyfin 的非敏感地址，供后台服务客户端只取同一主机名。
     static func updateJellyfinServerAddress(_ address: String?) {
@@ -437,6 +438,24 @@ struct BabyPlayerServiceConfiguration {
             UserDefaults.standard.removeObject(forKey: jellyfinServerAddressKey)
         } else {
             UserDefaults.standard.set(trimmed, forKey: jellyfinServerAddressKey)
+            // 只做一次旧配置迁移。之后 Jellyfin 与 AI 服务可分别变化，切源也不会覆盖 AI 地址。
+            if UserDefaults.standard.string(forKey: analysisServiceAddressKey) == nil,
+               let serviceURL = localBaseURL(forJellyfinServerAddress: trimmed) {
+                UserDefaults.standard.set(
+                    serviceURL.absoluteString,
+                    forKey: analysisServiceAddressKey
+                )
+            }
+        }
+    }
+
+    /// 保存独立 AI 服务地址；输入可为 Mac 主机名/IP 或完整 8011/v1 URL。
+    static func updateAnalysisServiceAddress(_ address: String?) {
+        let trimmed = address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: analysisServiceAddressKey)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: analysisServiceAddressKey)
         }
     }
 
@@ -456,12 +475,19 @@ struct BabyPlayerServiceConfiguration {
         return url
     }
 
+    static func localBaseURL(forAnalysisServiceAddress address: String) -> URL? {
+        localBaseURL(forJellyfinServerAddress: address)
+    }
+
     static func load() throws -> BabyPlayerServiceConfiguration {
         let token = Bundle.main.object(forInfoDictionaryKey: "BabyPlayerASRAPIToken") as? String ?? ""
+        let analysisAddress = UserDefaults.standard.string(forKey: analysisServiceAddressKey) ?? ""
         let jellyfinAddress = UserDefaults.standard.string(forKey: jellyfinServerAddressKey) ?? ""
+        let url = localBaseURL(forAnalysisServiceAddress: analysisAddress)
+            ?? localBaseURL(forJellyfinServerAddress: jellyfinAddress)
         guard !token.isEmpty,
               !token.uppercased().hasPrefix("XX_"),
-              let url = localBaseURL(forJellyfinServerAddress: jellyfinAddress) else {
+              let url else {
             throw BabyPlayerASRError.notConfigured
         }
         return BabyPlayerServiceConfiguration(baseURL: url, apiToken: token)
@@ -483,9 +509,27 @@ struct BabyPlayerServiceConfiguration {
             || (parts[0] == 192 && parts[1] == 168)
     }
 
-    /// Debug 与 Release 都只走 Mac 本地任务，由 Mac 直接读取 Jellyfin 提供的媒体 Path。
+    /// Debug 与 Release 都走 Mac 后台任务；Jellyfin 交路径，Samba 上传短命 M4A。
     var usesMacLocalAnalysisJobs: Bool {
         true
+    }
+}
+
+enum BabyPlayerUploadedAnalysisPolicy {
+    static let maximumDurationSeconds: Double = 20 * 60
+    static let maximumFileSize: Int64 = 64 * 1024 * 1024
+
+    static func validate(durationSeconds: Double, fileSize: Int64) throws {
+        guard durationSeconds.isFinite,
+              durationSeconds >= BabyPlayerAudioExportPolicy.minimumUsableDuration else {
+            throw BabyPlayerASRError.audioExportFailed
+        }
+        guard durationSeconds <= maximumDurationSeconds else {
+            throw BabyPlayerASRError.server("歌曲音频超过 20 分钟，暂不支持上传分析")
+        }
+        guard fileSize > 0, fileSize <= maximumFileSize else {
+            throw BabyPlayerASRError.server("临时歌曲音频超过 64 MB，无法上传到 Mac")
+        }
     }
 }
 
@@ -562,6 +606,42 @@ struct BabyPlayerASRClient {
         return try decode(BabyPlayerLocalAnalysisJob.self, data: data, response: response)
     }
 
+    /// 上传 Apple TV 从 Samba 资产提取的短命 M4A，并让 Mac 继续完整质量分析流程。
+    func submitUploadedAnalysis(
+        sampleURL: URL,
+        durationSeconds: Double,
+        fileSize: Int64,
+        mediaFingerprint: String,
+        mediaTitle: String,
+        forceRefresh: Bool
+    ) async throws -> BabyPlayerLocalAnalysisJob {
+        try BabyPlayerUploadedAnalysisPolicy.validate(
+            durationSeconds: durationSeconds,
+            fileSize: fileSize
+        )
+        let boundary = "BabyPlayerBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+        let bodyURL = try makeUploadJobMultipartBody(
+            sampleURL: sampleURL,
+            durationSeconds: durationSeconds,
+            mediaFingerprint: mediaFingerprint,
+            mediaTitle: mediaTitle,
+            forceRefresh: forceRefresh,
+            boundary: boundary
+        )
+        defer { try? FileManager.default.removeItem(at: bodyURL) }
+        var request = authenticatedRequest(
+            url: configuration.baseURL.appendingPathComponent("local-analysis/upload-jobs")
+        )
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        let (data, response) = try await session.upload(for: request, fromFile: bodyURL)
+        return try decode(BabyPlayerLocalAnalysisJob.self, data: data, response: response)
+    }
+
     /// 读取一次 Mac 任务状态；短请求不会等待整首识别完成。
     func localAnalysisJob(id: String) async throws -> BabyPlayerLocalAnalysisJob {
         var request = authenticatedRequest(
@@ -627,6 +707,53 @@ struct BabyPlayerASRClient {
         data.append("--\(boundary)\r\n")
         data.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
         data.append("\(value)\r\n")
+    }
+
+    private func makeUploadJobMultipartBody(
+        sampleURL: URL,
+        durationSeconds: Double,
+        mediaFingerprint: String,
+        mediaTitle: String,
+        forceRefresh: Bool,
+        boundary: String
+    ) throws -> URL {
+        let bodyURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BabyPlayer-ASR-Upload-\(UUID().uuidString)")
+            .appendingPathExtension("multipart")
+        guard FileManager.default.createFile(atPath: bodyURL.path, contents: nil) else {
+            throw BabyPlayerASRError.audioExportFailed
+        }
+        do {
+            let output = try FileHandle(forWritingTo: bodyURL)
+            defer { try? output.close() }
+            func write(_ value: String) throws {
+                try output.write(contentsOf: Data(value.utf8))
+            }
+            func writeField(_ name: String, _ value: String) throws {
+                try write("--\(boundary)\r\n")
+                try write("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
+                try write("\(value)\r\n")
+            }
+            try writeField("media_fingerprint", mediaFingerprint)
+            try writeField("media_title", mediaTitle)
+            try writeField("duration_seconds", String(format: "%.3f", durationSeconds))
+            try writeField("force_refresh", forceRefresh ? "true" : "false")
+            try write("--\(boundary)\r\n")
+            try write("Content-Disposition: form-data; name=\"audio\"; filename=\"song.m4a\"\r\n")
+            try write("Content-Type: audio/mp4\r\n\r\n")
+
+            let input = try FileHandle(forReadingFrom: sampleURL)
+            defer { try? input.close() }
+            while let chunk = try input.read(upToCount: 1_048_576), !chunk.isEmpty {
+                try Task.checkCancellation()
+                try output.write(contentsOf: chunk)
+            }
+            try write("\r\n--\(boundary)--\r\n")
+            return bodyURL
+        } catch {
+            try? FileManager.default.removeItem(at: bodyURL)
+            throw error
+        }
     }
 }
 
@@ -738,7 +865,15 @@ enum BabyPlayerASRSegmentPolicy {
 enum BabyPlayerTemporaryASRAudioPolicy {
     /// 计算整首 ASR 音频窗口；输入为 Jellyfin 媒体描述，输出安全的片头后/片尾前范围，不修改状态。
     static func songWindow(for media: LyricsMediaDescriptor) -> BabyPlayerAudioExportWindow? {
-        let totalDuration = media.durationSeconds ?? 0
+        songWindow(for: media, resolvedDurationSeconds: media.durationSeconds)
+    }
+
+    /// Samba 索引没有媒体时长时，使用 AVAsset 刚读取的真实时长建立同一歌曲窗口。
+    static func songWindow(
+        for media: LyricsMediaDescriptor,
+        resolvedDurationSeconds: Double?
+    ) -> BabyPlayerAudioExportWindow? {
+        let totalDuration = resolvedDurationSeconds ?? 0
         guard totalDuration >= BabyPlayerAudioExportPolicy.minimumUsableDuration else { return nil }
         let requestedStart = max(0, media.songStartSeconds ?? 0)
         let safeStart = requestedStart
@@ -884,10 +1019,20 @@ actor BabyPlayerASRAudioSegmentPreparer {
     static let shared = BabyPlayerASRAudioSegmentPreparer()
     private let fileManager = FileManager.default
 
-    /// 生成单个临时整首 M4A；输入为当前 Jellyfin 队列媒体，输出临时音频元数据，不分片、不持久化。
-    // 【MODIFIED】MVP 复用已验证的导出器，但只提交一个覆盖整首歌曲窗口的工作单元。
+    /// 生成单个临时整首 M4A；Samba 时先从自定义 AVAsset 读取真实时长，不持久化源视频。
     func prepareCompleteSong(item: BabyPlayerQueueItem) async throws -> BabyPlayerPreparedASRSegment {
-        guard let window = BabyPlayerTemporaryASRAudioPolicy.songWindow(for: item.lyricsMedia) else {
+        let preparedSMBAsset = item.smbPlaybackResource?.makePreparedAsset()
+        let asset: AVAsset = preparedSMBAsset?.asset ?? AVURLAsset(url: item.url)
+        let resolvedDuration: Double?
+        if let indexedDuration = item.lyricsMedia.durationSeconds {
+            resolvedDuration = indexedDuration
+        } else {
+            resolvedDuration = try? await asset.load(.duration).seconds
+        }
+        guard let window = BabyPlayerTemporaryASRAudioPolicy.songWindow(
+            for: item.lyricsMedia,
+            resolvedDurationSeconds: resolvedDuration
+        ) else {
             throw BabyPlayerASRError.audioExportFailed
         }
         return try await prepare(
@@ -896,7 +1041,10 @@ actor BabyPlayerASRAudioSegmentPreparer {
                 index: 0,
                 startSeconds: 0,
                 durationSeconds: window.durationSeconds
-            )
+            ),
+            songWindow: window,
+            asset: asset,
+            preparedSMBAsset: preparedSMBAsset
         )
     }
 
@@ -905,10 +1053,28 @@ actor BabyPlayerASRAudioSegmentPreparer {
         item: BabyPlayerQueueItem,
         segment: BabyPlayerASRAudioSegment
     ) async throws -> BabyPlayerPreparedASRSegment {
-        try Task.checkCancellation()
         guard let songWindow = BabyPlayerASRSegmentPolicy.songWindow(for: item.lyricsMedia) else {
             throw BabyPlayerASRError.audioExportFailed
         }
+        let preparedSMBAsset = item.smbPlaybackResource?.makePreparedAsset()
+        let asset: AVAsset = preparedSMBAsset?.asset ?? AVURLAsset(url: item.url)
+        return try await prepare(
+            item: item,
+            segment: segment,
+            songWindow: songWindow,
+            asset: asset,
+            preparedSMBAsset: preparedSMBAsset
+        )
+    }
+
+    private func prepare(
+        item: BabyPlayerQueueItem,
+        segment: BabyPlayerASRAudioSegment,
+        songWindow: BabyPlayerAudioExportWindow,
+        asset: AVAsset,
+        preparedSMBAsset: SMBSpikePreparedAsset?
+    ) async throws -> BabyPlayerPreparedASRSegment {
+        try Task.checkCancellation()
         let sourceStart = songWindow.startSeconds + segment.startSeconds
         let directory = fileManager.temporaryDirectory
             .appendingPathComponent("BabyPlayer-ASR-Segments", isDirectory: true)
@@ -920,9 +1086,10 @@ actor BabyPlayerASRAudioSegmentPreparer {
             "Segment preparation start index=\(segment.index, privacy: .public) start=\(segment.startSeconds, privacy: .public) intendedDuration=\(segment.durationSeconds, privacy: .public)"
         )
         do {
-            let asset = AVURLAsset(url: item.url)
+            // Resource loader delegate 是弱引用；Samba 音频导出结束前必须保留 prepared asset。
+            defer { withExtendedLifetime(preparedSMBAsset) {} }
             babyPlayerASRLogger.info(
-                "Remote AVAsset extraction start index=\(segment.index, privacy: .public)"
+                "AVAsset audio extraction start index=\(segment.index, privacy: .public) smb=\(preparedSMBAsset != nil, privacy: .public)"
             )
             do {
                 try await export(
@@ -937,9 +1104,9 @@ actor BabyPlayerASRAudioSegmentPreparer {
                 babyPlayerASRLogger.error(
                     "Direct AVAsset extraction failed index=\(segment.index, privacy: .public) domain=\(directError.domain, privacy: .public) code=\(directError.code, privacy: .public)"
                 )
-                if item.url.isFileURL {
+                if preparedSMBAsset != nil || item.url.isFileURL {
                     babyPlayerASRLogger.info(
-                        "Temporary audio fallback start index=\(segment.index, privacy: .public) mode=local-audio-composition"
+                        "Temporary audio fallback start index=\(segment.index, privacy: .public) mode=asset-audio-composition"
                     )
                     try await exportThroughAudioComposition(
                         asset: asset,
@@ -1594,49 +1761,51 @@ actor BabyPlayerASRCoordinator {
            ) {
             return cached
         }
+        if client.usesMacLocalAnalysisJobs {
+            await onStage?(.preparingAudio(index: 1, total: 1))
+            if let localMediaPath = item.localMediaPath, !localMediaPath.isEmpty {
+                let job = try await client.submitLocalAnalysis(
+                    mediaPath: localMediaPath,
+                    media: item.lyricsMedia,
+                    mediaFingerprint: fingerprint,
+                    mediaTitle: item.lyricsMedia.searchTitle,
+                    forceRefresh: forceRefresh
+                )
+                return try await waitForLocalAnalysisJob(
+                    job,
+                    client: client,
+                    onStage: onStage
+                )
+            }
+
+            // Samba 不把账号或源视频交给 Mac。Apple TV 只上传本次分析所需的短命 M4A。
+            let prepared = try await BabyPlayerASRAudioSegmentPreparer.shared
+                .prepareCompleteSong(item: item)
+            do {
+                try Task.checkCancellation()
+                let job = try await client.submitUploadedAnalysis(
+                    sampleURL: prepared.fileURL,
+                    durationSeconds: prepared.generatedDurationSeconds,
+                    fileSize: prepared.fileSize,
+                    mediaFingerprint: fingerprint,
+                    mediaTitle: item.lyricsMedia.searchTitle,
+                    forceRefresh: forceRefresh
+                )
+                await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
+                return try await waitForLocalAnalysisJob(
+                    job,
+                    client: client,
+                    onStage: onStage
+                )
+            } catch {
+                await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
+                throw error
+            }
+        }
+
         guard let songWindow = BabyPlayerTemporaryASRAudioPolicy.songWindow(
             for: item.lyricsMedia
         ) else { throw BabyPlayerASRError.audioExportFailed }
-
-        if client.usesMacLocalAnalysisJobs {
-            guard let localMediaPath = item.localMediaPath,
-                  !localMediaPath.isEmpty else {
-                throw BabyPlayerASRError.server("Jellyfin 没有提供 Mac 本机视频路径")
-            }
-            await onStage?(.preparingAudio(index: 1, total: 1))
-            var job = try await client.submitLocalAnalysis(
-                mediaPath: localMediaPath,
-                media: item.lyricsMedia,
-                mediaFingerprint: fingerprint,
-                mediaTitle: item.lyricsMedia.searchTitle,
-                forceRefresh: forceRefresh
-            )
-            // 【MODIFIED】每次仅做短轮询；等待期间 Task 挂起，不暂停 AVPlayer 或循环逻辑。
-            for _ in 0..<900 {
-                try Task.checkCancellation()
-                switch job.status {
-                case "queued", "extracting":
-                    await onStage?(.preparingAudio(index: 1, total: 1))
-                case "recognizing":
-                    await onStage?(.recognizing(index: 1, total: 1))
-                case "completed":
-                    guard let analysis = job.analysis else {
-                        throw BabyPlayerASRError.invalidResponse
-                    }
-                    return analysis
-                case "failed":
-                    throw BabyPlayerASRError.server(
-                        job.message ?? job.errorCode ?? "Mac 本地分析失败"
-                    )
-                default:
-                    throw BabyPlayerASRError.invalidResponse
-                }
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-                job = try await client.localAnalysisJob(id: job.jobID)
-            }
-            throw BabyPlayerASRError.server("Mac 本地分析等待超时，请稍后读取已保存结果")
-        }
-
         let usage = try await client.usage()
         try BabyPlayerASRQuotaPolicy.validate(
             usage,
@@ -1664,6 +1833,38 @@ actor BabyPlayerASRCoordinator {
             await BabyPlayerASRAudioSegmentPreparer.shared.remove(prepared)
             throw error
         }
+    }
+
+    /// 每次仅做短轮询；等待期间 Task 挂起，不暂停 AVPlayer、Samba 读取或循环逻辑。
+    private func waitForLocalAnalysisJob(
+        _ initialJob: BabyPlayerLocalAnalysisJob,
+        client: BabyPlayerASRClient,
+        onStage: BabyPlayerASRStageHandler?
+    ) async throws -> BabyPlayerASRAnalysis {
+        var job = initialJob
+        for _ in 0..<900 {
+            try Task.checkCancellation()
+            switch job.status {
+            case "queued", "extracting":
+                await onStage?(.preparingAudio(index: 1, total: 1))
+            case "recognizing":
+                await onStage?(.recognizing(index: 1, total: 1))
+            case "completed":
+                guard let analysis = job.analysis else {
+                    throw BabyPlayerASRError.invalidResponse
+                }
+                return analysis
+            case "failed":
+                throw BabyPlayerASRError.server(
+                    job.message ?? job.errorCode ?? "Mac 本地分析失败"
+                )
+            default:
+                throw BabyPlayerASRError.invalidResponse
+            }
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            job = try await client.localAnalysisJob(id: job.jobID)
+        }
+        throw BabyPlayerASRError.server("Mac 本地分析等待超时，请稍后读取已保存结果")
     }
 
     /// 只执行 DeepSeek 证据校准；输入媒体、最多三份候选与强制刷新，输出校准候选，不提取音频或调用 ASR。
@@ -2208,6 +2409,14 @@ enum BabyPlayerLyricsSoundMatcher {
 
 extension LyricsMediaDescriptor {
     var asrFingerprint: String {
+        // 已确认属于同一 Apple TV 媒体库的 Jellyfin/SMB 项共用服务端 ASR 与 DeepSeek 身份。
+        // 当前兼容键只能在目录内文件名唯一时使用；同名替换的强校验仍待全视频 hash。
+        if let localMediaMigrationKey {
+            let raw = "babyplayer-audio-content-v1|\(localMediaMigrationKey)"
+            return SHA256.hash(data: Data(raw.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+        }
         let duration = Int(((durationSeconds ?? 0) * 1_000).rounded())
         let start = Int(((songStartSeconds ?? 0) * 1_000).rounded())
         let end = Int(((songEndSeconds ?? durationSeconds ?? 0) * 1_000).rounded())

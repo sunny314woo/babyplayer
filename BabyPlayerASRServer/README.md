@@ -10,11 +10,13 @@ DeepSeek、中文字幕和结果缓存，固定监听 `8011`；Apple TV 不通�
 
 | 场景 | Apple TV 提交内容 | 音频处理位置 | 服务地址 |
 | --- | --- | --- | --- |
-| Debug / Release | Jellyfin 本机 Path、指纹、歌曲范围 | Mac 读取白名单内原视频，60 秒分片、重叠 5 秒 | 当前 Jellyfin 主机的 `:8011/v1` |
+| Jellyfin | Mac 本机 Path、指纹、歌曲范围 | Mac 读取白名单内原视频，执行原有完整质量链 | 独立 Jennifer `:8011/v1` |
+| Samba | Apple TV 从 SMB AVAsset 临时导出的 M4A、指纹、标题 | 同一 Mac 任务继续原有人声分离/VAD/分片 ASR/DeepSeek | 同一独立 Jennifer `:8011/v1` |
 
-Apple TV 不读取固定 Base URL。若当前 Jellyfin 为 `http://192.168.1.14:8096`，客户端会自动把
-ASR、DeepSeek 和翻译地址构造成 `http://192.168.1.14:8011/v1`，并使用
-`/v1/local-analysis/jobs`。代码不允许静默回退到 VPS。
+Apple TV 使用独立的 analysis-service 地址。升级时若该地址尚未存在，会仅从已配对
+Jellyfin host 迁移一次：例如 `http://192.168.1.14:8096` 迁移为
+`http://192.168.1.14:8011/v1`。之后媒体切到 Samba 不会覆盖 AI 地址。Jellyfin 使用
+`/v1/local-analysis/jobs`，Samba 使用 `/v1/local-analysis/upload-jobs`，两者轮询同一个 job 状态接口。代码不允许静默回退到 VPS。
 
 ```text
 /opt/babyplayer-asr                 独立程序与 .env
@@ -29,11 +31,10 @@ player.wisteriasoftware.uk          独立子域名
 - ASR 模块保护腾讯密钥、执行每月 18,000 秒硬上限，并缓存腾讯返回的转写文字和时间戳。
 - 兼容歌词修复模块保留原 `/v1/refine` limited-repair contract，供新 D3 链路失败时回退。
 - D3 Lyrics Evidence Reconciler 从服务端缓存读取 ASR，两阶段调用 DeepSeek 完成候选审查和最终 word-range 映射；必要时通过独立限域检索器获取新的候选证据。
-- 非 production 的 Mac 本地任务模块只读取 `LOCAL_MEDIA_ROOTS` 白名单内文件，计算原视频
-  SHA-256、提取音频、分片并把进度保存在内存任务表中。
+- 非 production 的 Mac 本地任务模块接受 `LOCAL_MEDIA_ROOTS` 白名单内的 Jellyfin 文件，或服务端自己创建的 Apple TV 短命上传文件；两者共用原音频提取、人声分离、VAD、分片与内存 job 进度表。
 
 生产 `/v1/analyze` 服务不下载 Jellyfin 视频，也不持久化上传音频。Mac 开发任务会直接读取
-Jellyfin 本机 Path；如果显式启用过程文件，会把提取音频、ASR/DeepSeek JSON 和 SRT 保存到
+Jellyfin 本机 Path，或在 job 结束后删除 Samba 上传的临时 M4A；如果显式启用过程文件，会把提取音频、ASR/DeepSeek JSON 和 SRT 保存到
 本机调试目录。网页候选只存在于当次请求内存；最终通过服务端验证的 AI Lyrics 会写入 SQLite。
 
 当前 D3 缓存键已同时绑定媒体指纹、reconciliation version、ASR 算法版本、
@@ -68,7 +69,7 @@ DATABASE_PATH="$TEST_DATABASE_DIR/test.sqlite3" PRODUCT_ENV=test \
   python -m pytest -q -p no:cacheprovider
 ```
 
-当前结果：63 项通过。测试目录只包含本次 SQLite，可在完成后删除。
+当前结果：78 项通过。测试目录只包含本次 SQLite，可在完成后删除。
 
 ### Mac 本地开发
 
@@ -95,8 +96,8 @@ BabyPlayerASRServer/scripts/start-local-development.sh
 
 Apple TV 的 `-1004` 表示连不上 Mac `8011`，不是腾讯 ASR 识别拒绝。先检查
 `launchctl print`、Mac 的 `8011` 健康接口、防火墙和两台设备是否在同一局域网。Mac DHCP
-地址变化后，只更新 Apple TV 的 Jellyfin `:8096` 地址；AI 会自动跟随同一主机，不修改
-`BabyPlayerSecrets.xcconfig`，也不重新编译 Base URL。
+地址变化后需更新独立 analysis-service 地址；媒体源仍可保持 Samba。Bearer Token 仍由
+`BabyPlayerSecrets.xcconfig` 注入，不应在日志或文档中输出。
 
 ### Mac 人声分离与活动质量层
 
@@ -145,7 +146,8 @@ LaunchAgent 必须使用 `ProcessType=Interactive`，否则这台 Mac 上的 Cor
 - `POST /v1/analyze`：上传 M4A/AAC/MP3；BabyPlayer 实际固定使用 M4A。
 - `POST /v1/refine`：接收 `original_lines` 及其 `aligned_words`、ASR transcript 和集中计算的 evidence；返回 `line_identifier / original_text / suggested_text / should_modify / evidence / confidence`。响应 contract 不存在时间戳字段。
 - `POST /v1/lyrics/reconcile`：D3 主接口。Apple TV 只传 `media_fingerprint`/`song_title`/最多 3 份候选；服务器读取 ASR 缓存，必要时限域检索，验证 DeepSeek 返回的 ASR word ranges 后生成最终时间。乱序/重叠/无支持模型行被确定性舍弃，未覆盖但有人声证据的 ASR 词会自动回收。响应包含 `asr_word_coverage` 和 `recovered_asr_word_count`。`force_refresh=true` 可忽略 AI Lyrics 缓存重新分析。
-- `POST /v1/local-analysis/jobs`：仅非 production。提交 Jellyfin 本机 Path 和歌曲范围，立即返回可轮询的 job ID；不接收 Apple TV 音频。
+- `POST /v1/local-analysis/jobs`：仅非 production。提交 Jellyfin 本机 Path 和歌曲范围，立即返回可轮询的 job ID。
+- `POST /v1/local-analysis/upload-jobs`：仅非 production。接收 Apple TV 从 Samba asset 提取的短命 M4A，上限 20 分钟/64 MiB；以 1 MiB 块写入临时文件后交给同一 `LocalAnalysisJobManager`，任务结束后删除上传原件。
 - `GET /v1/local-analysis/jobs/{job_id}`：仅非 production。读取提取、识别、完成或失败状态。当前 Apple TV UI 会把识别阶段统一显示为 1/1，不会显示 Mac 内部真实分片序号。
 
 D3 的可复用边界：
