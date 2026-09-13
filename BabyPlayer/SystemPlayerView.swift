@@ -337,6 +337,20 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         case single
         case sequential
         case shuffled
+        case countedSequential
+        case countedShuffled
+    }
+
+    private enum CountedPlaybackOrder: Equatable {
+        case sequential
+        case shuffled
+
+        var title: String {
+            switch self {
+            case .sequential: return "顺序"
+            case .shuffled: return "随机"
+            }
+        }
     }
 
     var onExit: (() -> Void)?
@@ -720,19 +734,48 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 finishPlayback()
             }
         case .repeatAll:
-            currentPlayNumber = 1
-            currentIndex = (currentIndex + 1) % queueItems.count
-            playCurrentItem()
+            if activePlaybackMode == .countedSequential || activePlaybackMode == .countedShuffled {
+                if BabyPlayerCountedRepeatPolicy.shouldRepeat(
+                    currentPlayNumber: currentPlayNumber,
+                    totalPlays: activeRepeatCount
+                ) {
+                    currentPlayNumber += 1
+                    playCurrentItem()
+                } else {
+                    currentPlayNumber = 1
+                    advanceToNextItem(wrapAtEnd: true)
+                }
+            } else {
+                currentPlayNumber = 1
+                advanceToNextItem(wrapAtEnd: true)
+            }
         case .stopAtEnd:
             currentPlayNumber = 1
-            let nextIndex = currentIndex + 1
-            if queueItems.indices.contains(nextIndex) {
-                currentIndex = nextIndex
-                playCurrentItem()
-            } else {
-                finishPlayback()
-            }
+            advanceToNextItem(wrapAtEnd: false)
         }
+    }
+
+    /// 按当前队列前进；随机队列完成一轮后重新洗牌，并避免下一首立刻重复上一首。
+    private func advanceToNextItem(wrapAtEnd: Bool) {
+        let nextIndex = currentIndex + 1
+        if queueItems.indices.contains(nextIndex) {
+            currentIndex = nextIndex
+            playCurrentItem()
+            return
+        }
+
+        guard wrapAtEnd else {
+            finishPlayback()
+            return
+        }
+
+        let completedItemID = currentQueueItem?.id
+        if activePlaybackMode == .shuffled || activePlaybackMode == .countedShuffled {
+            reshuffleQueueAvoiding(itemID: completedItemID)
+        } else {
+            currentIndex = 0
+        }
+        playCurrentItem()
     }
 
     private func sessionLimitReached() -> Bool {
@@ -1511,50 +1554,101 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         }
         single.state = activePlaybackMode == .single ? .on : .off
 
-        let sequential = UIAction(title: "顺序循环", image: UIImage(systemName: "repeat")) { [weak self] _ in
+        let sequential = UIAction(title: "列表循环·顺序", image: UIImage(systemName: "repeat")) { [weak self] _ in
             self?.setPlaybackMode(.sequential)
         }
         sequential.state = activePlaybackMode == .sequential ? .on : .off
 
-        let shuffled = UIAction(title: "随机播放", image: UIImage(systemName: "shuffle")) { [weak self] _ in
+        let shuffled = UIAction(title: "列表循环·随机", image: UIImage(systemName: "shuffle")) { [weak self] _ in
             self?.setPlaybackMode(.shuffled)
         }
         shuffled.state = activePlaybackMode == .shuffled ? .on : .off
 
-        let timedSingle = UIAction(
-            title: "30 分钟·单曲循环",
-            image: UIImage(systemName: "timer")
-        ) { [weak self] _ in
-            self?.setPlaybackMode(.single, timerMinutes: 30)
-        }
-        let timedSequential = UIAction(
-            title: "30 分钟·顺序循环",
-            image: UIImage(systemName: "timer")
-        ) { [weak self] _ in
-            self?.setPlaybackMode(.sequential, timerMinutes: 30)
-        }
-
-        var children: [UIMenuElement] = [single, sequential, shuffled, timedSingle, timedSequential]
-        if let timerDurationMinutes {
-            let timerStatus = UIAction(
-                title: "定时已开启：\(timerDurationMinutes) 分钟后停止",
-                image: UIImage(systemName: "clock.fill")
-            ) { _ in }
-            timerStatus.attributes = .disabled
-            let cancelTimer = UIAction(
-                title: "取消定时",
-                image: UIImage(systemName: "timer.square")
-            ) { [weak self] _ in
-                self?.cancelPlaybackTimer()
+        let countedChildren: [UIMenuElement] = [
+            CountedPlaybackOrder.sequential,
+            CountedPlaybackOrder.shuffled
+        ].flatMap { order in
+            BabyPlayerCountedRepeatPolicy.availableCounts.map { count in
+                countedPlaybackAction(order: order, count: count) as UIMenuElement
             }
-            children.append(contentsOf: [timerStatus, cancelTimer])
         }
+        let counted = UIMenu(
+            title: "定次循环",
+            image: UIImage(systemName: "repeat"),
+            children: countedChildren
+        )
+
+        let timerOff = UIAction(
+            title: "关闭",
+            image: UIImage(systemName: "timer")
+        ) { [weak self] _ in
+            self?.cancelPlaybackTimer()
+        }
+        timerOff.state = timerDurationMinutes == nil ? .on : .off
+        let timer30 = UIAction(
+            title: "30 分钟",
+            image: UIImage(systemName: "timer")
+        ) { [weak self] _ in
+            self?.setPlaybackTimer(minutes: 30)
+        }
+        timer30.state = timerDurationMinutes == 30 ? .on : .off
+        let timerMenu = UIMenu(
+            title: timerDurationMinutes.map { "定时停止：\($0) 分钟" } ?? "定时停止",
+            image: UIImage(systemName: "timer"),
+            children: [timerOff, timer30]
+        )
 
         return UIMenu(
-            title: "播放模式",
-            image: UIImage(systemName: activePlaybackMode == .single ? "repeat.1" : "repeat"),
-            children: children
+            title: "播放模式：\(activePlaybackModeTitle)",
+            image: UIImage(systemName: activePlaybackModeIconName),
+            children: [single, sequential, shuffled, counted, timerMenu]
         )
+    }
+
+    private var activePlaybackModeTitle: String {
+        switch activePlaybackMode {
+        case .single:
+            return "单曲循环"
+        case .sequential:
+            return activeRepeatMode == .repeatAll ? "列表循环·顺序" : "顺序播放"
+        case .shuffled:
+            return activeRepeatMode == .repeatAll ? "列表循环·随机" : "随机播放"
+        case .countedSequential:
+            return "定次循环·顺序·每首播放 \(activeRepeatCount) 遍"
+        case .countedShuffled:
+            return "定次循环·随机·每首播放 \(activeRepeatCount) 遍"
+        }
+    }
+
+    private var activePlaybackModeIconName: String {
+        switch activePlaybackMode {
+        case .single:
+            return "repeat.1"
+        case .shuffled, .countedShuffled:
+            return "shuffle"
+        case .sequential, .countedSequential:
+            return "repeat"
+        }
+    }
+
+    private func countedPlaybackAction(
+        order: CountedPlaybackOrder,
+        count: Int
+    ) -> UIAction {
+        let normalizedCount = BabyPlayerCountedRepeatPolicy.normalized(count)
+        let action = UIAction(
+            title: "\(order.title)：每首播放 \(normalizedCount) 遍",
+            image: UIImage(systemName: order == .shuffled ? "shuffle" : "repeat")
+        ) { [weak self] _ in
+            self?.setCountedPlaybackMode(order: order, count: normalizedCount)
+        }
+        let selectedMode: ActivePlaybackMode = order == .shuffled
+            ? .countedShuffled
+            : .countedSequential
+        action.state = activePlaybackMode == selectedMode && activeRepeatCount == normalizedCount
+            ? .on
+            : .off
+        return action
     }
 
     private func playbackRateMenu() -> UIMenu {
@@ -1582,10 +1676,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         return action
     }
 
-    private func setPlaybackMode(
-        _ mode: ActivePlaybackMode,
-        timerMinutes: Int? = nil
-    ) {
+    private func setPlaybackMode(_ mode: ActivePlaybackMode) {
         activePlaybackMode = mode
         activeRepeatCount = 0
         currentPlayNumber = 1
@@ -1598,11 +1689,24 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         case .shuffled:
             shuffleQueueKeepingCurrentItem()
             activeRepeatMode = .repeatAll
+        case .countedSequential, .countedShuffled:
+            break
         }
+        updateLyricsTransportMenu()
+    }
 
-        if let timerMinutes {
-            sessionEndsAt = Date().addingTimeInterval(TimeInterval(timerMinutes * 60))
-            timerDurationMinutes = timerMinutes
+    private func setCountedPlaybackMode(order: CountedPlaybackOrder, count: Int) {
+        let normalizedCount = BabyPlayerCountedRepeatPolicy.normalized(count)
+        activePlaybackMode = order == .shuffled ? .countedShuffled : .countedSequential
+        activeRepeatMode = .repeatAll
+        activeRepeatCount = normalizedCount
+        currentPlayNumber = 1
+
+        switch order {
+        case .sequential:
+            restoreOriginalQueueKeepingCurrentItem()
+        case .shuffled:
+            shuffleQueueKeepingCurrentItem()
         }
         updateLyricsTransportMenu()
     }
@@ -1626,9 +1730,37 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         currentIndex = 0
     }
 
+    /// 重新开始随机循环时避免把刚播完的歌曲立刻放到队首。
+    private func reshuffleQueueAvoiding(itemID: String?) {
+        guard originalQueueItems.count > 1 else {
+            queueItems = originalQueueItems
+            currentIndex = 0
+            return
+        }
+
+        var reshuffled = originalQueueItems.shuffled()
+        if let itemID,
+           reshuffled.first?.id == itemID,
+           let swapIndex = reshuffled.indices.dropFirst().randomElement() {
+            reshuffled.swapAt(0, swapIndex)
+        }
+        queueItems = reshuffled
+        currentIndex = 0
+    }
+
     private func cancelPlaybackTimer() {
         sessionEndsAt = nil
         timerDurationMinutes = nil
+        updateLyricsTransportMenu()
+    }
+
+    private func setPlaybackTimer(minutes: Int) {
+        guard minutes > 0 else {
+            cancelPlaybackTimer()
+            return
+        }
+        sessionEndsAt = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        timerDurationMinutes = minutes
         updateLyricsTransportMenu()
     }
 

@@ -12,6 +12,40 @@ import XCTest
 final class SMBSpikeTests: XCTestCase {
     private static let livePasswordDefaultsKey = "BabyPlayer.Tests.LiveSMBPassword"
 
+    func testCountedRepeatPolicyUsesThreeMeaningfulPresets() {
+        XCTAssertEqual(BabyPlayerCountedRepeatPolicy.availableCounts, [5, 15, 30])
+        XCTAssertEqual(BabyPlayerCountedRepeatPolicy.defaultCount, 5)
+        XCTAssertEqual(BabyPlayerCountedRepeatPolicy.normalized(20), 15)
+        XCTAssertEqual(BabyPlayerCountedRepeatPolicy.normalized(60), 30)
+    }
+
+    func testCountedRepeatPolicyCountsTheFirstPlay() {
+        XCTAssertTrue(BabyPlayerCountedRepeatPolicy.shouldRepeat(
+            currentPlayNumber: 1,
+            totalPlays: 5
+        ))
+        XCTAssertTrue(BabyPlayerCountedRepeatPolicy.shouldRepeat(
+            currentPlayNumber: 4,
+            totalPlays: 5
+        ))
+        XCTAssertFalse(BabyPlayerCountedRepeatPolicy.shouldRepeat(
+            currentPlayNumber: 5,
+            totalPlays: 5
+        ))
+        XCTAssertTrue(BabyPlayerCountedRepeatPolicy.shouldRepeat(
+            currentPlayNumber: 14,
+            totalPlays: 15
+        ))
+        XCTAssertFalse(BabyPlayerCountedRepeatPolicy.shouldRepeat(
+            currentPlayNumber: 15,
+            totalPlays: 15
+        ))
+        XCTAssertFalse(BabyPlayerCountedRepeatPolicy.shouldRepeat(
+            currentPlayNumber: 30,
+            totalPlays: 30
+        ))
+    }
+
     func testPathNormalizationAndChildJoining() throws {
         XCTAssertEqual(try SMBSpikePath.normalize("//sss73///cartoons/"), "/sss73/cartoons")
         XCTAssertEqual(

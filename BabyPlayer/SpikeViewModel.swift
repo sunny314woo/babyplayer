@@ -127,6 +127,23 @@ enum BabyPlayerRepeatMode {
     case repeatAll
 }
 
+/// 定次循环的固定档位；次数表示完整播放次数，包含第一次播放。
+enum BabyPlayerCountedRepeatPolicy {
+    static let availableCounts = [5, 15, 30]
+    static let defaultCount = 5
+
+    /// 将任意输入收敛到 UI 暴露的最近档位；不修改持久化或播放状态。
+    static func normalized(_ count: Int) -> Int {
+        availableCounts.min(by: { abs($0 - count) < abs($1 - count) }) ?? defaultCount
+    }
+
+    /// 当前这遍结束后是否还应重播当前歌曲；输入从第 1 遍开始。
+    static func shouldRepeat(currentPlayNumber: Int, totalPlays: Int) -> Bool {
+        guard currentPlayNumber >= 1 else { return false }
+        return currentPlayNumber < normalized(totalPlays)
+    }
+}
+
 enum BabyPlayerLyricsMode: String, CaseIterable, Identifiable {
     case off = "关闭"
     case english = "英文"
