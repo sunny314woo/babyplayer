@@ -1524,6 +1524,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                 children: children
             ),
             lyricsAnalysisMenu(),
+            smartSkipMenu(),
             ratingMenu(),
             playbackModeMenu(),
             playbackRateMenu()
@@ -1616,19 +1617,39 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         ]
 
         return UIMenu(
-            title: "AI 功能",
+            title: "歌词与音频分析",
             image: UIImage(systemName: "sparkles"),
             children: children
         )
     }
 
+    /// 智能跳过只切换“是否采用已保存边界”，绝不启动 ASR、DeepSeek 或其他分析任务。
+    private func smartSkipMenu() -> UIMenu {
+        let hasStoredBoundary = analysisBundle?.smartPlaybackBoundary != nil
+        let action = smartSkipAction(hasStoredBoundary: hasStoredBoundary)
+        let detail = UIAction(
+            title: hasStoredBoundary
+                ? "已有分析结果：播放时直接采用"
+                : "暂无分析结果：不会自动开始分析",
+            image: UIImage(systemName: hasStoredBoundary ? "checkmark.circle" : "info.circle")
+        ) { _ in }
+        detail.attributes = .disabled
+        return UIMenu(
+            title: "智能片头片尾",
+            image: UIImage(systemName: isSmartSkipEnabled ? "forward.end.circle.fill" : "forward.end.circle"),
+            children: [action, detail]
+        )
+    }
+
     /// Apple TV 本机的全局播放偏好；始终展示，且只控制 AI 生成的边界。
-    private func smartSkipAction() -> UIAction {
+    private func smartSkipAction(hasStoredBoundary: Bool = false) -> UIAction {
         let action = UIAction(
-            title: "智能跳过片头片尾",
+            title: isSmartSkipEnabled ? "关闭智能跳过" : "开启智能跳过",
             subtitle: isSmartSkipEnabled
-                ? "已启用：采用 AI 分析结果；所有媒体源通用"
-                : "已关闭：保留分析结果；固定跳过设置不受影响",
+                ? (hasStoredBoundary
+                    ? "已启用：直接采用已有片头片尾结果"
+                    : "已启用：有分析结果时自动采用，不会触发分析")
+                : "已关闭：保留分析结果，重新开启不会触发分析",
             image: UIImage(systemName: isSmartSkipEnabled ? "forward.end.circle.fill" : "forward.end.circle")
         ) { [weak self] _ in
             self?.setSmartSkipEnabled(!(self?.isSmartSkipEnabled ?? true))
@@ -1881,7 +1902,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         return UIMenu(
             title: "倍速：\(BabyPlayerPlaybackRatePolicy.title(for: currentPlaybackRate))",
             image: UIImage(systemName: "speedometer"),
-            children: [smartSkipAction(), rates]
+            children: [rates]
         )
     }
 
