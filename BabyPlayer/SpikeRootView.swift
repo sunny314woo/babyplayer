@@ -520,7 +520,7 @@ private struct SMBChildrenHomeView: View {
                             coverSource: model.coverSource(for:)
                         ) { item in
                             guard let index = visibleItems.firstIndex(where: { $0.id == item.id }) else { return }
-                            play(items: visibleItems, startIndex: index, behavior: .repeatOne)
+                            play(items: visibleItems, startIndex: index, behavior: .countedSequential)
                         }
                         .containerRelativeFrame(.vertical)
                     }

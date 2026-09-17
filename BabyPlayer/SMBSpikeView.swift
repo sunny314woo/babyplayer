@@ -188,11 +188,8 @@ final class SMBHomeViewModel: ObservableObject {
                 try Task.checkCancellation()
                 try SMBSpikeConfigurationStore.save(configuration)
                 try SMBSpikeLibraryIndexStore.save(items, configuration: configuration)
-                let playbackClient = try SMBSpikeClient(configuration: configuration)
                 let previousLibraryClient = self.libraryClient
-                let previousPlaybackClient = self.playbackClient
                 self.libraryClient = libraryClient
-                self.playbackClient = playbackClient
                 self.mediaItems = items
                 self.updateCoverContentIDs(for: items)
                 self.statusText = "光猫 U 盘 · Samba · \(items.count) 个视频"
@@ -201,7 +198,6 @@ final class SMBHomeViewModel: ObservableObject {
                 print("BABYPLAYER_SMB_HOME_RESULT ready count=\(items.count)")
                 #endif
                 await previousLibraryClient?.disconnect()
-                await previousPlaybackClient?.disconnect()
             } catch is CancellationError {
                 return
             } catch {
@@ -226,10 +222,7 @@ final class SMBHomeViewModel: ObservableObject {
         localMediaMigrationKey: (SMBSpikeMediaItem) -> String?,
         startPositionSeconds: Double?
     ) {
-        guard let playbackClient, !items.isEmpty else {
-            statusText = "媒体库尚未连接，请重试。"
-            return
-        }
+        guard !items.isEmpty else { return }
         coverPrewarmTask?.cancel()
         playbackPreparationTask?.cancel()
         let prepared = items.map { item in
@@ -255,6 +248,19 @@ final class SMBHomeViewModel: ObservableObject {
             )
         }
         playbackPreparationTask = Task { [weak self] in
+            let playbackClient: SMBSpikeClient
+            do {
+                // 缓存索引只负责让首页先显示；第一次点击时若实时 SMB 通道尚未建立，
+                // 在这里等待连接完成，不丢弃这次点击，也不要求用户再按一次。
+                guard let self else { return }
+                playbackClient = try await self.ensurePlaybackClient()
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.statusText = "SMB 播放连接失败，请检查光猫 U 盘和网络后重试。"
+                return
+            }
             let configurations = await BabyLyricsRepository.shared.smartPlaybackConfigurations(
                 for: prepared.map(\.lyricsMedia)
             )
@@ -290,7 +296,7 @@ final class SMBHomeViewModel: ObservableObject {
             switch behavior {
             case .repeatOne:
                 repeatMode = .repeatOne
-            case .repeatAll:
+            case .repeatAll, .countedSequential:
                 repeatMode = .repeatAll
             case .sequential, .shuffle:
                 repeatMode = .stopAtEnd
@@ -299,7 +305,11 @@ final class SMBHomeViewModel: ObservableObject {
                 items: queue,
                 startIndex: boundedStartIndex,
                 repeatMode: repeatMode,
-                repeatCount: behavior == .repeatOne ? 0 : 1,
+                repeatCount: behavior == .repeatOne
+                    ? 0
+                    : behavior == .countedSequential
+                        ? BabyPlayerCountedRepeatPolicy.defaultCount
+                        : 1,
                 initialBehavior: behavior,
                 sessionDuration: playbackTimerMinutes == 0
                     ? nil
@@ -335,6 +345,20 @@ final class SMBHomeViewModel: ObservableObject {
             ),
             legacyCacheKeys: [Self.legacyCoverCacheKey(for: item)]
         )
+    }
+
+    /// 返回可用于实际播放的独立 SMB 通道；缓存列表存在时也可以按需建立。
+    private func ensurePlaybackClient() async throws -> SMBSpikeClient {
+        if let playbackClient {
+            return playbackClient
+        }
+        let configuration = SMBSpikeConfigurationStore.load()
+        let client = try SMBSpikeClient(configuration: configuration)
+        statusText = "正在连接 Samba 播放通道…"
+        try await client.connect()
+        try Task.checkCancellation()
+        playbackClient = client
+        return client
     }
 
     private func replaceOperation(_ operation: @escaping @MainActor () async -> Void) {

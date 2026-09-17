@@ -24,6 +24,7 @@ enum BabyPlayerOnboardingStep {
 
 enum BabyPlayerPlaybackBehavior: String, CaseIterable, Identifiable {
     case repeatOne = "单曲循环"
+    case countedSequential = "定次顺序循环"
     case sequential = "顺序播放"
     case repeatAll = "列表循环"
     case shuffle = "随机播放"
@@ -900,14 +901,14 @@ final class SpikeViewModel: ObservableObject {
         )
     }
 
-    /// 点击封面默认无限循环当前歌曲；播放页可随时切换模式。
+    /// 点击封面默认按顺序、每首播放 5 遍；播放页可随时切换模式。
     func play(_ item: JellyfinMediaItem) {
         guard let index = filteredMediaItems.firstIndex(where: { $0.id == item.id }) else { return }
-        // 封面点播默认只循环当前歌曲，但把完整库交给播放器，便于播放中切换为顺序或随机。
+        // 封面点播默认定次顺序循环，但把完整库交给播放器，便于播放中切换模式。
         presentPlayback(
             items: filteredMediaItems,
             startIndex: index,
-            behaviorOverride: .repeatOne
+            behaviorOverride: .countedSequential
         )
     }
 
@@ -1524,12 +1525,12 @@ final class SpikeViewModel: ObservableObject {
             return
         }
 
-        let effectiveBehavior = behaviorOverride ?? .repeatOne
+        let effectiveBehavior = behaviorOverride ?? .countedSequential
         let repeatMode: BabyPlayerRepeatMode
         switch effectiveBehavior {
         case .repeatOne:
             repeatMode = .repeatOne
-        case .repeatAll:
+        case .repeatAll, .countedSequential:
             repeatMode = .repeatAll
         case .sequential, .shuffle:
             repeatMode = .stopAtEnd
@@ -1544,7 +1545,11 @@ final class SpikeViewModel: ObservableObject {
             items: queue,
             startIndex: queueStartIndex,
             repeatMode: repeatMode,
-            repeatCount: effectiveBehavior == .repeatOne ? 0 : 1,
+            repeatCount: effectiveBehavior == .repeatOne
+                ? 0
+                : effectiveBehavior == .countedSequential
+                    ? BabyPlayerCountedRepeatPolicy.defaultCount
+                    : 1,
             initialBehavior: effectiveBehavior,
             sessionDuration: playbackTimerMinutes == 0 ? nil : TimeInterval(playbackTimerMinutes * 60),
             introSkipSeconds: Double(introSkipSeconds),

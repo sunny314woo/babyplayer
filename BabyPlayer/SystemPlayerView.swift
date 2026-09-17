@@ -17,6 +17,7 @@ import AVKit
 import Foundation
 import OSLog
 import SwiftUI
+import UIKit
 
 private let babyPlayerSystemPlayerLogger = Logger(
     subsystem: "com.wufengyu.BabyPlayer",
@@ -375,7 +376,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private var activePreparedSMBAsset: SMBSpikePreparedAsset?
     private var endObserver: NSObjectProtocol?
     private var analysisWorkflowObserver: NSObjectProtocol?
+    private var appDidBecomeActiveObserver: NSObjectProtocol?
+    private var playbackStalledObserver: NSObjectProtocol?
     private var timeObserver: Any?
+    private var playerItemStatusObservation: NSKeyValueObservation?
+    private var playbackStartupRetryWorkItem: DispatchWorkItem?
+    private var playbackStartupGeneration = 0
+    private var playerItemStartAttempt = 0
+    private var isPlaybackRequested = false
     private var lyricsTask: Task<Void, Never>?
     private var soundAnalysisTask: Task<Void, Never>?
     private var lyricsSaveTask: Task<Void, Never>?
@@ -435,6 +443,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         activePlaybackMode = {
             switch selection.initialBehavior {
             case .repeatOne: return .single
+            case .countedSequential: return .countedSequential
             case .sequential, .repeatAll: return .sequential
             case .shuffle: return .shuffled
             }
@@ -463,6 +472,25 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
                   notification.object as? AVPlayerItem === self.player?.currentItem else { return }
             self.handleNaturalEnd()
         }
+        appDidBecomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.resumePlaybackAfterActivationIfNeeded()
+        }
+        playbackStalledObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemPlaybackStalled,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  self.isPlaybackRequested,
+                  notification.object as? AVPlayerItem === self.player?.currentItem else { return }
+            // 电视从休眠恢复或 SMB 连接短暂断开时，AVPlayer 可能只停在 waiting 状态；
+            // 再次声明播放意图，让 AVPlayer 重新等待缓冲，而不是要求用户再按一次。
+            self.player?.play()
+        }
         analysisWorkflowObserver = NotificationCenter.default.addObserver(
             forName: .babyPlayerAIWorkflowDidChange,
             object: nil,
@@ -482,6 +510,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     }
 
     func cleanUp() {
+        isPlaybackRequested = false
         lyricsTask?.cancel()
         lyricsTask = nil
         // AI 工作不属于播放页生命周期：退回首页后仍继续到 DeepSeek
@@ -494,6 +523,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         aiProgressHideTask = nil
         outroFadeTask?.cancel()
         outroFadeTask = nil
+        playbackStartupRetryWorkItem?.cancel()
+        playbackStartupRetryWorkItem = nil
+        playerItemStatusObservation?.invalidate()
+        playerItemStatusObservation = nil
         player?.volume = 1
         player?.pause()
         if let timeObserver, let player {
@@ -508,6 +541,14 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             NotificationCenter.default.removeObserver(analysisWorkflowObserver)
         }
         analysisWorkflowObserver = nil
+        if let appDidBecomeActiveObserver {
+            NotificationCenter.default.removeObserver(appDidBecomeActiveObserver)
+        }
+        appDidBecomeActiveObserver = nil
+        if let playbackStalledObserver {
+            NotificationCenter.default.removeObserver(playbackStalledObserver)
+        }
+        playbackStalledObserver = nil
         player?.replaceCurrentItem(with: nil)
         activePreparedSMBAsset = nil
         player = nil
@@ -548,8 +589,10 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             rate: player.rate
         ) {
         case .play:
+            isPlaybackRequested = true
             player.playImmediately(atRate: currentPlaybackRate)
         case .pause:
+            isPlaybackRequested = false
             player.pause()
         }
     }
@@ -582,7 +625,7 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         currentQueueItem?.lyricsMedia.asrFingerprint == fingerprint
     }
 
-    private func playCurrentItem() {
+    private func playCurrentItem(isRetry: Bool = false) {
         guard !sessionLimitReached(),
               let selection,
               let queueItem = currentQueueItem else {
@@ -590,10 +633,22 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
             return
         }
 
+        playbackStartupRetryWorkItem?.cancel()
+        playbackStartupRetryWorkItem = nil
+        playerItemStatusObservation?.invalidate()
+        playerItemStatusObservation = nil
+        playbackStartupGeneration &+= 1
+        let startupGeneration = playbackStartupGeneration
+        if !isRetry {
+            playerItemStartAttempt = 0
+        }
+        playerItemStartAttempt += 1
+
         outroFadeTask?.cancel()
         outroFadeTask = nil
         player?.volume = 1
         isAdvancing = false
+        isPlaybackRequested = true
         let playerItem: AVPlayerItem
         if let smbPlaybackResource = queueItem.smbPlaybackResource {
             let preparedAsset = smbPlaybackResource.makePreparedAsset()
@@ -630,24 +685,182 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
         recentSmartIntroApplication = abs(introTarget - introTargetWithoutSmartSkip) > 0.01
             ? (queueItem.id, Date().addingTimeInterval(30))
             : nil
-        if introTarget > 0 {
-            player?.seek(
-                to: CMTime(seconds: introTarget, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            ) { [weak self] finished in
-                guard finished,
-                      let self,
-                      self.currentQueueItem?.id == queueItem.id,
-                      let elapsed = self.player?.currentTime().seconds,
-                      elapsed.isFinite else { return }
-                // 歌词始终跟随视频的绝对播放时间，不把片头跳过量重复叠加到歌词偏移。
-                self.currentLyricIndex = nil
-                self.updateLyrics(at: elapsed)
+        waitForPlayerItemAndStart(
+            playerItem,
+            queueItemID: queueItem.id,
+            targetSeconds: introTarget,
+            generation: startupGeneration
+        )
+    }
+
+    /// AVPlayerItem 刚被替换时通常仍处于 unknown；远程 HTTP 和 SMB resource loader
+    /// 尤其容易在此时让 seek/playImmediately 失效。先等 readyToPlay，再恢复位置和播放。
+    private func waitForPlayerItemAndStart(
+        _ playerItem: AVPlayerItem,
+        queueItemID: String,
+        targetSeconds: Double,
+        generation: Int
+    ) {
+        let handleStatus: (AVPlayerItem) -> Void = { [weak self, weak playerItem] item in
+            guard let self,
+                  let playerItem,
+                  item === playerItem,
+                  self.playbackStartupGeneration == generation,
+                  self.player?.currentItem === playerItem,
+                  self.currentQueueItem?.id == queueItemID,
+                  !self.didExit else { return }
+
+            switch item.status {
+            case .readyToPlay:
+                self.playerItemStatusObservation?.invalidate()
+                self.playerItemStatusObservation = nil
+                self.seekAndStartPlayback(
+                    playerItem,
+                    queueItemID: queueItemID,
+                    targetSeconds: targetSeconds,
+                    generation: generation,
+                    seekAttempt: 0
+                )
+            case .failed:
+                self.playerItemStatusObservation?.invalidate()
+                self.playerItemStatusObservation = nil
+                self.retryFailedPlayerItemIfPossible(
+                    queueItemID: queueItemID,
+                    generation: generation
+                )
+            case .unknown:
+                break
+            @unknown default:
+                break
             }
         }
-        player?.defaultRate = currentPlaybackRate
-        player?.playImmediately(atRate: currentPlaybackRate)
+
+        playerItemStatusObservation = playerItem.observe(
+            \.status,
+            options: [.initial, .new]
+        ) { item, _ in
+            // KVO 的回调线程不由 AVFoundation 保证；播放器状态统一回主线程处理。
+            DispatchQueue.main.async {
+                handleStatus(item)
+            }
+        }
+    }
+
+    private func seekAndStartPlayback(
+        _ playerItem: AVPlayerItem,
+        queueItemID: String,
+        targetSeconds: Double,
+        generation: Int,
+        seekAttempt: Int
+    ) {
+        guard playbackStartupGeneration == generation,
+              player?.currentItem === playerItem,
+              currentQueueItem?.id == queueItemID,
+              !didExit else { return }
+
+        let startPlaying: () -> Void = { [weak self, weak playerItem] in
+            guard let self,
+                  let playerItem,
+                  self.playbackStartupGeneration == generation,
+                  self.player?.currentItem === playerItem,
+                  self.currentQueueItem?.id == queueItemID,
+                  !self.didExit else { return }
+            self.player?.defaultRate = self.currentPlaybackRate
+            self.isPlaybackRequested = true
+            // 使用 play()，让 AVPlayer 在首段数据不足时自行等待缓冲；
+            // playImmediately(atRate:) 在冷连接上可能只设置一次瞬时播放请求。
+            self.player?.play()
+        }
+
+        guard targetSeconds > 0 else {
+            startPlaying()
+            return
+        }
+
+        player?.seek(
+            to: CMTime(seconds: targetSeconds, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        ) { [weak self, weak playerItem] finished in
+            DispatchQueue.main.async {
+                guard let self,
+                      let playerItem,
+                      self.playbackStartupGeneration == generation,
+                      self.player?.currentItem === playerItem,
+                      self.currentQueueItem?.id == queueItemID,
+                      !self.didExit else { return }
+
+                if finished || seekAttempt >= 2 {
+                    if let elapsed = self.player?.currentTime().seconds,
+                       elapsed.isFinite {
+                        // 歌词始终跟随视频的绝对播放时间，不把片头跳过量重复叠加到歌词偏移。
+                        self.currentLyricIndex = nil
+                        self.updateLyrics(at: elapsed)
+                    }
+                    startPlaying()
+                } else {
+                    self.schedulePlaybackStartupRetry(
+                        generation: generation,
+                        queueItemID: queueItemID
+                    ) { [weak self, weak playerItem] in
+                        guard let self, let playerItem else { return }
+                        self.seekAndStartPlayback(
+                            playerItem,
+                            queueItemID: queueItemID,
+                            targetSeconds: targetSeconds,
+                            generation: generation,
+                            seekAttempt: seekAttempt + 1
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func retryFailedPlayerItemIfPossible(
+        queueItemID: String,
+        generation: Int
+    ) {
+        guard playerItemStartAttempt < 2 else {
+            babyPlayerSystemPlayerLogger.error(
+                "Playback item failed after retry, item=\(queueItemID, privacy: .private)"
+            )
+            return
+        }
+        schedulePlaybackStartupRetry(
+            generation: generation,
+            queueItemID: queueItemID
+        ) { [weak self] in
+            self?.playCurrentItem(isRetry: true)
+        }
+    }
+
+    private func schedulePlaybackStartupRetry(
+        generation: Int,
+        queueItemID: String,
+        operation: @escaping () -> Void
+    ) {
+        playbackStartupRetryWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.playbackStartupGeneration == generation,
+                  self.currentQueueItem?.id == queueItemID,
+                  !self.didExit else { return }
+            self.playbackStartupRetryWorkItem = nil
+            operation()
+        }
+        playbackStartupRetryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: workItem)
+    }
+
+    private func resumePlaybackAfterActivationIfNeeded() {
+        guard isPlaybackRequested,
+              !didExit,
+              let player,
+              let currentItem = player.currentItem,
+              currentItem.status == .readyToPlay else { return }
+        player.defaultRate = currentPlaybackRate
+        player.play()
     }
 
     private func handleProgress(_ elapsed: Double) {
@@ -786,6 +999,11 @@ final class BabyPlaylistPlayerViewController: AVPlayerViewController {
     private func finishPlayback() {
         guard !didExit else { return }
         didExit = true
+        isPlaybackRequested = false
+        playbackStartupRetryWorkItem?.cancel()
+        playbackStartupRetryWorkItem = nil
+        playerItemStatusObservation?.invalidate()
+        playerItemStatusObservation = nil
         lyricsTask?.cancel()
         // Back 只退出播放，不撤销已经提交的 AI 分析。
         soundAnalysisTask = nil
