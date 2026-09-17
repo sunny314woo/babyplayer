@@ -8,6 +8,7 @@
 import AVFoundation
 import AVKit
 import SwiftUI
+import UIKit
 
 #if DEBUG
 /// 仅供开发包真机自动化验收；密码只从当次进程环境读取，不写入日志或 Keychain。
@@ -160,6 +161,7 @@ final class SMBHomeViewModel: ObservableObject {
     private var coverPrewarmTask: Task<Void, Never>?
     private var playbackPreparationTask: Task<Void, Never>?
     private var coverContentIDs: [String: String] = [:]
+    private var appLifecycleObservers: [NSObjectProtocol] = []
 
     init() {
         let configuration = SMBSpikeConfigurationStore.load()
@@ -167,6 +169,35 @@ final class SMBHomeViewModel: ObservableObject {
             mediaItems = cachedItems
             updateCoverContentIDs(for: cachedItems)
             statusText = "已显示 \(cachedItems.count) 个缓存视频，正在连接 Samba 刷新…"
+        }
+        appLifecycleObservers = [
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.willResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.releasePlaybackConnectionForBackground()
+                }
+            },
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if !self.mediaItems.isEmpty {
+                        self.statusText = "已返回前台，播放连接将在点播时重新建立…"
+                    }
+                }
+            }
+        ]
+    }
+
+    deinit {
+        for observer in appLifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
         }
     }
 
@@ -359,6 +390,18 @@ final class SMBHomeViewModel: ObservableObject {
         try Task.checkCancellation()
         playbackClient = client
         return client
+    }
+
+    /// tvOS 切换到其他 App 后，旧 SMB 会话可能仍保留对象但底层连接已经失效。
+    /// 主动释放它，保证回到前台后的第一次点播一定创建新连接。
+    private func releasePlaybackConnectionForBackground() {
+        playbackPreparationTask?.cancel()
+        playbackPreparationTask = nil
+        let staleClient = playbackClient
+        playbackClient = nil
+        Task {
+            await staleClient?.disconnect()
+        }
     }
 
     private func replaceOperation(_ operation: @escaping @MainActor () async -> Void) {
