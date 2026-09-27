@@ -4,6 +4,7 @@
 //
 // Phase A：SMB 真机播放 Spike 的配置、路径规则和只读媒体模型。
 // 这些类型与现有 Jellyfin 主链隔离，Spike 通过后再提升为正式媒体源模型。
+// 最近修改：【MODIFIED】Phase 2 从旧平面缓存恢复目录入口，不改变缓存文件格式。
 //
 
 import CryptoKit
@@ -122,7 +123,7 @@ enum SMBSpikeLibraryIndexStore {
               snapshot.schemaVersion == schemaVersion,
               snapshot.sourceIdentity == sourceIdentity(for: configuration),
               !snapshot.items.isEmpty,
-              snapshot.items.allSatisfy(isValidCachedItem) else { return nil }
+              snapshot.items.allSatisfy({ isValidCachedItem($0, rootPath: configuration.rootPath) }) else { return nil }
         return snapshot.items
     }
 
@@ -132,7 +133,8 @@ enum SMBSpikeLibraryIndexStore {
         cacheDirectory: URL? = nil,
         fileManager: FileManager = .default
     ) throws {
-        guard !items.isEmpty, items.allSatisfy(isValidCachedItem) else {
+        guard !items.isEmpty,
+              items.allSatisfy({ isValidCachedItem($0, rootPath: configuration.rootPath) }) else {
             throw SMBSpikeError.noSupportedMedia
         }
         let snapshot = SMBSpikeLibrarySnapshot(
@@ -152,6 +154,36 @@ enum SMBSpikeLibraryIndexStore {
             withIntermediateDirectories: true
         )
         try data.write(to: url, options: .atomic)
+    }
+
+    /// 【MODIFIED】职责：从旧版平面索引恢复当前层可见内容；输入为缓存视频及根内目录，输出文件夹和直接视频。
+    static func directoryFromCachedItems(
+        _ items: [SMBSpikeMediaItem],
+        rootPath: String,
+        directoryPath: String
+    ) -> BabyPlayerDirectoryListing<SMBSpikeMediaItem> {
+        guard let root = try? SMBSpikePath.normalize(rootPath),
+              let directory = try? SMBSpikePath.normalize(directoryPath),
+              root == "/" || directory == root || directory.hasPrefix(root + "/") else {
+            return BabyPlayerDirectoryListing(folders: [], videos: [])
+        }
+        let prefix = directory == "/" ? "/" : directory + "/"
+        var folders: [String: BabyPlayerFolderNode] = [:]
+        var videos: [SMBSpikeMediaItem] = []
+        for item in items where item.path.hasPrefix(prefix) {
+            let relative = String(item.path.dropFirst(prefix.count))
+            let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+            if components.count == 1 {
+                videos.append(item)
+            } else if let first = components.first, !first.isEmpty,
+                      let path = try? SMBSpikePath.child(named: String(first), in: directory) {
+                folders[path] = BabyPlayerFolderNode(id: path, name: String(first))
+            }
+        }
+        return BabyPlayerDirectoryListing(
+            folders: folders.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending },
+            videos: videos.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        )
     }
 
     private static func indexURL(
@@ -181,12 +213,15 @@ enum SMBSpikeLibraryIndexStore {
             .joined()
     }
 
-    private static func isValidCachedItem(_ item: SMBSpikeMediaItem) -> Bool {
+    /// 【MODIFIED】职责：验证旧缓存视频始终落在当前 Root Folder 内；输入为项目与配置根目录，输出为可否安全显示。
+    private static func isValidCachedItem(_ item: SMBSpikeMediaItem, rootPath: String) -> Bool {
+        guard let root = try? SMBSpikePath.normalize(rootPath) else { return false }
         guard item.fileSize > 0,
               SMBSpikePath.isSupportedVideo(name: item.name),
               !SMBSpikePath.shouldIgnore(name: item.name, isDirectory: false),
               let normalized = try? SMBSpikePath.normalize(item.path),
-              normalized == item.path else { return false }
+              normalized == item.path,
+              root == "/" || normalized.hasPrefix(root + "/") else { return false }
         return true
     }
 }

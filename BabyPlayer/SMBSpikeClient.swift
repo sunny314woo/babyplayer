@@ -3,6 +3,7 @@
 // BabyPlayer
 //
 // Phase A：用 AMSMB2 连接真实路由器共享，提供严格只读的目录、stat 和 range read。
+// 最近修改：【MODIFIED】Phase 2 增加无产品层深度限制的逐层目录读取与文件夹播放收集。
 //
 
 import AMSMB2
@@ -120,9 +121,68 @@ actor SMBSpikeClient {
         }
     }
 
-    func stat(path: String) async throws -> SMBSpikeFileStat {
+    /// 【MODIFIED】职责：列出 Root Folder 内指定目录的直接子项；输入为目录路径，输出文件夹及视频，不递归。
+    func listDirectory(at path: String) async throws -> BabyPlayerDirectoryListing<SMBSpikeMediaItem> {
+        let directory = try pathWithinRoot(path)
         try await connect()
-        let normalizedPath = try SMBSpikePath.normalize(path)
+        let entries = try await manager.contentsOfDirectory(atPath: directory)
+        var folders: [BabyPlayerFolderNode] = []
+        var videos: [SMBSpikeMediaItem] = []
+        for entry in entries {
+            try Task.checkCancellation()
+            guard let name = entry.name, !name.isEmpty,
+                  !SMBSpikePath.shouldIgnore(name: name, isDirectory: entry.isDirectory),
+                  !entry.isSymbolicLink else { continue }
+            let child = try SMBSpikePath.child(named: name, in: directory)
+            if entry.isDirectory {
+                folders.append(BabyPlayerFolderNode(id: child, name: name))
+            } else if SMBSpikePath.isSupportedVideo(name: name),
+                      let size = entry.fileSize, size > 0 {
+                videos.append(SMBSpikeMediaItem(
+                    path: child,
+                    name: name,
+                    fileSize: size,
+                    modifiedAt: entry.contentModificationDate
+                ))
+            }
+        }
+        return BabyPlayerDirectoryListing(
+            folders: folders.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending },
+            videos: videos.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        )
+    }
+
+    /// 【MODIFIED】职责：为“播放此文件夹”收集所有子目录视频；输入为 Root Folder 内路径，输出按目录/文件名排序的视频。
+    func videosRecursively(in path: String) async throws -> [SMBSpikeMediaItem] {
+        let root = try pathWithinRoot(path)
+        var pending = [root]
+        var videos: [SMBSpikeMediaItem] = []
+        var visited = Set<String>()
+        while !pending.isEmpty {
+            try Task.checkCancellation()
+            let directory = pending.removeFirst()
+            guard visited.insert(directory).inserted else { continue }
+            let listing = try await listDirectory(at: directory)
+            videos.append(contentsOf: listing.videos)
+            pending.append(contentsOf: listing.folders.map(\.id))
+        }
+        return videos
+    }
+
+    /// 【MODIFIED】职责：阻止目录访问越过配置的 Root Folder；输入为路径，输出规范化的根内路径。
+    private func pathWithinRoot(_ path: String) throws -> String {
+        let normalized = try SMBSpikePath.normalize(path)
+        let root = configuration.rootPath
+        guard root == "/" || normalized == root || normalized.hasPrefix(root + "/") else {
+            throw SMBSpikeError.invalidPath
+        }
+        return normalized
+    }
+
+    func stat(path: String) async throws -> SMBSpikeFileStat {
+        // 【MODIFIED】播放前的 stat 也必须服从儿童 Root Folder 边界。
+        let normalizedPath = try pathWithinRoot(path)
+        try await connect()
         let attributes = try await manager.attributesOfItem(atPath: normalizedPath)
         guard let fileSize = attributes.fileSize, fileSize >= 0 else {
             throw SMBSpikeError.invalidFileSize
@@ -143,8 +203,9 @@ actor SMBSpikeClient {
         guard length > 0, length <= 1_048_576 else { throw SMBSpikeError.invalidReadRange }
         guard offset <= UInt64.max - UInt64(length) else { throw SMBSpikeError.invalidReadRange }
         try Task.checkCancellation()
+        // 【MODIFIED】Range Read 只能读取 Root Folder 下的文件。
+        let normalizedPath = try pathWithinRoot(path)
         try await connect()
-        let normalizedPath = try SMBSpikePath.normalize(path)
 
         do {
             let data = try await manager.contents(

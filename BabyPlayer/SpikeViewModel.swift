@@ -2,6 +2,7 @@
 // SpikeViewModel.swift
 // BabyPlayer 产品状态：首次配对、持久授权、儿童首页和播放队列。
 // 最近修改：2026-08-24 将 Jellyfin 本机媒体路径随队列交给 Mac 本地歌词分析。
+// 最近修改：【MODIFIED】Phase 2 加入 Jellyfin 目录导航，并冻结历史跨源内容别名。
 //
 
 import Combine
@@ -52,6 +53,7 @@ enum BabyPlayerRating: String, CaseIterable, Identifiable {
 
 /// 媒体源只负责定位文件；BabyPlayer 的评分、屏蔽、续播和字幕使用这个来源无关身份。
 /// 目前以规范化文件名建立兼容身份；同一目录出现重名时退回来源 ID，避免错误串数据。
+/// 【MODIFIED】此算法仅用于旧数据兼容测试；新媒体不再调用它建立跨来源同名关联。
 struct BabyPlayerContentIdentityInput: Equatable, Sendable {
     let sourceID: String
     let displayName: String
@@ -59,6 +61,20 @@ struct BabyPlayerContentIdentityInput: Equatable, Sendable {
 }
 
 enum BabyPlayerContentIdentityResolver {
+    /// 【MODIFIED】职责：保留旧项目已保存的别名；新项目使用带来源前缀的稳定 ID，避免歌词库按标题回退跨源匹配。
+    static func resolvedContentID(
+        for sourceID: String,
+        existingAliases: [String: String]
+    ) -> String {
+        existingAliases[sourceID] ?? sourceScopedID(for: sourceID)
+    }
+
+    /// 【MODIFIED】职责：给新媒体生成来源隔离的内容 ID；输入为来源原生 ID，输出为持久稳定的键。
+    static func sourceScopedID(for sourceID: String) -> String {
+        let namespace = sourceID.hasPrefix("smb:") ? sourceID : "jellyfin:\(sourceID)"
+        return "source-v1:\(namespace)"
+    }
+
     static func mappings(
         for inputs: [BabyPlayerContentIdentityInput]
     ) -> [String: String] {
@@ -542,6 +558,13 @@ final class SpikeViewModel: ObservableObject {
     @Published private(set) var mediaItems: [JellyfinMediaItem] = [] {
         didSet { registerJellyfinMediaItems(mediaItems) }
     }
+    // 【MODIFIED】职责：当前目录直接子项；输入为 Jellyfin 文件夹 ID，输出给儿童目录页。
+    @Published private(set) var directoryFolders: [BabyPlayerFolderNode] = []
+    @Published private(set) var directoryVideos: [JellyfinMediaItem] = [] {
+        didSet { registerJellyfinMediaItems(directoryVideos) }
+    }
+    @Published private(set) var directoryName = "音乐视频"
+    @Published private(set) var canGoBackInDirectory = false
     @Published private(set) var isWorking = false
     @Published var activePlayback: SpikePlaybackSelection?
     @Published private(set) var playbackResumeState: BabyPlayerPlaybackResumeState?
@@ -574,8 +597,12 @@ final class SpikeViewModel: ObservableObject {
     private var coverPrewarmTask: Task<Void, Never>?
     private var playbackPreparationTask: Task<Void, Never>?
     private var batchAnalysisTask: Task<Void, Never>?
+    private var directoryTask: Task<Void, Never>?
+    private var directoryNavigation: BabyPlayerDirectoryNavigation?
     private var contentAliases: [String: String] = [:]
     private var contentTitles: [String: String] = [:]
+    // 【MODIFIED】首次读取历史字幕别名前，延后把旧原生 ID 迁移为新来源 ID。
+    private var legacyAliasImportInProgress = true
 
     private static let playbackTimerKey = "BabyPlayer.PlaybackTimerMinutes"
     private static let introSkipKey = "BabyPlayer.IntroSkipSeconds"
@@ -587,6 +614,7 @@ final class SpikeViewModel: ObservableObject {
     private static let playbackResumeKey = "BabyPlayer.PlaybackResumeV1"
     private static let contentAliasesKey = "BabyPlayer.ContentAliasesV1"
     private static let contentTitlesKey = "BabyPlayer.ContentTitlesV1"
+    private static let jellyfinRootKey = "BabyPlayer.Jellyfin.RootFolder.v1"
 
     var completedBatchAnalysisItems: [BabyPlayerBatchAnalysisItem] {
         batchAnalysisItems.filter { $0.state.isCompleted }
@@ -660,7 +688,9 @@ final class SpikeViewModel: ObservableObject {
         applyContentIdentityMigration()
         Task { [weak self] in
             let persistedAliases = await BabyLyricsRepository.shared.persistedContentAliases()
+            self?.legacyAliasImportInProgress = false
             self?.registerPersistedContentAliases(persistedAliases)
+            self?.applyContentIdentityMigration()
         }
 
         guard let credentials = JellyfinCredentialStore.load() else { return }
@@ -677,6 +707,16 @@ final class SpikeViewModel: ObservableObject {
     /// BabyPlayer 只读取 Jellyfin 的“音乐视频”库，因此首页无需再做伪分类。
     var filteredMediaItems: [JellyfinMediaItem] {
         let visible = mediaItems.filter { rating(for: $0.id) != .blocked }
+        guard let resumeID = playbackResumeState?.itemID,
+              let current = visible.first(where: { preferenceID(for: $0.id) == resumeID }) else {
+            return visible
+        }
+        return [current] + visible.filter { preferenceID(for: $0.id) != resumeID }
+    }
+
+    /// 【MODIFIED】职责：过滤当前目录视频并将该目录内续播项置前；输出仅含 Root Folder 下当前层项目。
+    var filteredDirectoryItems: [JellyfinMediaItem] {
+        let visible = directoryVideos.filter { rating(for: $0.id) != .blocked }
         guard let resumeID = playbackResumeState?.itemID,
               let current = visible.first(where: { preferenceID(for: $0.id) == resumeID }) else {
             return visible
@@ -737,11 +777,24 @@ final class SpikeViewModel: ObservableObject {
                         throw JellyfinSpikeError.incompleteAuthentication
                     }
 
-                    let videos = try await client.fetchVideos(userID: userID, accessToken: accessToken)
+                    // 【MODIFIED】空媒体库仍可进入目录页配置和查看文件夹。
+                    let videos = try await self.legacyVideosOrEmpty(
+                        client: client, userID: userID, accessToken: accessToken
+                    )
                     self.authenticatedUserID = userID
                     self.accessToken = accessToken
                     self.mediaItems = videos
                     self.prewarmCovers(for: videos)
+                    // 【MODIFIED】换 Jellyfin 服务器时旧根目录 ID 不可复用；同服务器重新配对仍保留目录。
+                    if JellyfinCredentialStore.load()?.serverAddress != self.serverAddress {
+                        UserDefaults.standard.removeObject(forKey: Self.jellyfinRootKey)
+                    }
+                    // 【MODIFIED】首次配对后立即建立 Jellyfin Root Folder 的当前目录。
+                    try await self.restoreDirectory(
+                        client: client,
+                        userID: userID,
+                        accessToken: accessToken
+                    )
                     JellyfinCredentialStore.save(
                         StoredJellyfinCredentials(
                             serverAddress: self.serverAddress,
@@ -766,10 +819,7 @@ final class SpikeViewModel: ObservableObject {
     }
 
     func enterHome() {
-        guard !mediaItems.isEmpty else {
-            appState = .unavailable
-            return
-        }
+        // 【MODIFIED】目录可以暂时没有视频；空列表由目录页展示。
         appState = .home
         statusText = ""
     }
@@ -799,6 +849,7 @@ final class SpikeViewModel: ObservableObject {
                 )
                 self.mediaItems = videos
                 self.prewarmCovers(for: videos)
+                self.loadCurrentDirectory()
                 self.statusText = "已更新 \(videos.count) 个视频"
             } catch {
                 self.statusText = self.readableMessage(for: error)
@@ -840,6 +891,7 @@ final class SpikeViewModel: ObservableObject {
                 )
                 self.mediaItems = videos
                 self.prewarmCovers(for: videos)
+                self.loadCurrentDirectory()
                 self.statusText = "扫描完成，现在有 \(videos.count) 个视频"
             } catch is CancellationError {
                 return
@@ -868,6 +920,8 @@ final class SpikeViewModel: ObservableObject {
         operationTask = nil
         batchAnalysisTask = nil
         JellyfinCredentialStore.delete()
+        // 【MODIFIED】明确清除配对时清除该来源的 Root Folder，避免下个服务器复用旧 ID。
+        UserDefaults.standard.removeObject(forKey: Self.jellyfinRootKey)
         BabyPlayerServiceConfiguration.updateJellyfinServerAddress(nil)
         authenticatedUserID = nil
         accessToken = nil
@@ -903,10 +957,13 @@ final class SpikeViewModel: ObservableObject {
 
     /// 点击封面默认按顺序、每首播放 5 遍；播放页可随时切换模式。
     func play(_ item: JellyfinMediaItem) {
-        guard let index = filteredMediaItems.firstIndex(where: { $0.id == item.id }) else { return }
+        // 【MODIFIED】儿童点播仅把当前目录视频放入队列；旧调用仍可使用完整媒体列表。
+        let visible = filteredDirectoryItems.contains(where: { $0.id == item.id })
+            ? filteredDirectoryItems : filteredMediaItems
+        guard let index = visible.firstIndex(where: { $0.id == item.id }) else { return }
         // 封面点播默认定次顺序循环，但把完整库交给播放器，便于播放中切换模式。
         presentPlayback(
-            items: filteredMediaItems,
+            items: visible,
             startIndex: index,
             behaviorOverride: .countedSequential
         )
@@ -936,6 +993,79 @@ final class SpikeViewModel: ObservableObject {
         )
     }
 
+    /// 【MODIFIED】职责：递归播放当前文件夹；输入为顺序或随机模式，输出为原 Jellyfin 播放队列。
+    func playCurrentFolder(shuffled: Bool) {
+        guard let folderID = directoryNavigation?.currentID,
+              let authenticatedUserID, let accessToken else { return }
+        playbackPreparationTask?.cancel()
+        playbackPreparationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let videos = try await self.makeClient().fetchFolderVideos(
+                    userID: authenticatedUserID,
+                    accessToken: accessToken,
+                    folderID: folderID
+                )
+                try Task.checkCancellation()
+                let visible = videos.filter { self.rating(for: $0.id) != .blocked }
+                guard !visible.isEmpty else {
+                    self.statusText = "这个文件夹没有可播放的视频"
+                    return
+                }
+                self.presentPlayback(
+                    items: visible,
+                    startIndex: 0,
+                    behaviorOverride: shuffled ? .shuffle : .sequential
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                self.statusText = self.readableMessage(for: error)
+            }
+        }
+    }
+
+    /// 【MODIFIED】职责：只允许进入当前目录列出的子文件夹；输入为文件夹，副作用是保存并加载下一层。
+    func openDirectory(_ folder: BabyPlayerFolderNode) {
+        guard var navigation = directoryNavigation,
+              navigation.open(folder, visibleFolders: directoryFolders) else { return }
+        directoryNavigation = navigation
+        loadCurrentDirectory()
+    }
+
+    /// 【MODIFIED】职责：按目录层级返回，不越过 Jellyfin Root Folder；副作用是持久化当前层。
+    func leaveDirectory() {
+        guard var navigation = directoryNavigation, navigation.goBack() else { return }
+        directoryNavigation = navigation
+        loadCurrentDirectory()
+    }
+
+    /// 【MODIFIED】职责：读取当前目录直接子项；失败时保留现有页面并展示错误。
+    private func loadCurrentDirectory() {
+        guard let folderID = directoryNavigation?.currentID,
+              let authenticatedUserID, let accessToken else { return }
+        directoryTask?.cancel()
+        directoryTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let listing = try await self.makeClient().fetchDirectory(
+                    userID: authenticatedUserID,
+                    accessToken: accessToken,
+                    parentID: folderID
+                )
+                try Task.checkCancellation()
+                self.directoryFolders = listing.folders
+                self.directoryVideos = listing.videos
+                self.directoryName = self.directoryNavigation?.currentName ?? "音乐视频"
+                self.canGoBackInDirectory = self.directoryNavigation?.canGoBack ?? false
+            } catch is CancellationError {
+                return
+            } catch {
+                self.statusText = self.readableMessage(for: error)
+            }
+        }
+    }
+
     /// 返回视频当前的本地偏好；没有记录时返回未评分。
     func rating(for itemID: String) -> BabyPlayerRating {
         ratings[preferenceID(for: itemID)] ?? .unrated
@@ -958,12 +1088,21 @@ final class SpikeViewModel: ObservableObject {
     }
 
     func preferenceID(for sourceID: String) -> String {
-        contentAliases[sourceID] ?? sourceID
+        // 【MODIFIED】深层目录视频即使尚未进入旧索引，也立即使用来源专属身份；已解析的旧键保持原样。
+        if sourceID.hasPrefix("filename-sha256:") || sourceID.hasPrefix("source-v1:") {
+            return sourceID
+        }
+        return BabyPlayerContentIdentityResolver.resolvedContentID(
+            for: sourceID,
+            existingAliases: contentAliases
+        )
     }
 
     func contentMigrationKey(for sourceID: String) -> String? {
         let resolved = preferenceID(for: sourceID)
-        return resolved.hasPrefix("filename-sha256:") ? resolved : nil
+        // 【MODIFIED】旧文件名键保留；新来源键传给歌词/ASR，禁止仅凭同名回退复用别的来源。
+        return resolved.hasPrefix("filename-sha256:") || resolved.hasPrefix("source-v1:")
+            ? resolved : nil
     }
 
     /// 来源适配器在拿到目录后登记一次别名；之后运行只依赖 Apple TV 本地映射。
@@ -989,10 +1128,13 @@ final class SpikeViewModel: ObservableObject {
 
     private func registerContentItems(_ items: [BabyPlayerContentIdentityInput]) {
         guard !items.isEmpty else { return }
-        let resolved = BabyPlayerContentIdentityResolver.mappings(for: items)
         var changed = false
         for item in items {
-            let contentID = resolved[item.sourceID] ?? item.sourceID
+            // 【MODIFIED】旧别名原样保留，保护已有评分/续播/字幕；新项目只用来源 ID，停止同名跨源关联。
+            let contentID = BabyPlayerContentIdentityResolver.resolvedContentID(
+                for: item.sourceID,
+                existingAliases: contentAliases
+            )
             if contentAliases[item.sourceID] != contentID {
                 contentAliases[item.sourceID] = contentID
                 changed = true
@@ -1005,7 +1147,9 @@ final class SpikeViewModel: ObservableObject {
         guard changed else { return }
         UserDefaults.standard.set(contentAliases, forKey: Self.contentAliasesKey)
         UserDefaults.standard.set(contentTitles, forKey: Self.contentTitlesKey)
-        applyContentIdentityMigration()
+        if !legacyAliasImportInProgress {
+            applyContentIdentityMigration()
+        }
         contentIdentityRevision &+= 1
         logSharedContentState()
     }
@@ -1468,13 +1612,21 @@ final class SpikeViewModel: ObservableObject {
         defer { isWorking = false }
         do {
             try Task.checkCancellation()
-            let videos = try await makeClient().fetchVideos(
+            let client = try makeClient()
+            let videos = try await legacyVideosOrEmpty(
+                client: client,
                 userID: authenticatedUserID,
                 accessToken: accessToken
             )
             try Task.checkCancellation()
             mediaItems = videos
             prewarmCovers(for: videos)
+            // 【MODIFIED】先逐级验证上次访问路径，避免已删除目录越过 Root Folder。
+            try await restoreDirectory(
+                client: client,
+                userID: authenticatedUserID,
+                accessToken: accessToken
+            )
             appState = .home
             statusText = ""
         } catch is CancellationError {
@@ -1484,6 +1636,54 @@ final class SpikeViewModel: ObservableObject {
             appState = .unavailable
             statusText = "暂时看不到内容，请稍后再试"
         }
+    }
+
+    /// 【MODIFIED】职责：保留旧完整视频列表供封面/批量分析使用；无视频时返回空数组让目录页正常打开。
+    private func legacyVideosOrEmpty(
+        client: JellyfinSpikeClient,
+        userID: String,
+        accessToken: String
+    ) async throws -> [JellyfinMediaItem] {
+        do {
+            return try await client.fetchVideos(userID: userID, accessToken: accessToken)
+        } catch JellyfinSpikeError.noVideo {
+            return []
+        }
+    }
+
+    /// 【MODIFIED】职责：恢复已保存的 Jellyfin 根目录及上次路径；输入为认证客户端，输出为当前层子项。
+    private func restoreDirectory(
+        client: JellyfinSpikeClient,
+        userID: String,
+        accessToken: String
+    ) async throws {
+        let libraryRoot = try await client.fetchMusicVideoRoot(userID: userID, accessToken: accessToken)
+        let rootID = UserDefaults.standard.string(forKey: Self.jellyfinRootKey) ?? libraryRoot.id
+        if UserDefaults.standard.string(forKey: Self.jellyfinRootKey) == nil {
+            UserDefaults.standard.set(rootID, forKey: Self.jellyfinRootKey)
+        }
+        var navigation = BabyPlayerDirectoryNavigation(sourceKey: "jellyfin", rootID: rootID)
+        let savedPath = navigation.savedPath
+        navigation.returnToRoot()
+        var listing = try await client.fetchDirectory(
+            userID: userID,
+            accessToken: accessToken,
+            parentID: rootID
+        )
+        for folder in savedPath {
+            try Task.checkCancellation()
+            guard navigation.open(folder, visibleFolders: listing.folders) else { break }
+            listing = try await client.fetchDirectory(
+                userID: userID,
+                accessToken: accessToken,
+                parentID: folder.id
+            )
+        }
+        directoryNavigation = navigation
+        directoryFolders = listing.folders
+        directoryVideos = listing.videos
+        directoryName = navigation.currentName
+        canGoBackInDirectory = navigation.canGoBack
     }
 
     /// 【MODIFIED】媒体列表到达后在后台预热缺失封面，不阻塞首页和播放入口。

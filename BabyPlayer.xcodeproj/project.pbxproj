@@ -22,6 +22,7 @@
 		A1000000000000000000000F /* SMBSpikeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* SMBSpikeClient.swift */; };
 		A10000000000000000000010 /* SMBAssetResourceLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* SMBAssetResourceLoader.swift */; };
 		A10000000000000000000011 /* SMBSpikeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* SMBSpikeView.swift */; };
+		D10000000000000000000001 /* BabyPlayerDirectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000001 /* BabyPlayerDirectory.swift */; };
 		A10000000000000000000012 /* AMSMB2 in Frameworks */ = {isa = PBXBuildFile; productRef = C10000000000000000000001 /* AMSMB2 */; };
 		A10000000000000000000013 /* AMSMB2 in Embed Frameworks */ = {isa = PBXBuildFile; productRef = C10000000000000000000001 /* AMSMB2 */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		B10000000000000000000001 /* LyricsAndASRTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* LyricsAndASRTests.swift */; };
@@ -72,6 +73,7 @@
 		A20000000000000000000011 /* SMBSpikeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBSpikeClient.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* SMBAssetResourceLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBAssetResourceLoader.swift; sourceTree = "<group>"; };
 		A20000000000000000000013 /* SMBSpikeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBSpikeView.swift; sourceTree = "<group>"; };
+		D20000000000000000000001 /* BabyPlayerDirectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BabyPlayerDirectory.swift; sourceTree = "<group>"; };
 		B20000000000000000000001 /* LyricsAndASRTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsAndASRTests.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* BabyPlayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BabyPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B20000000000000000000003 /* SMBSpikeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBSpikeTests.swift; sourceTree = "<group>"; };
@@ -122,6 +124,7 @@
 				A20000000000000000000011 /* SMBSpikeClient.swift */,
 				A20000000000000000000012 /* SMBAssetResourceLoader.swift */,
 				A20000000000000000000013 /* SMBSpikeView.swift */,
+				D20000000000000000000001 /* BabyPlayerDirectory.swift */,
 				A2000000000000000000000A /* Assets.xcassets */,
 				A2000000000000000000000B /* BabyLyricsCatalog.json */,
 				A20000000000000000000006 /* Info.plist */,
@@ -268,6 +271,7 @@
 				A1000000000000000000000F /* SMBSpikeClient.swift in Sources */,
 				A10000000000000000000010 /* SMBAssetResourceLoader.swift in Sources */,
 				A10000000000000000000011 /* SMBSpikeView.swift in Sources */,
+				D10000000000000000000001 /* BabyPlayerDirectory.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -3,9 +3,11 @@
 // BabyPlayerTests
 //
 // SMB 直连 Spike 的纯逻辑回归测试：路径边界、媒体过滤和 AVPlayer Range 规划。
+// 最近修改：【MODIFIED】Phase 2 覆盖目录恢复、根目录边界、旧缓存和 Jellyfin 多层目录。
 //
 
 import AVFoundation
+import Foundation
 import XCTest
 @testable import BabyPlayer
 
@@ -91,6 +93,140 @@ final class SMBSpikeTests: XCTestCase {
             ),
             .samba
         )
+    }
+
+    /// 【MODIFIED】职责：验证历史内容 ID 不丢失，新视频停止按同名跨来源建立关联。
+    func testExistingContentAliasesSurviveWhileNewSourcesStayIndependent() {
+        let old = "filename-sha256:historical"
+        let aliases = ["jellyfin-old": old, "smb:/root/old.mp4": old]
+        XCTAssertEqual(BabyPlayerContentIdentityResolver.resolvedContentID(
+            for: "jellyfin-old", existingAliases: aliases
+        ), old)
+        XCTAssertEqual(BabyPlayerContentIdentityResolver.resolvedContentID(
+            for: "smb:/root/old.mp4", existingAliases: aliases
+        ), old)
+        XCTAssertEqual(BabyPlayerContentIdentityResolver.resolvedContentID(
+            for: "jellyfin-new", existingAliases: aliases
+        ), "source-v1:jellyfin:jellyfin-new")
+        XCTAssertEqual(BabyPlayerContentIdentityResolver.resolvedContentID(
+            for: "smb:/root/new.mp4", existingAliases: aliases
+        ), "source-v1:smb:/root/new.mp4")
+        XCTAssertNotEqual(
+            BabyPlayerContentIdentityResolver.sourceScopedID(for: "same-name"),
+            BabyPlayerContentIdentityResolver.sourceScopedID(for: "smb:/root/same-name")
+        )
+        let jellyfin = LyricsMediaDescriptor(
+            id: "same-name", title: "Same Name", searchTitle: "Same Name",
+            artistName: nil, sourceHint: nil, versionHint: nil,
+            durationSeconds: nil, songStartSeconds: nil, songEndSeconds: nil,
+            mediaSourceID: "same-name",
+            localMediaMigrationKey: BabyPlayerContentIdentityResolver.sourceScopedID(for: "same-name")
+        )
+        let samba = LyricsMediaDescriptor(
+            id: "smb:/root/same-name", title: "Same Name", searchTitle: "Same Name",
+            artistName: nil, sourceHint: nil, versionHint: nil,
+            durationSeconds: nil, songStartSeconds: nil, songEndSeconds: nil,
+            mediaSourceID: "smb:/root/same-name",
+            localMediaMigrationKey: BabyPlayerContentIdentityResolver.sourceScopedID(for: "smb:/root/same-name")
+        )
+        XCTAssertNotEqual(jellyfin.sharedContentID, samba.sharedContentID)
+        XCTAssertNotEqual(jellyfin.asrFingerprint, samba.asrFingerprint)
+    }
+
+    /// 【MODIFIED】职责：验证 Root Folder 边界、逐级返回与每个来源的历史目录持久化。
+    func testDirectoryNavigationStaysWithinRootAndRestoresLastFolder() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        let root = BabyPlayerFolderNode(id: "/root/one", name: "one")
+        let child = BabyPlayerFolderNode(id: "/root/one/two", name: "two")
+        var navigation = BabyPlayerDirectoryNavigation(
+            sourceKey: "samba", rootID: "/root", defaults: defaults
+        )
+        XCTAssertFalse(navigation.open(child, visibleFolders: [root], defaults: defaults))
+        XCTAssertTrue(navigation.open(root, visibleFolders: [root], defaults: defaults))
+        XCTAssertTrue(navigation.open(child, visibleFolders: [child], defaults: defaults))
+        XCTAssertEqual(navigation.currentID, child.id)
+
+        var restored = BabyPlayerDirectoryNavigation(
+            sourceKey: "samba", rootID: "/root", defaults: defaults
+        )
+        XCTAssertEqual(restored.savedPath, [root, child])
+        XCTAssertTrue(restored.goBack(defaults: defaults))
+        XCTAssertEqual(restored.currentID, root.id)
+        XCTAssertTrue(restored.goBack(defaults: defaults))
+        XCTAssertFalse(restored.goBack(defaults: defaults))
+        XCTAssertEqual(restored.currentID, "/root")
+        XCTAssertTrue(BabyPlayerDirectoryNavigation(
+            sourceKey: "jellyfin", rootID: "/root", defaults: defaults
+        ).savedPath.isEmpty)
+        let renamed = BabyPlayerFolderNode(id: root.id, name: "renamed")
+        XCTAssertTrue(restored.open(root, visibleFolders: [renamed], defaults: defaults))
+        XCTAssertEqual(restored.currentName, "renamed")
+    }
+
+    /// 【MODIFIED】职责：验证旧 Samba 平面索引仍可展示根目录、子目录和视频。
+    func testCachedSambaIndexRecoversFoldersWithoutLeakingOutsideRoot() {
+        let items = [
+            SMBSpikeMediaItem(path: "/root/a.mp4", name: "a.mp4", fileSize: 10, modifiedAt: nil),
+            SMBSpikeMediaItem(path: "/root/one/b.mp4", name: "b.mp4", fileSize: 10, modifiedAt: nil),
+            SMBSpikeMediaItem(path: "/root/one/two/c.mp4", name: "c.mp4", fileSize: 10, modifiedAt: nil),
+            SMBSpikeMediaItem(path: "/outside/d.mp4", name: "d.mp4", fileSize: 10, modifiedAt: nil)
+        ]
+        let root = SMBSpikeLibraryIndexStore.directoryFromCachedItems(
+            items, rootPath: "/root", directoryPath: "/root"
+        )
+        XCTAssertEqual(root.videos.map(\.name), ["a.mp4"])
+        XCTAssertEqual(root.folders.map(\.name), ["one"])
+        let child = SMBSpikeLibraryIndexStore.directoryFromCachedItems(
+            items, rootPath: "/root", directoryPath: "/root/one"
+        )
+        XCTAssertEqual(child.videos.map(\.name), ["b.mp4"])
+        XCTAssertEqual(child.folders.map(\.name), ["two"])
+        XCTAssertTrue(SMBSpikeLibraryIndexStore.directoryFromCachedItems(
+            items, rootPath: "/root", directoryPath: "/outside"
+        ).videos.isEmpty)
+    }
+
+    /// 【MODIFIED】职责：验证 Samba 目录 API 在联网前拒绝越过 Root Folder 的路径。
+    func testSambaDirectoryRejectsPathOutsideRootBeforeConnecting() async throws {
+        var configuration = SMBSpikeConfiguration.homeGatewayDefaults
+        configuration.rootPath = "/root"
+        configuration.password = "unit-test-placeholder"
+        let client = try SMBSpikeClient(configuration: configuration)
+        do {
+            _ = try await client.listDirectory(at: "/outside")
+            XCTFail("Expected Root Folder boundary error")
+        } catch SMBSpikeError.invalidPath {
+            // Expected without touching the network.
+        }
+    }
+
+    /// 【MODIFIED】职责：用模拟 Jellyfin API 验证三层目录和文件夹递归队列不丢视频。
+    func testJellyfinDirectoryTraversesNestedFoldersAndVideos() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BabyPlayerDirectoryFixtureProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = try JellyfinSpikeClient(
+            serverAddress: "http://babyplayer.invalid:8096",
+            deviceID: "directory-test",
+            session: session
+        )
+        let root = try await client.fetchMusicVideoRoot(userID: "user", accessToken: "token")
+        XCTAssertEqual(root.id, "root")
+        let first = try await client.fetchDirectory(
+            userID: "user", accessToken: "token", parentID: root.id
+        )
+        XCTAssertEqual(first.folders.map(\.id), ["one"])
+        XCTAssertEqual(first.videos.map(\.id), ["root-video"])
+        let recursive = try await client.fetchFolderVideos(
+            userID: "user", accessToken: "token", folderID: root.id
+        )
+        XCTAssertEqual(recursive.map(\.id), ["root-video", "one-video", "two-video"])
+        let paged = try await client.fetchDirectory(
+            userID: "user", accessToken: "token", parentID: "many"
+        )
+        XCTAssertEqual(paged.videos.count, 201)
+        XCTAssertEqual(paged.videos.first?.id, "page-0")
+        XCTAssertEqual(paged.videos.last?.id, "page-200")
     }
 
     func testRangePlanUsesOriginalRequestEndAfterPartialResponse() throws {
@@ -258,4 +394,55 @@ final class SMBSpikeTests: XCTestCase {
             throw error
         }
     }
+}
+
+/// 【MODIFIED】职责：仅为 Jellyfin 目录单测返回固定三层响应；输入为请求 URL，输出为 JSON HTTP 响应。
+private final class BabyPlayerDirectoryFixtureProtocol: URLProtocol {
+    /// 【MODIFIED】职责：拦截本测试会话的请求；输出是否接管该请求。
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    /// 【MODIFIED】职责：保持请求原样，避免 URLProtocol 重复改写。
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    /// 【MODIFIED】职责：按 parentId 返回当前层文件夹和视频；副作用是完成 URLSession 请求。
+    override func startLoading() {
+        guard let url = request.url,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let body: String
+        if url.lastPathComponent == "UserViews" {
+            body = #"{"Items":[{"Id":"root","Name":"音乐视频","CollectionType":"musicvideos"}]}"#
+        } else {
+            let parent = components.queryItems?.first(where: { $0.name == "parentId" })?.value
+            switch parent {
+            case "root":
+                body = #"{"Items":[{"Id":"one","Name":"第一层","Type":"Folder"},{"Id":"root-video","Name":"根视频","Type":"Video"}]}"#
+            case "one":
+                body = #"{"Items":[{"Id":"two","Name":"第二层","Type":"Folder"},{"Id":"one-video","Name":"第一层视频","Type":"MusicVideo"}]}"#
+            case "two":
+                body = #"{"Items":[{"Id":"two-video","Name":"第二层视频","Type":"Video"}]}"#
+            case "many":
+                let start = Int(components.queryItems?.first(where: { $0.name == "startIndex" })?.value ?? "0") ?? 0
+                let end = min(start + 200, 201)
+                let videos = (start..<end).map { index in
+                    "{\"Id\":\"page-\(index)\",\"Name\":\"Video \(index)\",\"Type\":\"Video\"}"
+                }
+                body = "{\"Items\":[\(videos.joined(separator: ","))]}"
+            default:
+                body = #"{"Items":[]}"#
+            }
+        }
+        let response = HTTPURLResponse(
+            url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    /// 【MODIFIED】职责：结束测试请求；无额外副作用。
+    override func stopLoading() { }
 }

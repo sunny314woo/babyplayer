@@ -3,6 +3,9 @@
 // BabyPlayer
 //
 // Phase A：仅在 feature flag 开启时显示的 SMB 真机诊断页和最小系统播放入口。
+// 用途：Samba 连接配置、儿童首页与原生播放器入口。
+// 主要功能：连接扫描、目录展示、封面和 Samba 播放队列。
+// 最近修改：【MODIFIED】Phase 2 为 Samba 首页增加逐层目录浏览，保留原 Range 播放链。
 //
 
 import AVFoundation
@@ -151,6 +154,11 @@ private enum SMBSpikeLaunchProbeError: Error {
 @MainActor
 final class SMBHomeViewModel: ObservableObject {
     @Published private(set) var mediaItems: [SMBSpikeMediaItem] = []
+    // 【MODIFIED】当前目录的直接子项与导航标题，仅供共用目录组件展示。
+    @Published private(set) var directoryFolders: [BabyPlayerFolderNode] = []
+    @Published private(set) var directoryVideos: [SMBSpikeMediaItem] = []
+    @Published private(set) var directoryName = "音乐视频"
+    @Published private(set) var canGoBackInDirectory = false
     @Published private(set) var statusText = "正在准备光猫 U 盘媒体库…"
     @Published private(set) var isWorking = false
     @Published var activePlayback: SpikePlaybackSelection?
@@ -160,14 +168,31 @@ final class SMBHomeViewModel: ObservableObject {
     private var operationTask: Task<Void, Never>?
     private var coverPrewarmTask: Task<Void, Never>?
     private var playbackPreparationTask: Task<Void, Never>?
+    private var directoryTask: Task<Void, Never>?
+    private var directoryNavigation: BabyPlayerDirectoryNavigation
     private var coverContentIDs: [String: String] = [:]
     private var appLifecycleObservers: [NSObjectProtocol] = []
 
     init() {
         let configuration = SMBSpikeConfigurationStore.load()
+        // 【MODIFIED】Samba Root Folder 沿用已保存的 rootPath，历史目录按根目录隔离。
+        directoryNavigation = BabyPlayerDirectoryNavigation(
+            sourceKey: "samba",
+            rootID: (try? SMBSpikePath.normalize(configuration.rootPath)) ?? configuration.rootPath
+        )
         if let cachedItems = SMBSpikeLibraryIndexStore.load(configuration: configuration) {
             mediaItems = cachedItems
             updateCoverContentIDs(for: cachedItems)
+            // 【MODIFIED】沿用旧缓存的视频与封面冷启动体验，同时构造当前目录入口。
+            let cachedDirectory = SMBSpikeLibraryIndexStore.directoryFromCachedItems(
+                cachedItems,
+                rootPath: configuration.rootPath,
+                directoryPath: directoryNavigation.currentID
+            )
+            directoryFolders = cachedDirectory.folders
+            directoryVideos = cachedDirectory.videos
+            directoryName = directoryNavigation.currentName
+            canGoBackInDirectory = directoryNavigation.canGoBack
             statusText = "已显示 \(cachedItems.count) 个缓存视频，正在连接 Samba 刷新…"
         }
         appLifecycleObservers = [
@@ -211,20 +236,43 @@ final class SMBHomeViewModel: ObservableObject {
             guard let self else { return }
             do {
                 let configuration = SMBSpikeConfigurationStore.load()
+                let normalizedRoot = try SMBSpikePath.normalize(configuration.rootPath)
+                if normalizedRoot != self.directoryNavigation.rootID {
+                    // 【MODIFIED】家长更换 Root Folder 后立即撤下旧目录与旧 SMB 连接，禁止儿童看到根目录外内容。
+                    let oldLibraryClient = self.libraryClient
+                    let oldPlaybackClient = self.playbackClient
+                    self.libraryClient = nil
+                    self.playbackClient = nil
+                    self.mediaItems = []
+                    self.directoryFolders = []
+                    self.directoryVideos = []
+                    self.directoryNavigation = BabyPlayerDirectoryNavigation(
+                        sourceKey: "samba", rootID: normalizedRoot
+                    )
+                    await oldLibraryClient?.disconnect()
+                    await oldPlaybackClient?.disconnect()
+                }
                 self.statusText = "正在连接光猫 U 盘…"
                 let libraryClient = try SMBSpikeClient(configuration: configuration)
                 try await libraryClient.connect()
                 self.statusText = "已连接，正在读取媒体目录…"
-                let items = try await libraryClient.listMedia()
+                // 【MODIFIED】先加载当前目录；旧平面索引只是缓存优化，不能限制目录深度。
+                try await self.restoreDirectory(client: libraryClient, rootPath: configuration.rootPath)
+                let items = (try? await libraryClient.listMedia()) ?? []
                 try Task.checkCancellation()
+                // 【MODIFIED】保留原连接成功后的设置持久化行为。
                 try SMBSpikeConfigurationStore.save(configuration)
-                try SMBSpikeLibraryIndexStore.save(items, configuration: configuration)
+                if !items.isEmpty {
+                    try SMBSpikeLibraryIndexStore.save(items, configuration: configuration)
+                }
                 let previousLibraryClient = self.libraryClient
                 self.libraryClient = libraryClient
-                self.mediaItems = items
-                self.updateCoverContentIDs(for: items)
-                self.statusText = "光猫 U 盘 · Samba · \(items.count) 个视频"
-                self.prewarmCovers(for: items, client: libraryClient)
+                if !items.isEmpty {
+                    self.mediaItems = items
+                    self.updateCoverContentIDs(for: items)
+                    self.prewarmCovers(for: items, client: libraryClient)
+                }
+                self.statusText = "光猫 U 盘 · Samba · 当前目录 \(self.directoryVideos.count) 个视频"
                 #if DEBUG
                 print("BABYPLAYER_SMB_HOME_RESULT ready count=\(items.count)")
                 #endif
@@ -238,6 +286,96 @@ final class SMBHomeViewModel: ObservableObject {
                     : "当前显示 \(self.mediaItems.count) 个缓存视频 · \(failure)"
             }
         }
+    }
+
+    /// 【MODIFIED】职责：验证并恢复 Root Folder 以下的历史路径；输入为已连接 SMB 客户端，输出为当前层列表。
+    private func restoreDirectory(client: SMBSpikeClient, rootPath: String) async throws {
+        let root = try SMBSpikePath.normalize(rootPath)
+        var navigation = BabyPlayerDirectoryNavigation(sourceKey: "samba", rootID: root)
+        let savedPath = navigation.savedPath
+        navigation.returnToRoot()
+        var listing = try await client.listDirectory(at: root)
+        for folder in savedPath {
+            try Task.checkCancellation()
+            guard navigation.open(folder, visibleFolders: listing.folders) else { break }
+            listing = try await client.listDirectory(at: folder.id)
+        }
+        directoryNavigation = navigation
+        directoryFolders = listing.folders
+        directoryVideos = listing.videos
+        directoryName = navigation.currentName
+        canGoBackInDirectory = navigation.canGoBack
+    }
+
+    /// 【MODIFIED】职责：进入当前列表中的 Samba 子目录；副作用为保存路径并读取下一层。
+    func openDirectory(_ folder: BabyPlayerFolderNode) {
+        guard directoryNavigation.open(folder, visibleFolders: directoryFolders) else { return }
+        loadCurrentDirectory()
+    }
+
+    /// 【MODIFIED】职责：逐层返回，不越过配置的 Samba Root Folder。
+    func leaveDirectory() {
+        guard directoryNavigation.goBack() else { return }
+        loadCurrentDirectory()
+    }
+
+    /// 【MODIFIED】职责：读取当前 Samba 目录直接子项；失败时保留旧内容并显示原因。
+    private func loadCurrentDirectory() {
+        let path = directoryNavigation.currentID
+        // 【MODIFIED】离线时仍可逐级查看已有缓存，但播放必须重新建立 SMB 连接。
+        if !mediaItems.isEmpty {
+            let cached = SMBSpikeLibraryIndexStore.directoryFromCachedItems(
+                mediaItems,
+                rootPath: directoryNavigation.rootID,
+                directoryPath: path
+            )
+            directoryFolders = cached.folders
+            directoryVideos = cached.videos
+            directoryName = directoryNavigation.currentName
+            canGoBackInDirectory = directoryNavigation.canGoBack
+        }
+        directoryTask?.cancel()
+        directoryTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let client = try await self.ensureLibraryClient()
+                let listing = try await client.listDirectory(at: path)
+                try Task.checkCancellation()
+                self.directoryFolders = listing.folders
+                self.directoryVideos = listing.videos
+                self.directoryName = self.directoryNavigation.currentName
+                self.canGoBackInDirectory = self.directoryNavigation.canGoBack
+            } catch is CancellationError {
+                return
+            } catch {
+                self.statusText = Self.readableMessage(for: error)
+            }
+        }
+    }
+
+    /// 【MODIFIED】职责：为当前文件夹顺序或随机播放收集全部子目录视频；输出视频，不改变现有播放实现。
+    func videosInCurrentFolder() async throws -> [SMBSpikeMediaItem] {
+        let client = try await ensureLibraryClient()
+        return try await client.videosRecursively(in: directoryNavigation.currentID)
+    }
+
+    /// 【MODIFIED】职责：向儿童目录页报告目录读取失败；输入为错误，副作用是更新状态文字。
+    func reportDirectoryError(_ error: Error) {
+        statusText = Self.readableMessage(for: error)
+    }
+
+    /// 【MODIFIED】职责：反馈文件夹没有可播放视频；副作用仅更新状态文字。
+    func reportEmptyFolder() {
+        statusText = "这个文件夹没有可播放的视频"
+    }
+
+    /// 【MODIFIED】职责：提供列表连接；缓存可展示时仍需实际建立 SMB 连接。
+    private func ensureLibraryClient() async throws -> SMBSpikeClient {
+        if let libraryClient { return libraryClient }
+        let client = try SMBSpikeClient(configuration: SMBSpikeConfigurationStore.load())
+        try await client.connect()
+        libraryClient = client
+        return client
     }
 
     func play(
@@ -451,12 +589,14 @@ final class SMBHomeViewModel: ObservableObject {
     }
 
     private func updateCoverContentIDs(for items: [SMBSpikeMediaItem]) {
-        coverContentIDs = BabyPlayerContentIdentityResolver.mappings(for: items.map {
-            BabyPlayerContentIdentityInput(
-                sourceID: Self.sourceID(for: $0),
-                displayName: $0.displayName,
-                fileNameOrPath: $0.name
-            )
+        // 【MODIFIED】已有别名继续命中历史封面；新文件只用 Samba 路径 ID，不再按同名跨源关联。
+        let aliases = UserDefaults.standard.dictionary(forKey: "BabyPlayer.ContentAliasesV1") as? [String: String] ?? [:]
+        coverContentIDs = Dictionary(uniqueKeysWithValues: items.map { item in
+            let sourceID = Self.sourceID(for: item)
+            return (sourceID, BabyPlayerContentIdentityResolver.resolvedContentID(
+                for: sourceID,
+                existingAliases: aliases
+            ))
         })
     }
 

@@ -2,6 +2,7 @@
 // SpikeRootView.swift
 // BabyPlayer V1 界面：家长配对、儿童首页、家长设置和系统播放器入口。
 // 最近修改：2026-08-22 接入应用封面、封面抽帧和本地评分入口。
+// 最近修改：【MODIFIED】Phase 2 在现有双源首页接入共用文件夹导航组件。
 //
 
 import SwiftUI
@@ -87,6 +88,10 @@ struct SpikeRootView: View {
             .ignoresSafeArea()
         }
         .onReceive(smbModel.$mediaItems) { items in
+            model.registerSMBMediaItems(items)
+        }
+        // 【MODIFIED】深层目录未必进入旧五层索引；当前层视频也要登记来源专属身份。
+        .onReceive(smbModel.$directoryVideos) { items in
             model.registerSMBMediaItems(items)
         }
     }
@@ -272,8 +277,9 @@ private struct ChildrenHomeView: View {
     @Binding var showSettings: Bool
 
     private var pages: [[JellyfinMediaItem]] {
-        stride(from: 0, to: model.filteredMediaItems.count, by: 12).map { start in
-            Array(model.filteredMediaItems[start..<min(start + 12, model.filteredMediaItems.count)])
+        // 【MODIFIED】首页只展示当前目录的视频，文件夹由共用组件负责。
+        stride(from: 0, to: model.filteredDirectoryItems.count, by: 12).map { start in
+            Array(model.filteredDirectoryItems[start..<min(start + 12, model.filteredDirectoryItems.count)])
         }
     }
 
@@ -282,35 +288,43 @@ private struct ChildrenHomeView: View {
             OrchardBackground()
             VStack(alignment: .leading, spacing: 14) {
                 header
+                // 【MODIFIED】Jellyfin 和 Samba 复用相同的文件夹入口及逐级返回交互。
+                BabyPlayerFolderSection(
+                    name: model.directoryName,
+                    folders: model.directoryFolders,
+                    canGoBack: model.canGoBackInDirectory,
+                    goBack: model.leaveDirectory,
+                    open: model.openDirectory
+                )
                 mediaPages
                 footer
             }
             // SwiftUI 已应用 tvOS 80/60pt 安全区，不再重复叠加大边距。
             .padding(.horizontal, 4)
         }
-        .onExitCommand { }
+        .onExitCommand { model.leaveDirectory() }
     }
 
     private var header: some View {
         HStack(spacing: 14) {
             Text("音乐视频")
                 .font(.system(size: 31, weight: .bold, design: .rounded))
-            Text("\(model.filteredMediaItems.count) 首")
+            Text("\(model.filteredDirectoryItems.count) 首")
                 .font(.system(size: 18, weight: .medium, design: .rounded))
                 .foregroundStyle(BabyPlayerPalette.muted)
             Button {
-                model.playAll(shuffled: false)
+                model.playCurrentFolder(shuffled: false)
             } label: {
-                Label("顺序播放", systemImage: "play.fill")
+                Label("顺序播放此文件夹", systemImage: "play.fill")
                     .font(.system(size: 19, weight: .semibold, design: .rounded))
                     .padding(.horizontal, 16)
                     .frame(height: 52)
             }
             .buttonStyle(LowContrastButtonStyle())
             Button {
-                model.playAll(shuffled: true)
+                model.playCurrentFolder(shuffled: true)
             } label: {
-                Label("随机播放", systemImage: "shuffle")
+                Label("随机播放此文件夹", systemImage: "shuffle")
                     .font(.system(size: 19, weight: .semibold, design: .rounded))
                     .padding(.horizontal, 16)
                     .frame(height: 52)
@@ -349,7 +363,8 @@ private struct ChildrenHomeView: View {
     @ViewBuilder
     private var mediaPages: some View {
         if pages.isEmpty {
-            Text("这个分类还没有内容")
+            // 【MODIFIED】有子文件夹但本层无视频时，提示儿童继续进入文件夹。
+            Text(model.directoryFolders.isEmpty ? "这个文件夹还没有视频" : "选择上方文件夹继续浏览")
                 .font(.title2)
                 .foregroundStyle(BabyPlayerPalette.muted)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -376,7 +391,7 @@ private struct ChildrenHomeView: View {
     private var footer: some View {
         HStack {
             Text(model.statusText.isEmpty
-                 ? "上下翻页  ·  \(model.filteredMediaItems.count) 个视频"
+                 ? "上下翻页  ·  当前目录 \(model.filteredDirectoryItems.count) 个视频"
                  : model.statusText)
                 .font(.system(size: 17, weight: .medium, design: .rounded))
                 .foregroundStyle(BabyPlayerPalette.muted)
@@ -397,7 +412,8 @@ private struct SMBChildrenHomeView: View {
     @Binding var showSettings: Bool
 
     private var visibleItems: [SMBSpikeMediaItem] {
-        let items = model.mediaItems.filter {
+        // 【MODIFIED】只展示当前目录视频，旧平面缓存不决定儿童目录边界。
+        let items = model.directoryVideos.filter {
             preferences.rating(for: sourceID(for: $0)) != .blocked
         }
         guard let resumeID = preferences.playbackResumeState?.itemID,
@@ -422,13 +438,20 @@ private struct SMBChildrenHomeView: View {
             OrchardBackground()
             VStack(alignment: .leading, spacing: 14) {
                 header
+                BabyPlayerFolderSection(
+                    name: model.directoryName,
+                    folders: model.directoryFolders,
+                    canGoBack: model.canGoBackInDirectory,
+                    goBack: model.leaveDirectory,
+                    open: model.openDirectory
+                )
                 mediaPages
                 footer
             }
             .padding(.horizontal, 4)
         }
         .task { model.connectIfNeeded() }
-        .onExitCommand { }
+        .onExitCommand { model.leaveDirectory() }
     }
 
     private var header: some View {
@@ -439,25 +462,25 @@ private struct SMBChildrenHomeView: View {
                 .font(.system(size: 18, weight: .medium, design: .rounded))
                 .foregroundStyle(BabyPlayerPalette.muted)
             Button {
-                play(items: visibleItems, startIndex: 0, behavior: .sequential)
+                playCurrentFolder(shuffled: false)
             } label: {
-                Label("顺序播放", systemImage: "play.fill")
+                Label("顺序播放此文件夹", systemImage: "play.fill")
                     .font(.system(size: 19, weight: .semibold, design: .rounded))
                     .padding(.horizontal, 16)
                     .frame(height: 52)
             }
             .buttonStyle(LowContrastButtonStyle())
-            .disabled(visibleItems.isEmpty)
+            .disabled(model.isWorking)
             Button {
-                play(items: visibleItems, startIndex: 0, behavior: .shuffle)
+                playCurrentFolder(shuffled: true)
             } label: {
-                Label("随机播放", systemImage: "shuffle")
+                Label("随机播放此文件夹", systemImage: "shuffle")
                     .font(.system(size: 19, weight: .semibold, design: .rounded))
                     .padding(.horizontal, 16)
                     .frame(height: 52)
             }
             .buttonStyle(LowContrastButtonStyle())
-            .disabled(visibleItems.isEmpty)
+            .disabled(model.isWorking)
             Button {
                 let liked = visibleItems.filter {
                     preferences.rating(for: sourceID(for: $0)) == .liked
@@ -501,7 +524,9 @@ private struct SMBChildrenHomeView: View {
         if pages.isEmpty {
             VStack(spacing: 22) {
                 if model.isWorking { ProgressView() }
-                Text(model.statusText)
+                Text(model.directoryFolders.isEmpty
+                     ? model.statusText
+                     : "选择上方文件夹继续浏览")
                     .font(.title2)
                     .foregroundStyle(BabyPlayerPalette.muted)
                     .multilineTextAlignment(.center)
@@ -547,6 +572,27 @@ private struct SMBChildrenHomeView: View {
 
     private func sourceID(for item: SMBSpikeMediaItem) -> String {
         "smb:\(item.path)"
+    }
+
+    /// 【MODIFIED】职责：从当前文件夹递归收集视频，再交给原 Samba 播放队列；输入为播放顺序。
+    private func playCurrentFolder(shuffled: Bool) {
+        Task {
+            do {
+                let all = try await model.videosInCurrentFolder()
+                let visible = all.filter { preferences.rating(for: sourceID(for: $0)) != .blocked }
+                guard !visible.isEmpty else {
+                    model.reportEmptyFolder()
+                    return
+                }
+                play(
+                    items: visible,
+                    startIndex: 0,
+                    behavior: shuffled ? .shuffle : .sequential
+                )
+            } catch {
+                model.reportDirectoryError(error)
+            }
+        }
     }
 
     private func play(

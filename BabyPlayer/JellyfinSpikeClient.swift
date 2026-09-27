@@ -3,6 +3,7 @@
 // 用途：封装技术 Spike 所需的最小 Jellyfin HTTP API。
 // 主要功能：服务器探测、Quick Connect、读取视频库和生成直放 URL。
 // 最近修改：2026-08-24 接收 Jellyfin 本机 Path，供 Mac 本地歌词分析读取原视频。
+// 最近修改：【MODIFIED】Phase 2 增加逐层目录与文件夹递归视频读取，保留原直放 API。
 //
 
 import Foundation
@@ -90,6 +91,8 @@ struct JellyfinChapter: Decodable {
 struct JellyfinMediaItem: Decodable, Identifiable {
     let id: String
     let name: String
+    // 【MODIFIED】目录查询同时返回文件夹和视频，需要保留 Jellyfin 的 Type。
+    let itemType: String?
     let path: String?
     let collectionType: String?
     let artists: [String]?
@@ -101,6 +104,7 @@ struct JellyfinMediaItem: Decodable, Identifiable {
     enum CodingKeys: String, CodingKey {
         case id = "Id"
         case name = "Name"
+        case itemType = "Type"
         case path = "Path"
         case collectionType = "CollectionType"
         case artists = "Artists"
@@ -267,6 +271,88 @@ struct JellyfinSpikeClient {
             throw JellyfinSpikeError.noVideo
         }
         return response.items
+    }
+
+    /// 【MODIFIED】职责：定位当前用户的音乐视频库根目录；输入为用户凭证，输出为可保存的 Jellyfin 文件夹 ID。
+    func fetchMusicVideoRoot(userID: String, accessToken: String) async throws -> BabyPlayerFolderNode {
+        let views: JellyfinItemsResponse = try await send(
+            path: "UserViews",
+            queryItems: [URLQueryItem(name: "userId", value: userID)],
+            accessToken: accessToken
+        )
+        guard let library = views.items.first(where: {
+            $0.collectionType?.caseInsensitiveCompare("musicvideos") == .orderedSame
+        }) ?? views.items.first(where: {
+            $0.name.caseInsensitiveCompare("音乐视频") == .orderedSame
+        }) else { throw JellyfinSpikeError.musicVideoLibraryNotFound }
+        return BabyPlayerFolderNode(id: library.id, name: library.name)
+    }
+
+    /// 【MODIFIED】职责：按 Jellyfin 父目录 ID 分页读取直接子项；输出当前层文件夹和视频，不扁平化。
+    func fetchDirectory(
+        userID: String,
+        accessToken: String,
+        parentID: String
+    ) async throws -> BabyPlayerDirectoryListing<JellyfinMediaItem> {
+        var folders: [BabyPlayerFolderNode] = []
+        var videos: [JellyfinMediaItem] = []
+        var startIndex = 0
+        let pageSize = 200
+        while true {
+            try Task.checkCancellation()
+            let response: JellyfinItemsResponse = try await send(
+                path: "Items",
+                queryItems: [
+                    URLQueryItem(name: "userId", value: userID),
+                    URLQueryItem(name: "parentId", value: parentID),
+                    URLQueryItem(name: "recursive", value: "false"),
+                    URLQueryItem(name: "includeItemTypes", value: "Folder,CollectionFolder,Video,MusicVideo"),
+                    URLQueryItem(name: "fields", value: "MediaSources,Path,Chapters,Artists,ImageTags"),
+                    URLQueryItem(name: "sortBy", value: "SortName"),
+                    URLQueryItem(name: "sortOrder", value: "Ascending"),
+                    URLQueryItem(name: "startIndex", value: String(startIndex)),
+                    URLQueryItem(name: "limit", value: String(pageSize))
+                ],
+                accessToken: accessToken
+            )
+            for item in response.items {
+                switch item.itemType {
+                case "Folder", "CollectionFolder":
+                    folders.append(BabyPlayerFolderNode(id: item.id, name: item.name))
+                case "Video", "MusicVideo":
+                    videos.append(item)
+                default:
+                    break
+                }
+            }
+            guard response.items.count == pageSize else { break }
+            startIndex += response.items.count
+        }
+        return BabyPlayerDirectoryListing(folders: folders, videos: videos)
+    }
+
+    /// 【MODIFIED】职责：为文件夹播放收集所有下层视频；输入为已验证的根内文件夹 ID，输出按目录遍历顺序排列的视频。
+    func fetchFolderVideos(
+        userID: String,
+        accessToken: String,
+        folderID: String
+    ) async throws -> [JellyfinMediaItem] {
+        var pending = [folderID]
+        var visited = Set<String>()
+        var videos: [JellyfinMediaItem] = []
+        while !pending.isEmpty {
+            try Task.checkCancellation()
+            let next = pending.removeFirst()
+            guard visited.insert(next).inserted else { continue }
+            let listing = try await fetchDirectory(
+                userID: userID,
+                accessToken: accessToken,
+                parentID: next
+            )
+            videos.append(contentsOf: listing.videos)
+            pending.append(contentsOf: listing.folders.map(\.id))
+        }
+        return videos
     }
 
     /// 保留 Spike 的单视频调用语义，供首条视频快捷播放使用。
