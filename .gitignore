@@ -15,3 +15,9 @@ BabyPlayerASRServer/.cache/
 # Local-only tvOS build secret. The committed example contains placeholders only.
 Config/BabyPlayerSecrets.xcconfig
 Config/BabyPlayerSMBSecrets.xcconfig
+
+# 【MODIFIED】BabyPlayer 百度独立服务的本地凭证、虚拟环境与测试缓存。
+BabyPlayerBaiduServer/.env
+BabyPlayerBaiduServer/.venv/
+BabyPlayerBaiduServer/.pytest_cache/
+BabyPlayerBaiduServer/**/__pycache__/

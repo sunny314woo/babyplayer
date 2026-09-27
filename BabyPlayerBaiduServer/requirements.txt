@@ -1,0 +1,9 @@
+# 用途：独立百度授权服务的 Python 运行与测试依赖。
+# 主要功能：固定 FastAPI、MySQL 原生驱动、HTTP 客户端与凭证加密依赖。
+# 最近修改：【MODIFIED】Phase 5 建立最小服务依赖，不引入 ORM。
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pymysql>=1.1,<2
+httpx>=0.27,<1
+cryptography>=44,<47
+pytest>=8,<10
