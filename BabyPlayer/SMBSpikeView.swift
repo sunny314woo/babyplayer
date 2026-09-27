@@ -5,7 +5,7 @@
 // Phase A：仅在 feature flag 开启时显示的 SMB 真机诊断页和最小系统播放入口。
 // 用途：Samba 连接配置、儿童首页与原生播放器入口。
 // 主要功能：连接扫描、目录展示、封面和 Samba 播放队列。
-// 最近修改：【MODIFIED】Phase 2 为 Samba 首页增加逐层目录浏览，保留原 Range 播放链。
+// 最近修改：【MODIFIED】Phase 3 提供 Samba 在线检测与首次加载结果。
 //
 
 import AVFoundation
@@ -161,6 +161,9 @@ final class SMBHomeViewModel: ObservableObject {
     @Published private(set) var canGoBackInDirectory = false
     @Published private(set) var statusText = "正在准备光猫 U 盘媒体库…"
     @Published private(set) var isWorking = false
+    // 【MODIFIED】首次加载成败独立于可显示的旧缓存；缓存存在不代表 Samba 在线。
+    @Published private(set) var isOnline = false
+    @Published private(set) var hasAttemptedConnection = false
     @Published var activePlayback: SpikePlaybackSelection?
 
     private var libraryClient: SMBSpikeClient?
@@ -231,7 +234,9 @@ final class SMBHomeViewModel: ObservableObject {
         connectAndScan()
     }
 
+    /// 【MODIFIED】职责：连接并加载 Samba 根内目录；输出在线状态，失败时保留可显示的旧缓存。
     func connectAndScan() {
+        hasAttemptedConnection = false
         replaceOperation { [weak self] in
             guard let self else { return }
             do {
@@ -273,6 +278,8 @@ final class SMBHomeViewModel: ObservableObject {
                     self.prewarmCovers(for: items, client: libraryClient)
                 }
                 self.statusText = "光猫 U 盘 · Samba · 当前目录 \(self.directoryVideos.count) 个视频"
+                self.isOnline = true
+                self.hasAttemptedConnection = true
                 #if DEBUG
                 print("BABYPLAYER_SMB_HOME_RESULT ready count=\(items.count)")
                 #endif
@@ -280,11 +287,33 @@ final class SMBHomeViewModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                self.isOnline = false
+                self.hasAttemptedConnection = true
                 let failure = Self.readableMessage(for: error)
                 self.statusText = self.mediaItems.isEmpty
                     ? failure
                     : "当前显示 \(self.mediaItems.count) 个缓存视频 · \(failure)"
             }
+        }
+    }
+
+    /// 【MODIFIED】职责：只检测已配置 Samba 的 Root Folder 能否读取；输入现有 Keychain 配置，输出在线布尔值。
+    func probeSambaOnline() async -> Bool {
+        guard SMBSpikeConfigurationStore.hasSavedConfiguration else { return false }
+        do {
+            let configuration = SMBSpikeConfigurationStore.load()
+            let client = try SMBSpikeClient(configuration: configuration)
+            try await client.connect()
+            do {
+                _ = try await client.listDirectory(at: configuration.rootPath)
+                await client.disconnect()
+                return true
+            } catch {
+                await client.disconnect()
+                return false
+            }
+        } catch {
+            return false
         }
     }
 

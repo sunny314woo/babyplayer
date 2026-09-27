@@ -3,7 +3,7 @@
 // BabyPlayerTests
 //
 // SMB 直连 Spike 的纯逻辑回归测试：路径边界、媒体过滤和 AVPlayer Range 规划。
-// 最近修改：【MODIFIED】Phase 2 覆盖目录恢复、根目录边界、旧缓存和 Jellyfin 多层目录。
+// 最近修改：【MODIFIED】Phase 3 覆盖三源状态、优先级、启动选择和播放中禁用回退。
 //
 
 import AVFoundation
@@ -93,6 +93,86 @@ final class SMBSpikeTests: XCTestCase {
             ),
             .samba
         )
+    }
+
+    /// 【MODIFIED】职责：验证三个来源均有独立的未配置、离线与在线状态。
+    func testAllMediaSourceConfigurationAndOnlineStates() {
+        XCTAssertEqual(Set(BabyPlayerMediaSourceKind.allCases), [.samba, .baidu, .jellyfin])
+        for _ in BabyPlayerMediaSourceKind.allCases {
+            XCTAssertEqual(BabyPlayerMediaSourceStatusPolicy.resolve(
+                isConfigured: false, isReachable: false
+            ), .unconfigured)
+            XCTAssertEqual(BabyPlayerMediaSourceStatusPolicy.resolve(
+                isConfigured: false, isReachable: true
+            ), .unconfigured)
+            XCTAssertEqual(BabyPlayerMediaSourceStatusPolicy.resolve(
+                isConfigured: true, isReachable: false
+            ), .offline)
+            XCTAssertEqual(BabyPlayerMediaSourceStatusPolicy.resolve(
+                isConfigured: true, isReachable: true
+            ), .online)
+        }
+    }
+
+    /// 【MODIFIED】职责：默认 NAS 优先，家长排序跨重启保存且旧默认来源不能覆盖新规则。
+    func testMediaSourcePriorityPersistsAndIgnoresLegacyActiveSource() {
+        let suite = "BabyPlayerTests.SourcePriority.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            XCTFail("Unable to create isolated defaults")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(BabyPlayerMediaSourceKind.jellyfin.rawValue, forKey: "BabyPlayer.ActiveMediaSource.v1")
+        XCTAssertEqual(BabyPlayerMediaSourcePriorityStore.load(defaults: defaults),
+                       [.samba, .baidu, .jellyfin])
+        BabyPlayerMediaSourcePriorityStore.save([.jellyfin, .samba, .baidu], defaults: defaults)
+        XCTAssertEqual(BabyPlayerMediaSourcePriorityStore.load(defaults: defaults),
+                       [.jellyfin, .samba, .baidu])
+        defaults.set(["unknown", "baidu", "baidu"], forKey: "BabyPlayer.MediaSourcePriority.v1")
+        XCTAssertEqual(BabyPlayerMediaSourcePriorityStore.load(defaults: defaults),
+                       [.baidu, .samba, .jellyfin])
+    }
+
+    /// 【MODIFIED】职责：验证启动选择最高在线源、单源离线回退及全部离线返回配置态。
+    func testStartupSourceSelectionAndInitialFallback() {
+        let priority = BabyPlayerMediaSourceSelectionPolicy.defaultPriority
+        XCTAssertEqual(priority.first, .samba)
+        let allOnline: [BabyPlayerMediaSourceKind: BabyPlayerMediaSourceAvailability] = [
+            .samba: .online, .baidu: .online, .jellyfin: .online
+        ]
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.highestOnline(
+            priority: priority, states: allOnline
+        ), .samba)
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.highestOnline(
+            priority: priority, states: allOnline, excluding: [.samba]
+        ), .baidu)
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.highestOnline(
+            priority: [.jellyfin, .samba, .baidu], states: allOnline
+        ), .jellyfin)
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.highestOnline(
+            priority: priority,
+            states: [.samba: .offline, .baidu: .unconfigured, .jellyfin: .online]
+        ), .jellyfin)
+        XCTAssertNil(BabyPlayerMediaSourceSelectionPolicy.highestOnline(
+            priority: priority,
+            states: [.samba: .offline, .baidu: .unconfigured, .jellyfin: .offline]
+        ))
+    }
+
+    /// 【MODIFIED】职责：播放中断线时永不允许跨源自动切换。
+    func testAutomaticSwitchIsLimitedToLaunchAndInitialLoad() {
+        XCTAssertTrue(BabyPlayerMediaSourceSelectionPolicy.mayAutoSwitch(
+            for: .appLaunch, isPlaybackActive: false
+        ))
+        XCTAssertTrue(BabyPlayerMediaSourceSelectionPolicy.mayAutoSwitch(
+            for: .initialLibraryLoadFailure, isPlaybackActive: false
+        ))
+        XCTAssertFalse(BabyPlayerMediaSourceSelectionPolicy.mayAutoSwitch(
+            for: .playbackDisconnect, isPlaybackActive: false
+        ))
+        XCTAssertFalse(BabyPlayerMediaSourceSelectionPolicy.mayAutoSwitch(
+            for: .initialLibraryLoadFailure, isPlaybackActive: true
+        ))
     }
 
     /// 【MODIFIED】职责：验证历史内容 ID 不丢失，新视频停止按同名跨来源建立关联。

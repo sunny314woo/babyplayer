@@ -2,7 +2,7 @@
 // SpikeRootView.swift
 // BabyPlayer V1 界面：家长配对、儿童首页、家长设置和系统播放器入口。
 // 最近修改：2026-08-22 接入应用封面、封面抽帧和本地评分入口。
-// 最近修改：【MODIFIED】Phase 2 在现有双源首页接入共用文件夹导航组件。
+// 最近修改：【MODIFIED】Phase 3 启动时按在线状态和优先级选择来源，并仅在初次加载失败时回退。
 //
 
 import SwiftUI
@@ -23,20 +23,36 @@ struct SpikeRootView: View {
     @StateObject private var model = SpikeViewModel()
     @StateObject private var smbModel = SMBHomeViewModel()
     @State private var showSettings = false
-    @State private var activeMediaSource = BabyPlayerMediaSourcePreference.load()
+    @State private var showSMBOnboarding = false
+    // 【MODIFIED】旧 ActiveMediaSource 只作历史数据保存；启动来源由在线探测和优先级确定。
+    @State private var activeMediaSource: BabyPlayerMediaSourceKind = .samba
+    @State private var sourcePriority = BabyPlayerMediaSourcePriorityStore.load()
+    @State private var sourceStatuses: [BabyPlayerMediaSourceKind: BabyPlayerMediaSourceAvailability] = [:]
+    @State private var isCheckingSources = true
+    @State private var hasOnlineSource = false
+    @State private var isInitialLibraryLoad = true
+    @State private var attemptedInitialSources: Set<BabyPlayerMediaSourceKind> = []
 
     var body: some View {
         Group {
-            if activeMediaSource == .samba {
+            if isCheckingSources {
+                ProgressView("正在检查媒体源…")
+            } else if !hasOnlineSource {
+                // 【MODIFIED】Phase 4 会把此处改成三来源的独立配置入口。
+                OnboardingView(model: model, connectSamba: { showSMBOnboarding = true })
+            } else if activeMediaSource == .samba {
                 SMBChildrenHomeView(
                     model: smbModel,
                     preferences: model,
                     showSettings: $showSettings
                 )
-            } else {
+            } else if activeMediaSource == .jellyfin {
                 switch model.appState {
                 case .onboarding:
-                    OnboardingView(model: model)
+                    OnboardingView(
+                        model: model,
+                        connectSamba: { showSMBOnboarding = true }
+                    )
                 case .loading:
                     LoadingLibraryView(repair: model.startRePairing)
                 case .home:
@@ -47,6 +63,8 @@ struct SpikeRootView: View {
                         repair: model.startRePairing
                     )
                 }
+            } else {
+                Text("百度网盘尚未完成授权")
             }
         }
         .fullScreenCover(isPresented: $showSettings) {
@@ -58,6 +76,9 @@ struct SpikeRootView: View {
                 selectSamba: { selectMediaSource(.samba) },
                 close: { showSettings = false }
             )
+        }
+        .fullScreenCover(isPresented: $showSMBOnboarding) {
+            SMBSpikeView(close: finishSambaOnboarding)
         }
         .fullScreenCover(item: $model.activePlayback) { selection in
             SystemPlayerView(
@@ -94,15 +115,117 @@ struct SpikeRootView: View {
         .onReceive(smbModel.$directoryVideos) { items in
             model.registerSMBMediaItems(items)
         }
+        // 【MODIFIED】只在初始媒体库加载失败时回退；正常播放和后续断线均保持原来源。
+        .onReceive(smbModel.$hasAttemptedConnection) { attempted in
+            guard attempted, activeMediaSource == .samba, isInitialLibraryLoad else { return }
+            if smbModel.isOnline {
+                isInitialLibraryLoad = false
+            } else {
+                fallBackAfterInitialLoadFailure()
+            }
+        }
+        .onReceive(model.$appState) { state in
+            guard !isCheckingSources else { return }
+            // 【MODIFIED】无在线来源时新完成 Quick Connect，立即进入 Jellyfin 首页。
+            if !hasOnlineSource, case .home = state {
+                activeMediaSource = .jellyfin
+                hasOnlineSource = true
+                isInitialLibraryLoad = false
+                return
+            }
+            guard activeMediaSource == .jellyfin, isInitialLibraryLoad else { return }
+            handleJellyfinInitialState(state)
+        }
+        .task { await selectStartupSource() }
     }
 
+    /// 【MODIFIED】职责：探测已配置来源，并按家长优先级选择在线媒体库；百度在授权阶段前保持未配置。
+    @MainActor
+    private func selectStartupSource() async {
+        let sambaConfigured = SMBSpikeConfigurationStore.hasSavedConfiguration
+        let jellyfinConfigured = model.hasSavedJellyfinConfiguration
+        async let sambaOnline = sambaConfigured ? smbModel.probeSambaOnline() : false
+        async let jellyfinOnline = jellyfinConfigured ? model.probeJellyfinOnline() : false
+        sourceStatuses = [
+            .samba: BabyPlayerMediaSourceStatusPolicy.resolve(
+                isConfigured: sambaConfigured, isReachable: await sambaOnline
+            ),
+            .jellyfin: BabyPlayerMediaSourceStatusPolicy.resolve(
+                isConfigured: jellyfinConfigured, isReachable: await jellyfinOnline
+            ),
+            .baidu: .unconfigured
+        ]
+        sourcePriority = BabyPlayerMediaSourcePriorityStore.load()
+        if let source = BabyPlayerMediaSourceSelectionPolicy.highestOnline(
+            priority: sourcePriority, states: sourceStatuses
+        ) {
+            activeMediaSource = source
+            hasOnlineSource = true
+            isCheckingSources = false
+            if source == .jellyfin {
+                handleJellyfinInitialState(model.appState)
+            }
+        } else {
+            hasOnlineSource = false
+            isInitialLibraryLoad = false
+            isCheckingSources = false
+        }
+    }
+
+    /// 【MODIFIED】职责：把 Jellyfin 初始加载结果交给启动回退规则；输入现有应用状态，无播放中切源副作用。
+    private func handleJellyfinInitialState(_ state: BabyPlayerAppState) {
+        switch state {
+        case .home:
+            isInitialLibraryLoad = false
+        case .unavailable:
+            fallBackAfterInitialLoadFailure()
+        case .onboarding, .loading:
+            break
+        }
+    }
+
+    /// 【MODIFIED】职责：仅在启动后的初次加载失败时选下一个在线来源；耗尽后进入配置入口。
+    private func fallBackAfterInitialLoadFailure() {
+        guard isInitialLibraryLoad,
+              BabyPlayerMediaSourceSelectionPolicy.mayAutoSwitch(
+                for: .initialLibraryLoadFailure,
+                isPlaybackActive: model.activePlayback != nil || smbModel.activePlayback != nil
+              ) else { return }
+        attemptedInitialSources.insert(activeMediaSource)
+        sourceStatuses[activeMediaSource] = .offline
+        guard let next = BabyPlayerMediaSourceSelectionPolicy.highestOnline(
+            priority: sourcePriority,
+            states: sourceStatuses,
+            excluding: attemptedInitialSources
+        ) else {
+            hasOnlineSource = false
+            isInitialLibraryLoad = false
+            return
+        }
+        activeMediaSource = next
+        if next == .jellyfin {
+            handleJellyfinInitialState(model.appState)
+        }
+    }
+
+    /// 【MODIFIED】职责：处理家长手动切换；输入目标来源，不改优先级或旧默认来源键。
     private func selectMediaSource(_ source: BabyPlayerMediaSourceKind) {
-        BabyPlayerMediaSourcePreference.save(source)
+        isInitialLibraryLoad = false
         activeMediaSource = source
         showSettings = false
         if source == .samba {
             smbModel.connectIfNeeded()
         }
+    }
+
+    /// 【MODIFIED】职责：完成 Samba 配置后进入该媒体库；副作用是启动扫描而非改写默认优先级。
+    private func finishSambaOnboarding() {
+        showSMBOnboarding = false
+        guard SMBSpikeConfigurationStore.hasSavedConfiguration else { return }
+        isInitialLibraryLoad = false
+        hasOnlineSource = true
+        activeMediaSource = .samba
+        smbModel.connectAndScan()
     }
 }
 
@@ -142,6 +265,7 @@ struct OrchardBackground: View {
 
 private struct OnboardingView: View {
     @ObservedObject var model: SpikeViewModel
+    let connectSamba: () -> Void
 
     var body: some View {
         ZStack {
@@ -175,8 +299,12 @@ private struct OnboardingView: View {
             Text("打开就能看，专属宝宝的 Apple TV 播放器")
                 .font(.system(size: 30, weight: .medium, design: .rounded))
                 .foregroundStyle(BabyPlayerPalette.muted)
-            Button("开始设置", action: model.showServerStep)
-                .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.coral))
+            HStack(spacing: 20) {
+                Button("连接局域网 U 盘", action: connectSamba)
+                    .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.coral))
+                Button("连接 Jennifer · Jellyfin", action: model.showServerStep)
+                    .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.berry))
+            }
         }
     }
 

@@ -2,7 +2,7 @@
 // SpikeViewModel.swift
 // BabyPlayer 产品状态：首次配对、持久授权、儿童首页和播放队列。
 // 最近修改：2026-08-24 将 Jellyfin 本机媒体路径随队列交给 Mac 本地歌词分析。
-// 最近修改：【MODIFIED】Phase 2 加入 Jellyfin 目录导航，并冻结历史跨源内容别名。
+// 最近修改：【MODIFIED】Phase 3 提供 Jellyfin 配置与在线检测，供启动选择器使用。
 //
 
 import Combine
@@ -738,6 +738,30 @@ final class SpikeViewModel: ObservableObject {
 
     var connectionSummary: String {
         accessToken == nil ? "未连接" : "已连接"
+    }
+
+    /// 【MODIFIED】职责：判断是否保存过完整 Jellyfin 授权；输出供三来源状态机使用。
+    var hasSavedJellyfinConfiguration: Bool {
+        JellyfinCredentialStore.load() != nil
+    }
+
+    /// 【MODIFIED】职责：用现有授权验证音乐视频目录是否可读；输出启动时的在线状态，不修改播放状态。
+    func probeJellyfinOnline() async -> Bool {
+        guard let authenticatedUserID, let accessToken,
+              let client = try? makeClient() else { return false }
+        do {
+            let root = try await client.fetchMusicVideoRoot(
+                userID: authenticatedUserID, accessToken: accessToken
+            )
+            _ = try await client.fetchDirectory(
+                userID: authenticatedUserID,
+                accessToken: accessToken,
+                parentID: root.id
+            )
+            return true
+        } catch {
+            return false
+        }
     }
 
     func showServerStep() {

@@ -4,7 +4,7 @@
 //
 // Phase A：SMB 真机播放 Spike 的配置、路径规则和只读媒体模型。
 // 这些类型与现有 Jellyfin 主链隔离，Spike 通过后再提升为正式媒体源模型。
-// 最近修改：【MODIFIED】Phase 2 从旧平面缓存恢复目录入口，不改变缓存文件格式。
+// 最近修改：【MODIFIED】Phase 3 扩展来源类型；旧来源选择仅保留为迁移数据。
 //
 
 import CryptoKit
@@ -17,20 +17,22 @@ enum BabyPlayerFeatureFlags {
         if let stored = UserDefaults.standard.object(forKey: smbDirectPlaybackKey) as? Bool {
             return stored
         }
-        #if DEBUG
+        // Samba 已完成真机验证并成为正式媒体源。新安装的 Release 包也必须
+        // 展示双通道入口；运行时覆盖仅用于必要时紧急关闭该链路。
         return true
-        #else
-        return false
-        #endif
     }
 }
 
 /// 家长最后一次选定的媒体轨道。选择立即持久化，下次启动不再默认跳回 Jellyfin。
-enum BabyPlayerMediaSourceKind: String, Equatable {
+/// 【MODIFIED】上一行是旧版本行为记录；Phase 3 启动改由在线状态与优先级决定。
+/// 【MODIFIED】职责：标识三个独立媒体库；输出为稳定协议值，供持久化和未来后端使用。
+enum BabyPlayerMediaSourceKind: String, CaseIterable, Codable, Equatable {
     case jellyfin
     case samba
+    case baidu
 }
 
+/// 【MODIFIED】职责：保留旧版来源偏好的读写与迁移测试；新启动逻辑不再调用它。
 enum BabyPlayerMediaSourcePreference {
     private static let activeSourceKey = "BabyPlayer.ActiveMediaSource.v1"
 
