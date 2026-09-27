@@ -40,13 +40,13 @@ python3 -m venv .venv
 
 ## Lightsail 部署前置
 
-1. 百度开发者完成实名认证、创建 BabyPlayer 应用并确认 `basic,netdisk` scope、回调域名及个人应用的授权范围。网页 OAuth 的 `client_id` 对应 App Key；App ID 不用于这条服务端授权链。
+1. 百度开发者完成实名认证、创建 BabyPlayer 应用并确认 `basic,netdisk` scope、回调域名及个人应用的授权范围。网页 OAuth 的 `client_id` 对应 App Key；短数字 App ID 仅用于识别控制台应用，不能填入 `BABYPLAYER_BAIDU_CLIENT_ID`。
 2. 确定 `babyplayer-api.wisteriasoftware.uk` 或替代域名，指向独立 Lightsail 常驻 FastAPI 服务并配置 HTTPS。
 3. 在独立 MySQL 数据库执行 `schema.sql`。生产环境配置 `.env.example` 中的变量，生成 Fernet 密钥并保存在服务器；不提交 `.env`。例如 `python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`。
 4. 以 systemd 常驻运行 `uvicorn babyplayer_baidu.main:app --host 127.0.0.1 --port 8011`，由 Nginx 反代并限制配对接口速率。`GET /health` 用于探测。
 5. 将官网私有页面部署后，使用真实百度账号做 OAuth、列目录、保存 Root、电视自动恢复测试。之后才进入 Phase 6 播放 Spike。
 
-当前代码与静态页只在本地；虽然本机已有应用凭证，百度授权预检仍报 `redirect_uri_mismatch`，且现有 `ssh wisteria` 连接超时。未获得可访问服务器与通过验证的回调前，不能宣称已部署或已联机。电视上的已安装包仍为 Phase 2，不能扫码百度。
+当前代码与静态页只在本地；百度授权入口预检已通过，但完整授权和目录读取尚未完成，现有 `ssh wisteria` 连接仍超时。未获得可访问服务器并完成真实闭环前，不能宣称已部署或已联机。电视上的已安装包仍为 Phase 2，不能扫码百度。
 
 ## 百度官方依据
 

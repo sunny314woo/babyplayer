@@ -14,7 +14,7 @@
 ## 当前阻塞与界限
 
 - 用户已完成开发者实名认证，并在百度个人版控制台创建 BabyPlayer 应用。本机 Git 忽略的 `.env` 已填写 App Key 与 Secret Key，权限为 0600；服务端 OAuth 的 `client_id` 与 Chrome 中该应用的 App Key 已核对一致，未把具体值写入提交或文档。
-- 已在百度应用安全设置中保存完整回调 `https://babyplayer-api.wisteriasoftware.uk/v1/oauth/callback`，用户也确认该专用域名；但实际授权入口仍返回 `redirect_uri_mismatch`。`redirect_uri=oob` 可打开百度登录页，说明错误聚焦于回调校验；真实 OAuth 尚未通过。
+- 已在百度应用安全设置中保存完整回调 `https://babyplayer-api.wisteriasoftware.uk/v1/oauth/callback`，用户也确认该专用域名。起初授权入口短暂返回 `redirect_uri_mismatch`；2026-09-27 复检已进入百度登录/授权页。用户试将短数字 App ID 填入 OAuth `client_id` 时，百度明确返回 `invalid_client`；恢复为 32 位 App Key 后，`oob` 和专用回调两种预检均进入授权页。App ID 仅单独记录，不参与 OAuth。尚待浏览器用户授权、换令牌和真实目录读取。
 - 用户确认使用现有同一台服务器，但现有 `ssh wisteria` 的 22 端口连接超时；等待可连接的 SSH 信息。部署前必须核查现有 Outline 支付服务与 English Follow 服务的端口、Nginx、MySQL；BabyPlayer 用独立 `/opt/babyplayer-baidu`、库/用户、systemd unit、子域名，不重启现有两个应用。未部署服务或静态页。
 - 检查百度控制台页面结构时，工具输出曾意外包含页面显示的密钥；测试可继续，正式上线前应轮换相关密钥并更新服务器环境。
 - tvOS 的 Phase 4 百度入口仍为禁用状态；实体 Apple TV 仍是 Phase 2 包。待服务、域名、百度应用可用后接入扫码和状态；Phase 6 Spike 通过前不接入百度播放。
@@ -22,4 +22,4 @@
 
 ## 下个安全步骤
 
-先解决百度回调校验并取得可连接的 SSH 信息；只读核查现有服务后配置独立 HTTPS/MySQL，部署并做真实 OAuth + 目录闭环。若个人应用无法使用所需网盘能力，停止扩大实现，向用户明确提出这一冻结需求冲突。
+先完成当前 Chrome 授权诊断并取得可连接的 SSH 信息；只读核查现有服务后配置独立 HTTPS/MySQL，部署并做真实 OAuth + 目录闭环。若个人应用无法使用所需网盘能力，停止扩大实现，向用户明确提出这一冻结需求冲突。
