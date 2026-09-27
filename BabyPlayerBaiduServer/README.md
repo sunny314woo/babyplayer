@@ -7,6 +7,7 @@
 ## 边界
 
 - 独立于 English Follow 的 `account-server`，使用自己的 MySQL 数据库、服务进程和密钥。
+- 同一主机部署时使用独立目录 `/opt/babyplayer-baidu`、独立 systemd unit、独立数据库用户与库、独立 HTTPS 子域名；部署前在服务器核对端口占用。不得重启或改写 Outline 支付服务与 English Follow 服务。
 - 每台设备单独生成高熵令牌；每台设备只绑定一个百度账号、一个 Root Folder。其他设备各自授权，数据不混用。
 - 手机配置页放在官网的 `/babyplayer/connect.html`，不加入公开导航。链接内的 15 分钟配对码位于 URL fragment，不发给静态站点服务器。
 - 设备/配对令牌在 MySQL 只存 SHA-256 摘要；百度 access/refresh token 和回跳配对码以 Fernet 加密。百度 Secret 只放服务端环境。
@@ -39,13 +40,13 @@ python3 -m venv .venv
 
 ## Lightsail 部署前置
 
-1. 百度开发者完成实名认证、创建 BabyPlayer 应用并确认 `basic,netdisk` scope、回调域名及个人应用的授权范围。
+1. 百度开发者完成实名认证、创建 BabyPlayer 应用并确认 `basic,netdisk` scope、回调域名及个人应用的授权范围。网页 OAuth 的 `client_id` 对应 App Key；App ID 不用于这条服务端授权链。
 2. 确定 `babyplayer-api.wisteriasoftware.uk` 或替代域名，指向独立 Lightsail 常驻 FastAPI 服务并配置 HTTPS。
 3. 在独立 MySQL 数据库执行 `schema.sql`。生产环境配置 `.env.example` 中的变量，生成 Fernet 密钥并保存在服务器；不提交 `.env`。例如 `python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`。
 4. 以 systemd 常驻运行 `uvicorn babyplayer_baidu.main:app --host 127.0.0.1 --port 8011`，由 Nginx 反代并限制配对接口速率。`GET /health` 用于探测。
 5. 将官网私有页面部署后，使用真实百度账号做 OAuth、列目录、保存 Root、电视自动恢复测试。之后才进入 Phase 6 播放 Spike。
 
-当前代码与静态页只在本地；没有 Lightsail IP、百度应用凭证和已批准的回调时，不能宣称已部署或已联机。电视上的已安装包仍为 Phase 2，不能扫码百度。
+当前代码与静态页只在本地；虽然本机已有应用凭证，百度授权预检仍报 `redirect_uri_mismatch`，且现有 `ssh wisteria` 连接超时。未获得可访问服务器与通过验证的回调前，不能宣称已部署或已联机。电视上的已安装包仍为 Phase 2，不能扫码百度。
 
 ## 百度官方依据
 
