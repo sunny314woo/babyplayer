@@ -2,7 +2,7 @@
 // BabyPlayerMediaSourceState.swift
 // 用途：定义三来源共有的配置、在线和优先级规则。
 // 主要功能：保存家长优先级，选择启动时最高优先级的在线媒体源。
-// 最近修改：【MODIFIED】Phase 3 新增与 tvOS 视图无关的来源状态逻辑。
+// 最近修改：【MODIFIED】Phase 4 增加可测试的家长优先级调整规则。
 //
 
 import Foundation
@@ -56,6 +56,19 @@ enum BabyPlayerMediaSourceSelectionPolicy {
         for source in defaultPriority where !order.contains(source) {
             order.append(source)
         }
+        return order
+    }
+
+    /// 【MODIFIED】职责：移动一个来源的优先级；输入来源和方向，输出完整新顺序，边界处保持原样。
+    static func moving(
+        _ source: BabyPlayerMediaSourceKind,
+        by offset: Int,
+        in priority: [BabyPlayerMediaSourceKind]
+    ) -> [BabyPlayerMediaSourceKind] {
+        var order = normalizedPriority(priority.map(\.rawValue))
+        guard let index = order.firstIndex(of: source),
+              order.indices.contains(index + offset) else { return order }
+        order.swapAt(index, index + offset)
         return order
     }
 

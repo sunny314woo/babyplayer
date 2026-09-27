@@ -3,7 +3,7 @@
 // BabyPlayerTests
 //
 // SMB 直连 Spike 的纯逻辑回归测试：路径边界、媒体过滤和 AVPlayer Range 规划。
-// 最近修改：【MODIFIED】Phase 3 覆盖三源状态、优先级、启动选择和播放中禁用回退。
+// 最近修改：【MODIFIED】Phase 4 验证家长调整三来源顺序的边界与持久化。
 //
 
 import AVFoundation
@@ -130,6 +130,21 @@ final class SMBSpikeTests: XCTestCase {
                        [.jellyfin, .samba, .baidu])
         defaults.set(["unknown", "baidu", "baidu"], forKey: "BabyPlayer.MediaSourcePriority.v1")
         XCTAssertEqual(BabyPlayerMediaSourcePriorityStore.load(defaults: defaults),
+                       [.baidu, .samba, .jellyfin])
+    }
+
+    /// 【MODIFIED】职责：验证家长上移/下移只交换相邻来源，边界或重复输入不破坏完整顺序。
+    func testParentPriorityMovementKeepsAllThreeSources() {
+        let initial = BabyPlayerMediaSourceSelectionPolicy.defaultPriority
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.moving(.baidu, by: -1, in: initial),
+                       [.baidu, .samba, .jellyfin])
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.moving(.samba, by: -1, in: initial),
+                       initial)
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.moving(.jellyfin, by: 1, in: initial),
+                       initial)
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.moving(.baidu, by: 1, in: initial),
+                       [.samba, .jellyfin, .baidu])
+        XCTAssertEqual(BabyPlayerMediaSourceSelectionPolicy.moving(.baidu, by: -1, in: [.baidu]),
                        [.baidu, .samba, .jellyfin])
     }
 

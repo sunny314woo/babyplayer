@@ -2,7 +2,7 @@
 // SpikeRootView.swift
 // BabyPlayer V1 界面：家长配对、儿童首页、家长设置和系统播放器入口。
 // 最近修改：2026-08-22 接入应用封面、封面抽帧和本地评分入口。
-// 最近修改：【MODIFIED】Phase 3 启动时按在线状态和优先级选择来源，并仅在初次加载失败时回退。
+// 最近修改：【MODIFIED】Phase 4 展示三源配置状态与家长优先级入口。
 //
 
 import SwiftUI
@@ -39,7 +39,11 @@ struct SpikeRootView: View {
                 ProgressView("正在检查媒体源…")
             } else if !hasOnlineSource {
                 // 【MODIFIED】Phase 4 会把此处改成三来源的独立配置入口。
-                OnboardingView(model: model, connectSamba: { showSMBOnboarding = true })
+                OnboardingView(
+                    model: model,
+                    sourceStatuses: sourceStatuses,
+                    connectSamba: { showSMBOnboarding = true }
+                )
             } else if activeMediaSource == .samba {
                 SMBChildrenHomeView(
                     model: smbModel,
@@ -51,6 +55,7 @@ struct SpikeRootView: View {
                 case .onboarding:
                     OnboardingView(
                         model: model,
+                        sourceStatuses: sourceStatuses,
                         connectSamba: { showSMBOnboarding = true }
                     )
                 case .loading:
@@ -72,6 +77,9 @@ struct SpikeRootView: View {
                 model: model,
                 smbModel: smbModel,
                 activeMediaSource: activeMediaSource,
+                sourcePriority: sourcePriority,
+                sourceStatuses: sourceStatuses,
+                movePriority: movePriority,
                 selectJellyfin: { selectMediaSource(.jellyfin) },
                 selectSamba: { selectMediaSource(.samba) },
                 close: { showSettings = false }
@@ -124,8 +132,28 @@ struct SpikeRootView: View {
                 fallBackAfterInitialLoadFailure()
             }
         }
+        // 【MODIFIED】家长页显示最新 Samba 连接结果；旧缓存不会让离线来源被标为在线。
+        .onReceive(smbModel.$isOnline) { online in
+            guard !isCheckingSources else { return }
+            sourceStatuses[.samba] = BabyPlayerMediaSourceStatusPolicy.resolve(
+                isConfigured: SMBSpikeConfigurationStore.hasSavedConfiguration,
+                isReachable: online
+            )
+        }
         .onReceive(model.$appState) { state in
             guard !isCheckingSources else { return }
+            // 【MODIFIED】Jellyfin 状态在配对、载入和故障后同步给家长设置。
+            switch state {
+            case .home:
+                sourceStatuses[.jellyfin] = .online
+            case .unavailable, .onboarding:
+                sourceStatuses[.jellyfin] = BabyPlayerMediaSourceStatusPolicy.resolve(
+                    isConfigured: model.hasSavedJellyfinConfiguration,
+                    isReachable: false
+                )
+            case .loading:
+                break
+            }
             // 【MODIFIED】无在线来源时新完成 Quick Connect，立即进入 Jellyfin 首页。
             if !hasOnlineSource, case .home = state {
                 activeMediaSource = .jellyfin
@@ -208,6 +236,14 @@ struct SpikeRootView: View {
         }
     }
 
+    /// 【MODIFIED】职责：响应家长上移或下移；副作用是持久化完整优先级，不改变当前播放来源。
+    private func movePriority(_ source: BabyPlayerMediaSourceKind, _ offset: Int) {
+        sourcePriority = BabyPlayerMediaSourceSelectionPolicy.moving(
+            source, by: offset, in: sourcePriority
+        )
+        BabyPlayerMediaSourcePriorityStore.save(sourcePriority)
+    }
+
     /// 【MODIFIED】职责：处理家长手动切换；输入目标来源，不改优先级或旧默认来源键。
     private func selectMediaSource(_ source: BabyPlayerMediaSourceKind) {
         isInitialLibraryLoad = false
@@ -265,6 +301,7 @@ struct OrchardBackground: View {
 
 private struct OnboardingView: View {
     @ObservedObject var model: SpikeViewModel
+    let sourceStatuses: [BabyPlayerMediaSourceKind: BabyPlayerMediaSourceAvailability]
     let connectSamba: () -> Void
 
     var body: some View {
@@ -300,11 +337,26 @@ private struct OnboardingView: View {
                 .font(.system(size: 30, weight: .medium, design: .rounded))
                 .foregroundStyle(BabyPlayerPalette.muted)
             HStack(spacing: 20) {
-                Button("连接局域网 U 盘", action: connectSamba)
+                Button(
+                    sourceStatuses[.samba] == .offline ? "NAS 重连 / 修改设置" : "NAS 开始设置",
+                    action: connectSamba
+                )
                     .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.coral))
-                Button("连接 Jennifer · Jellyfin", action: model.showServerStep)
+                Button(
+                    sourceStatuses[.jellyfin] == .offline
+                        ? "Jellyfin 重连 / 修改设置" : "Jellyfin 开始设置",
+                    action: model.showServerStep
+                )
                     .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.berry))
+                // 【MODIFIED】Phase 5 后端就绪前展示真实状态，不提供无效的二维码操作。
+                Button("百度网盘 · 扫码连接") { }
+                    .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.leaf))
+                    .disabled(true)
+                    .opacity(0.55)
             }
+            Text("百度网盘授权服务尚未接入；完成后此入口可扫码连接。")
+                .font(.system(size: 20))
+                .foregroundStyle(BabyPlayerPalette.muted)
         }
     }
 
@@ -849,6 +901,9 @@ private struct ParentSettingsView: View {
     @ObservedObject var model: SpikeViewModel
     @ObservedObject var smbModel: SMBHomeViewModel
     let activeMediaSource: BabyPlayerMediaSourceKind
+    let sourcePriority: [BabyPlayerMediaSourceKind]
+    let sourceStatuses: [BabyPlayerMediaSourceKind: BabyPlayerMediaSourceAvailability]
+    let movePriority: (BabyPlayerMediaSourceKind, Int) -> Void
     let selectJellyfin: () -> Void
     let selectSamba: () -> Void
     let close: () -> Void
@@ -869,15 +924,21 @@ private struct ParentSettingsView: View {
                 }
             } else if showsMediaSourceSelection {
                 ParentMediaSourceSelectionView(
-                    jellyfinSummary: model.connectionSummary,
                     activeMediaSource: activeMediaSource,
+                    sourcePriority: sourcePriority,
+                    sourceStatuses: sourceStatuses,
+                    movePriority: movePriority,
                     selectJellyfin: {
                         showsMediaSourceSelection = false
                         selectJellyfin()
                     },
                     selectSMB: {
                         showsMediaSourceSelection = false
-                        selectSamba()
+                        if sourceStatuses[.samba] == .unconfigured {
+                            showsSMBConnectionEditor = true
+                        } else {
+                            selectSamba()
+                        }
                     },
                     close: { showsMediaSourceSelection = false }
                 )
@@ -929,21 +990,13 @@ private struct ParentSettingsView: View {
 
                 ScrollView {
                     VStack(spacing: 2) {
-                        if BabyPlayerFeatureFlags.isSMBDirectPlaybackSpikeEnabled {
-                            Button {
-                                showsMediaSourceSelection = true
-                            } label: {
-                                SettingsActionRow(
-                                    title: "媒体源",
-                                    value: activeMediaSource == .samba
-                                        ? "光猫 U 盘 · Samba · \(smbModel.mediaItems.isEmpty ? "连接中" : "已连接")"
-                                        : "Jennifer · Jellyfin · \(model.connectionSummary)"
-                                )
-                            }
-                        } else {
-                            SettingsInfoRow(
-                                title: "媒体源",
-                                value: "Jennifer · Jellyfin · \(model.connectionSummary)"
+                        // 【MODIFIED】来源设置始终可见；Samba 紧急开关不隐藏其他来源。
+                        Button {
+                            showsMediaSourceSelection = true
+                        } label: {
+                            SettingsActionRow(
+                                title: "媒体源与优先级",
+                                value: "\(activeMediaSource.displayName) · \(sourceStatuses[activeMediaSource]?.displayName ?? "检测中")"
                             )
                         }
                         if BabyPlayerFeatureFlags.isSMBDirectPlaybackSpikeEnabled {
@@ -1044,10 +1097,12 @@ private struct ParentSettingsView: View {
     }
 }
 
-/// 家长手工选择播放轨道；SMB 模式直接进入路由器 U 盘媒体库。
+/// 家长手工选择播放轨道，并调整下次启动时三来源的优先级。
 private struct ParentMediaSourceSelectionView: View {
-    let jellyfinSummary: String
     let activeMediaSource: BabyPlayerMediaSourceKind
+    let sourcePriority: [BabyPlayerMediaSourceKind]
+    let sourceStatuses: [BabyPlayerMediaSourceKind: BabyPlayerMediaSourceAvailability]
+    let movePriority: (BabyPlayerMediaSourceKind, Int) -> Void
     let selectJellyfin: () -> Void
     let selectSMB: () -> Void
     let close: () -> Void
@@ -1067,25 +1122,60 @@ private struct ParentMediaSourceSelectionView: View {
                     .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.berry))
             }
 
-            VStack(spacing: 16) {
-                Button(action: selectJellyfin) {
-                    MediaSourceChoiceLabel(
-                        icon: "desktopcomputer",
-                        title: "Jennifer",
-                        subtitle: "Jellyfin · \(jellyfinSummary) · 需要 Mac 服务",
-                        badge: activeMediaSource == .jellyfin ? "当前默认" : "选择"
-                    )
-                }
-                Button(action: selectSMB) {
-                    MediaSourceChoiceLabel(
-                        icon: "externaldrive.connected.to.line.below",
-                        title: "光猫 U 盘（Samba）",
-                        subtitle: "192.168.1.1 · usb-0781-060116_1/sss73 · 播放不经过 Mac",
-                        badge: activeMediaSource == .samba ? "当前默认" : "选择"
-                    )
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(spacing: 12) {
+                        Button(action: selectSMB) {
+                            MediaSourceChoiceLabel(
+                                icon: BabyPlayerMediaSourceKind.samba.sourceIcon,
+                                title: BabyPlayerMediaSourceKind.samba.displayName,
+                                subtitle: "\(sourceStatuses[.samba]?.displayName ?? "检测中") · 播放不经过 Mac",
+                                badge: activeMediaSource == .samba ? "当前播放" : "选择"
+                            )
+                        }
+                        Button(action: selectJellyfin) {
+                            MediaSourceChoiceLabel(
+                                icon: BabyPlayerMediaSourceKind.jellyfin.sourceIcon,
+                                title: BabyPlayerMediaSourceKind.jellyfin.displayName,
+                                subtitle: "\(sourceStatuses[.jellyfin]?.displayName ?? "检测中") · 需要 Jennifer 服务",
+                                badge: activeMediaSource == .jellyfin ? "当前播放" : "选择"
+                            )
+                        }
+                        // 【MODIFIED】Phase 5 前保留第三来源状态，但禁止无效的扫码操作。
+                        Button { } label: {
+                            MediaSourceChoiceLabel(
+                                icon: BabyPlayerMediaSourceKind.baidu.sourceIcon,
+                                title: BabyPlayerMediaSourceKind.baidu.displayName,
+                                subtitle: "\(sourceStatuses[.baidu]?.displayName ?? "未配置") · 授权服务尚未接入",
+                                badge: "扫码连接"
+                            )
+                        }
+                        .disabled(true)
+                        .opacity(0.55)
+                    }
+                    .buttonStyle(MediaSourceChoiceButtonStyle())
+
+                    Text("启动优先级 · 第一名是默认来源")
+                        .font(.system(size: 27, weight: .bold, design: .rounded))
+                    ForEach(sourcePriority, id: \.self) { source in
+                        let index = sourcePriority.firstIndex(of: source) ?? 0
+                        HStack(spacing: 18) {
+                            Text("\(index + 1). \(source.displayName)")
+                                .font(.system(size: 23, weight: .semibold, design: .rounded))
+                            Spacer()
+                            Text(sourceStatuses[source]?.displayName ?? "检测中")
+                                .foregroundStyle(BabyPlayerPalette.muted)
+                            Button("上移") { movePriority(source, -1) }
+                                .disabled(index == 0)
+                            Button("下移") { movePriority(source, 1) }
+                                .disabled(index == sourcePriority.count - 1)
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 10)
+                        .background(BabyPlayerPalette.dayPanel, in: RoundedRectangle(cornerRadius: 16))
+                    }
                 }
             }
-            .buttonStyle(MediaSourceChoiceButtonStyle())
 
             Text("字幕生成仍可使用 Mac；Mac 离线时只影响新字幕任务，不影响 U 盘视频和已有字幕。")
                 .font(.system(size: 20, weight: .medium, design: .rounded))
@@ -1128,6 +1218,39 @@ private struct MediaSourceChoiceLabel: View {
         .padding(.horizontal, 28)
         .frame(maxWidth: .infinity, minHeight: 116)
         .contentShape(RoundedRectangle(cornerRadius: 24))
+    }
+}
+
+/// 【MODIFIED】职责：将稳定来源值转为 tvOS 显示名称和图标；不参与业务选择规则。
+private extension BabyPlayerMediaSourceKind {
+    /// 【MODIFIED】职责：输出家长设置与首次启动共用的来源名称。
+    var displayName: String {
+        switch self {
+        case .samba: return "NAS / Samba"
+        case .baidu: return "百度网盘"
+        case .jellyfin: return "Jellyfin"
+        }
+    }
+
+    /// 【MODIFIED】职责：输出各来源在 tvOS 上的系统图标名称。
+    var sourceIcon: String {
+        switch self {
+        case .samba: return "externaldrive.connected.to.line.below"
+        case .baidu: return "cloud"
+        case .jellyfin: return "desktopcomputer"
+        }
+    }
+}
+
+/// 【MODIFIED】职责：把三态映射到家长可读文字；输入状态，输出展示文案。
+private extension BabyPlayerMediaSourceAvailability {
+    /// 【MODIFIED】职责：输出当前配置或网络状态的短文案。
+    var displayName: String {
+        switch self {
+        case .unconfigured: return "未配置"
+        case .offline: return "离线 / 不可用"
+        case .online: return "在线"
+        }
     }
 }
 
