@@ -1,4 +1,7 @@
 // !$*UTF8*$!
+// 用途：BabyPlayer tvOS 工程文件。
+// 主要功能：登记应用与测试的 Swift 源文件、目标和签名设置。
+// 最近修改：【MODIFIED】Phase 5 登记百度设备绑定 UI 及协议测试文件。
 {
 	archiveVersion = 1;
 	classes = {
@@ -24,10 +27,12 @@
 		A10000000000000000000011 /* SMBSpikeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* SMBSpikeView.swift */; };
 		D10000000000000000000001 /* BabyPlayerDirectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000001 /* BabyPlayerDirectory.swift */; };
 		D10000000000000000000002 /* BabyPlayerMediaSourceState.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000002 /* BabyPlayerMediaSourceState.swift */; };
+		D10000000000000000000003 /* BaiduBinding.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000003 /* BaiduBinding.swift */; };
 		A10000000000000000000012 /* AMSMB2 in Frameworks */ = {isa = PBXBuildFile; productRef = C10000000000000000000001 /* AMSMB2 */; };
 		A10000000000000000000013 /* AMSMB2 in Embed Frameworks */ = {isa = PBXBuildFile; productRef = C10000000000000000000001 /* AMSMB2 */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		B10000000000000000000001 /* LyricsAndASRTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* LyricsAndASRTests.swift */; };
 		B10000000000000000000002 /* SMBSpikeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000003 /* SMBSpikeTests.swift */; };
+		B10000000000000000000004 /* BaiduBindingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* BaiduBindingTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -76,9 +81,11 @@
 		A20000000000000000000013 /* SMBSpikeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBSpikeView.swift; sourceTree = "<group>"; };
 		D20000000000000000000001 /* BabyPlayerDirectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BabyPlayerDirectory.swift; sourceTree = "<group>"; };
 		D20000000000000000000002 /* BabyPlayerMediaSourceState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BabyPlayerMediaSourceState.swift; sourceTree = "<group>"; };
+		D20000000000000000000003 /* BaiduBinding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BaiduBinding.swift; sourceTree = "<group>"; };
 		B20000000000000000000001 /* LyricsAndASRTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsAndASRTests.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* BabyPlayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BabyPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B20000000000000000000003 /* SMBSpikeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBSpikeTests.swift; sourceTree = "<group>"; };
+		B20000000000000000000004 /* BaiduBindingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BaiduBindingTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -128,6 +135,7 @@
 				A20000000000000000000013 /* SMBSpikeView.swift */,
 				D20000000000000000000001 /* BabyPlayerDirectory.swift */,
 				D20000000000000000000002 /* BabyPlayerMediaSourceState.swift */,
+				D20000000000000000000003 /* BaiduBinding.swift */,
 				A2000000000000000000000A /* Assets.xcassets */,
 				A2000000000000000000000B /* BabyLyricsCatalog.json */,
 				A20000000000000000000006 /* Info.plist */,
@@ -158,6 +166,7 @@
 			children = (
 				B20000000000000000000001 /* LyricsAndASRTests.swift */,
 				B20000000000000000000003 /* SMBSpikeTests.swift */,
+				B20000000000000000000004 /* BaiduBindingTests.swift */,
 			);
 			path = BabyPlayerTests;
 			sourceTree = "<group>";
@@ -276,6 +285,7 @@
 				A10000000000000000000011 /* SMBSpikeView.swift in Sources */,
 				D10000000000000000000001 /* BabyPlayerDirectory.swift in Sources */,
 				D10000000000000000000002 /* BabyPlayerMediaSourceState.swift in Sources */,
+				D10000000000000000000003 /* BaiduBinding.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -285,6 +295,7 @@
 			files = (
 				B10000000000000000000001 /* LyricsAndASRTests.swift in Sources */,
 				B10000000000000000000002 /* SMBSpikeTests.swift in Sources */,
+				B10000000000000000000004 /* BaiduBindingTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

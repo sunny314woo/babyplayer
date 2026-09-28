@@ -1,0 +1,27 @@
+# 用途：在现有服务器上独立运行 BabyPlayer 百度授权服务。
+# 主要功能：仅监听本机 8012，隔离于 Outline、English Follow 和 BabyPlayer ASR。
+# 最近修改：【MODIFIED】Phase 5 新建常驻服务模板。
+[Unit]
+Description=BabyPlayer Baidu Binding API
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+# 【MODIFIED】职责：从专属环境文件读取凭证并限制服务权限；输入部署目录，输出本机 API。
+Type=simple
+User=babyplayer-baidu
+Group=babyplayer-baidu
+WorkingDirectory=/opt/babyplayer-baidu
+EnvironmentFile=/opt/babyplayer-baidu/.env
+Environment="PATH=/opt/babyplayer-baidu/.venv/bin"
+# 【MODIFIED】职责：避免 OAuth code/state 被 Uvicorn 访问日志记录；仍保留错误日志。
+ExecStart=/opt/babyplayer-baidu/.venv/bin/uvicorn babyplayer_baidu.main:app --host 127.0.0.1 --port 8012 --no-access-log
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

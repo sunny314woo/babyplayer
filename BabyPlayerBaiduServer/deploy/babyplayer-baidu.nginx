@@ -1,0 +1,32 @@
+# 用途：BabyPlayer 百度绑定 API 专属 HTTPS 虚拟主机。
+# 主要功能：只反向代理本机 8012，不复用现有产品的路由或进程。
+# 最近修改：【MODIFIED】Phase 5 新建独立子域名配置。
+server {
+    # 【MODIFIED】职责：将公开 HTTP 请求升级到 HTTPS；无应用数据处理。
+    listen 80;
+    server_name babyplayer-api.wisteriasoftware.uk;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    # 【MODIFIED】职责：通过现有通配符 Origin 证书暴露独立 API；只代理到 8012。
+    listen 443 ssl http2;
+    server_name babyplayer-api.wisteriasoftware.uk;
+    ssl_certificate /etc/nginx/ssl/origin.pem;
+    ssl_certificate_key /etc/nginx/ssl/origin.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    # 【MODIFIED】职责：OAuth 回调的 code/state 不能进入 URL 访问日志；所有绑定响应禁止缓存。
+    access_log off;
+    add_header Cache-Control "no-store" always;
+    client_max_body_size 64k;
+    proxy_read_timeout 30s;
+
+    location / {
+        proxy_pass http://127.0.0.1:8012;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}

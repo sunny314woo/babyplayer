@@ -2,7 +2,7 @@
 
 用途：承载 BabyPlayer 的设备绑定、百度 OAuth 和 Root Folder 协议。
 主要功能：服务端保管百度凭证，给 Apple TV 与未来 Android 提供相同的版本化状态/目录接口。
-最近修改：【MODIFIED】Phase 5 建立本地可测试闭环；真实百度授权与部署仍待开发者实名认证、应用审核及 Lightsail 地址。
+最近修改：【MODIFIED】Phase 5 已部署独立服务及静态页；真实账号授权和在线播放仍待验收。
 
 ## 边界
 
@@ -11,6 +11,7 @@
 - 每台设备单独生成高熵令牌；每台设备只绑定一个百度账号、一个 Root Folder。其他设备各自授权，数据不混用。
 - 手机配置页放在官网的 `/babyplayer/connect.html`，不加入公开导航。链接内的 15 分钟配对码位于 URL fragment，不发给静态站点服务器。
 - 设备/配对令牌在 MySQL 只存 SHA-256 摘要；百度 access/refresh token 和回跳配对码以 Fernet 加密。百度 Secret 只放服务端环境。
+- 【MODIFIED】OAuth 回调 URL 会带短时 code/state；专属 Nginx 站点关闭访问日志，Uvicorn 使用 `--no-access-log`，避免把它们写入日志。API 响应统一 `Cache-Control: no-store`。
 - 此服务不代理视频，不缓存或下载视频。正式播放链必须等独立 Spike 验证 Range、302、seek 和连续播放。
 
 ## API v1
@@ -43,10 +44,10 @@ python3 -m venv .venv
 1. 百度开发者完成实名认证、创建 BabyPlayer 应用并确认 `basic,netdisk` scope、回调域名及个人应用的授权范围。网页 OAuth 的 `client_id` 对应 App Key；短数字 App ID 仅用于识别控制台应用，不能填入 `BABYPLAYER_BAIDU_CLIENT_ID`。
 2. 确定 `babyplayer-api.wisteriasoftware.uk` 或替代域名，指向独立 Lightsail 常驻 FastAPI 服务并配置 HTTPS。
 3. 在独立 MySQL 数据库执行 `schema.sql`。生产环境配置 `.env.example` 中的变量，生成 Fernet 密钥并保存在服务器；不提交 `.env`。例如 `python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`。
-4. 以 systemd 常驻运行 `uvicorn babyplayer_baidu.main:app --host 127.0.0.1 --port 8011`，由 Nginx 反代并限制配对接口速率。`GET /health` 用于探测。
+4. 以独立 systemd unit 常驻运行 `uvicorn babyplayer_baidu.main:app --host 127.0.0.1 --port 8012`，由专属 Nginx 站点反代。`GET /health` 用于探测。`8011` 是已有 BabyPlayer ASR，不能占用。
 5. 将官网私有页面部署后，使用真实百度账号做 OAuth、列目录、保存 Root、电视自动恢复测试。之后才进入 Phase 6 播放 Spike。
 
-当前代码与静态页只在本地；百度授权入口预检已通过，但完整授权和目录读取尚未完成，现有 `ssh wisteria` 连接仍超时。未获得可访问服务器并完成真实闭环前，不能宣称已部署或已联机。电视上的已安装包仍为 Phase 2，不能扫码百度。
+【MODIFIED】2026-09-28 已在现有服务器创建独立 `/opt/babyplayer-baidu`、专属 MySQL 库/用户、`babyplayer-baidu.service` 与 HTTPS 站点。公网 `/health` 返回 200；真实 MySQL 的未配置设备配对状态已通过。官网私有页已由独立网站发布仓库同步并从正式域名验证。Outline `8000`、English Follow `8010`、ASR `8011` 和 BabyPlayer `8012` 四个服务均保持 active。电视 Phase 5 调试包已用原账号重新签名安装；完整百度 OAuth、目录选择及播放仍需真实设备验收。
 
 ## 百度官方依据
 

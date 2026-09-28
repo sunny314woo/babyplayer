@@ -3,6 +3,7 @@
 // BabyPlayer V1 界面：家长配对、儿童首页、家长设置和系统播放器入口。
 // 最近修改：2026-08-22 接入应用封面、封面抽帧和本地评分入口。
 // 最近修改：【MODIFIED】Phase 4 展示三源配置状态与家长优先级入口。
+// 最近修改：【MODIFIED】Phase 5 接入百度扫码绑定与在线状态；播放仍待独立 Spike。
 //
 
 import SwiftUI
@@ -22,8 +23,11 @@ enum BabyPlayerPalette {
 struct SpikeRootView: View {
     @StateObject private var model = SpikeViewModel()
     @StateObject private var smbModel = SMBHomeViewModel()
+    // 【MODIFIED】职责：独立保持百度绑定状态，不进入 Jellyfin/Samba 播放链。
+    @StateObject private var baiduModel = BaiduBindingViewModel()
     @State private var showSettings = false
     @State private var showSMBOnboarding = false
+    @State private var showBaiduOnboarding = false
     // 【MODIFIED】旧 ActiveMediaSource 只作历史数据保存；启动来源由在线探测和优先级确定。
     @State private var activeMediaSource: BabyPlayerMediaSourceKind = .samba
     @State private var sourcePriority = BabyPlayerMediaSourcePriorityStore.load()
@@ -42,7 +46,8 @@ struct SpikeRootView: View {
                 OnboardingView(
                     model: model,
                     sourceStatuses: sourceStatuses,
-                    connectSamba: { showSMBOnboarding = true }
+                    connectSamba: { showSMBOnboarding = true },
+                    connectBaidu: { showBaiduOnboarding = true }
                 )
             } else if activeMediaSource == .samba {
                 SMBChildrenHomeView(
@@ -56,7 +61,8 @@ struct SpikeRootView: View {
                     OnboardingView(
                         model: model,
                         sourceStatuses: sourceStatuses,
-                        connectSamba: { showSMBOnboarding = true }
+                        connectSamba: { showSMBOnboarding = true },
+                        connectBaidu: { showBaiduOnboarding = true }
                     )
                 case .loading:
                     LoadingLibraryView(repair: model.startRePairing)
@@ -76,6 +82,7 @@ struct SpikeRootView: View {
             ParentSettingsView(
                 model: model,
                 smbModel: smbModel,
+                baiduModel: baiduModel,
                 activeMediaSource: activeMediaSource,
                 sourcePriority: sourcePriority,
                 sourceStatuses: sourceStatuses,
@@ -87,6 +94,10 @@ struct SpikeRootView: View {
         }
         .fullScreenCover(isPresented: $showSMBOnboarding) {
             SMBSpikeView(close: finishSambaOnboarding)
+        }
+        // 【MODIFIED】首次启动也可以扫码；关闭后原有媒体源继续正常显示。
+        .fullScreenCover(isPresented: $showBaiduOnboarding) {
+            BaiduConnectionView(model: baiduModel, close: { showBaiduOnboarding = false })
         }
         .fullScreenCover(item: $model.activePlayback) { selection in
             SystemPlayerView(
@@ -140,6 +151,10 @@ struct SpikeRootView: View {
                 isReachable: online
             )
         }
+        // 【MODIFIED】服务端三态同步到家长设置；Phase 6 前不因百度绑定成功自动进入未验证播放页。
+        .onReceive(baiduModel.$deviceStatus) { status in
+            sourceStatuses[.baidu] = baiduAvailability(status)
+        }
         .onReceive(model.$appState) { state in
             guard !isCheckingSources else { return }
             // 【MODIFIED】Jellyfin 状态在配对、载入和故障后同步给家长设置。
@@ -167,13 +182,15 @@ struct SpikeRootView: View {
         .task { await selectStartupSource() }
     }
 
-    /// 【MODIFIED】职责：探测已配置来源，并按家长优先级选择在线媒体库；百度在授权阶段前保持未配置。
+    /// 【MODIFIED】职责：探测三来源状态，并选择已验证可播放的最高优先级在线媒体库。
     @MainActor
     private func selectStartupSource() async {
         let sambaConfigured = SMBSpikeConfigurationStore.hasSavedConfiguration
         let jellyfinConfigured = model.hasSavedJellyfinConfiguration
         async let sambaOnline = sambaConfigured ? smbModel.probeSambaOnline() : false
         async let jellyfinOnline = jellyfinConfigured ? model.probeJellyfinOnline() : false
+        async let baiduStatus = BaiduBindingClient.deviceStatus()
+        let baidu = try? await baiduStatus
         sourceStatuses = [
             .samba: BabyPlayerMediaSourceStatusPolicy.resolve(
                 isConfigured: sambaConfigured, isReachable: await sambaOnline
@@ -181,11 +198,14 @@ struct SpikeRootView: View {
             .jellyfin: BabyPlayerMediaSourceStatusPolicy.resolve(
                 isConfigured: jellyfinConfigured, isReachable: await jellyfinOnline
             ),
-            .baidu: .unconfigured
+            .baidu: baiduAvailability(baidu)
         ]
         sourcePriority = BabyPlayerMediaSourcePriorityStore.load()
+        // 【MODIFIED】Phase 5 先完成授权闭环；未通过 Phase 6 播放 Spike 前，百度不参加自动播放选择。
+        var playableStates = sourceStatuses
+        playableStates[.baidu] = .offline
         if let source = BabyPlayerMediaSourceSelectionPolicy.highestOnline(
-            priority: sourcePriority, states: sourceStatuses
+            priority: sourcePriority, states: playableStates
         ) {
             activeMediaSource = source
             hasOnlineSource = true
@@ -221,9 +241,12 @@ struct SpikeRootView: View {
               ) else { return }
         attemptedInitialSources.insert(activeMediaSource)
         sourceStatuses[activeMediaSource] = .offline
+        // 【MODIFIED】禁止初次加载失败时回退到尚未验证的百度播放链。
+        var playableStates = sourceStatuses
+        playableStates[.baidu] = .offline
         guard let next = BabyPlayerMediaSourceSelectionPolicy.highestOnline(
             priority: sourcePriority,
-            states: sourceStatuses,
+            states: playableStates,
             excluding: attemptedInitialSources
         ) else {
             hasOnlineSource = false
@@ -233,6 +256,18 @@ struct SpikeRootView: View {
         activeMediaSource = next
         if next == .jellyfin {
             handleJellyfinInitialState(model.appState)
+        }
+    }
+
+    /// 【MODIFIED】职责：把服务器绑定结果转为三态；输入可选设备状态，输出家长可见状态。
+    private func baiduAvailability(_ status: BaiduDeviceStatus?) -> BabyPlayerMediaSourceAvailability {
+        guard let status else {
+            return BaiduBindingClient.savedDeviceToken() == nil ? .unconfigured : .offline
+        }
+        switch status.status {
+        case "online": return .online
+        case "offline": return .offline
+        default: return .unconfigured
         }
     }
 
@@ -303,6 +338,7 @@ private struct OnboardingView: View {
     @ObservedObject var model: SpikeViewModel
     let sourceStatuses: [BabyPlayerMediaSourceKind: BabyPlayerMediaSourceAvailability]
     let connectSamba: () -> Void
+    let connectBaidu: () -> Void
 
     var body: some View {
         ZStack {
@@ -348,13 +384,11 @@ private struct OnboardingView: View {
                     action: model.showServerStep
                 )
                     .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.berry))
-                // 【MODIFIED】Phase 5 后端就绪前展示真实状态，不提供无效的二维码操作。
-                Button("百度网盘 · 扫码连接") { }
+                // 【MODIFIED】Phase 5 启用独立百度设备配对入口。
+                Button("百度网盘 · 扫码连接", action: connectBaidu)
                     .buttonStyle(PrimaryPillButtonStyle(tint: BabyPlayerPalette.leaf))
-                    .disabled(true)
-                    .opacity(0.55)
             }
-            Text("百度网盘授权服务尚未接入；完成后此入口可扫码连接。")
+            Text("百度网盘完成授权后会保存根目录；在线播放需通过独立验证。")
                 .font(.system(size: 20))
                 .foregroundStyle(BabyPlayerPalette.muted)
         }
@@ -900,6 +934,8 @@ private struct MediaCard: View {
 private struct ParentSettingsView: View {
     @ObservedObject var model: SpikeViewModel
     @ObservedObject var smbModel: SMBHomeViewModel
+    // 【MODIFIED】职责：在家长设置内读取百度绑定三态，不触碰已有媒体记录。
+    @ObservedObject var baiduModel: BaiduBindingViewModel
     let activeMediaSource: BabyPlayerMediaSourceKind
     let sourcePriority: [BabyPlayerMediaSourceKind]
     let sourceStatuses: [BabyPlayerMediaSourceKind: BabyPlayerMediaSourceAvailability]
@@ -913,6 +949,7 @@ private struct ParentSettingsView: View {
     @State private var showsBatchAnalysis = false
     @State private var showsMediaSourceSelection = false
     @State private var showsSMBConnectionEditor = false
+    @State private var showsBaiduConnectionEditor = false
 
     var body: some View {
         ZStack {
@@ -921,6 +958,11 @@ private struct ParentSettingsView: View {
                 SMBSpikeView {
                     showsSMBConnectionEditor = false
                     smbModel.connectAndScan()
+                }
+            } else if showsBaiduConnectionEditor {
+                // 【MODIFIED】百度二维码在家长设置内部显示，返回后仍停留在原媒体库。
+                BaiduConnectionView(model: baiduModel) {
+                    showsBaiduConnectionEditor = false
                 }
             } else if showsMediaSourceSelection {
                 ParentMediaSourceSelectionView(
@@ -940,6 +982,10 @@ private struct ParentSettingsView: View {
                             selectSamba()
                         }
                     },
+                    connectBaidu: {
+                        showsMediaSourceSelection = false
+                        showsBaiduConnectionEditor = true
+                    },
                     close: { showsMediaSourceSelection = false }
                 )
             } else if showsBatchAnalysis {
@@ -955,6 +1001,8 @@ private struct ParentSettingsView: View {
             if showsSMBConnectionEditor {
                 showsSMBConnectionEditor = false
                 smbModel.connectAndScan()
+            } else if showsBaiduConnectionEditor {
+                showsBaiduConnectionEditor = false
             } else if showsMediaSourceSelection {
                 showsMediaSourceSelection = false
             } else if showsBatchAnalysis {
@@ -1105,6 +1153,7 @@ private struct ParentMediaSourceSelectionView: View {
     let movePriority: (BabyPlayerMediaSourceKind, Int) -> Void
     let selectJellyfin: () -> Void
     let selectSMB: () -> Void
+    let connectBaidu: () -> Void
     let close: () -> Void
 
     var body: some View {
@@ -1141,17 +1190,15 @@ private struct ParentMediaSourceSelectionView: View {
                                 badge: activeMediaSource == .jellyfin ? "当前播放" : "选择"
                             )
                         }
-                        // 【MODIFIED】Phase 5 前保留第三来源状态，但禁止无效的扫码操作。
-                        Button { } label: {
+                        // 【MODIFIED】家长可以扫码绑定或重新授权；播放能力需单独验证。
+                        Button(action: connectBaidu) {
                             MediaSourceChoiceLabel(
                                 icon: BabyPlayerMediaSourceKind.baidu.sourceIcon,
                                 title: BabyPlayerMediaSourceKind.baidu.displayName,
-                                subtitle: "\(sourceStatuses[.baidu]?.displayName ?? "未配置") · 授权服务尚未接入",
-                                badge: "扫码连接"
+                                subtitle: "\(sourceStatuses[.baidu]?.displayName ?? "未配置") · 连接及设置根目录",
+                                badge: sourceStatuses[.baidu] == .online ? "管理授权" : "扫码连接"
                             )
                         }
-                        .disabled(true)
-                        .opacity(0.55)
                     }
                     .buttonStyle(MediaSourceChoiceButtonStyle())
 
