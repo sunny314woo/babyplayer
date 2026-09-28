@@ -1,6 +1,6 @@
 // 用途：Apple TV 与独立 BabyPlayer 百度绑定 API 通信。
 // 主要功能：设备令牌安全保存、扫码配对、授权状态恢复和二维码展示。
-// 最近修改：【MODIFIED】Phase 5 新增百度连接入口；不接入正式视频播放链。
+// 最近修改：【MODIFIED】绑定完成后自动返回原页面，避免电视停留在扫码页。
 
 import CoreImage.CIFilterBuiltins
 import Foundation
@@ -123,6 +123,8 @@ final class BaiduBindingViewModel: ObservableObject {
     @Published private(set) var pairing: BaiduPairing?
     @Published private(set) var statusText = "正在检查百度连接…"
     @Published private(set) var isWorking = false
+    // 【MODIFIED】职责：只标记本次扫码完成，不把启动时恢复的既有在线状态当作新绑定。
+    @Published private(set) var bindingCompleted = false
 
     /// 【MODIFIED】职责：恢复已有绑定；网络错误保持可重试，不清除设备令牌。
     func refreshStatus() async {
@@ -145,6 +147,7 @@ final class BaiduBindingViewModel: ObservableObject {
     /// 【MODIFIED】职责：生成当前电视专属的短时二维码；副作用为创建服务端配对。
     func beginPairing() async {
         guard !isWorking else { return }
+        bindingCompleted = false
         isWorking = true
         defer { isWorking = false }
         do {
@@ -160,6 +163,8 @@ final class BaiduBindingViewModel: ObservableObject {
         while !Task.isCancelled, pairing != nil {
             await refreshStatus()
             if deviceStatus?.status == "online" {
+                // 【MODIFIED】通知当前扫码页面自动返回；已有绑定的状态刷新不会触发。
+                bindingCompleted = true
                 pairing = nil
                 return
             }
@@ -217,6 +222,10 @@ struct BaiduConnectionView: View {
         .task { await model.refreshStatus() }
         .task(id: model.pairing?.pairingCode) {
             if model.pairing != nil { await model.pollUntilBound() }
+        }
+        // 【MODIFIED】手机保存 Root Folder 后关闭扫码页，交还来源选择或家长设置。
+        .onChange(of: model.bindingCompleted) { _, completed in
+            if completed { close() }
         }
     }
 
