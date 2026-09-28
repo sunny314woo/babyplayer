@@ -91,7 +91,7 @@ def create_app(store, baidu: BaiduGateway, cipher: Fernet, api_origin: str, phon
 
     @app.get("/health")
     def health():
-        """【MODIFIED】职责：供 Lightsail 健康探测；输出无凭证状态。"""
+        """【MODIFIED】职责：供现有 Hetzner 常驻服务健康探测；输出无凭证状态。"""
         return {"ok": True}
 
     @app.post("/v1/pairings")
