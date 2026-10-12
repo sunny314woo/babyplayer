@@ -2,9 +2,9 @@
 
 本文记录已经在“客厅”Apple TV 上验证成功的完整流程，供以后更换 Mac、使用 Mac Mini，或重新安装 Xcode 后部署 BabyPlayer。
 
-## 1. 本次验证成功的环境
+## 1. 首次验证成功的环境（tvOS 26.6）
 
-| 项目 | 当前配置 |
+| 项目 | 首次配置 |
 | --- | --- |
 | Apple TV 名称 | 客厅 |
 | Apple TV 型号 | Apple TV 4K，A2843，128 GB（AppleTV14,1） |
@@ -15,7 +15,7 @@
 | 局域网 | Mac 与 Apple TV 连接同一个 Wi-Fi，没有使用网线 |
 | Mac VPN | VPN 可以保持开启，但不能让局域网发现和局域网流量被隧道接管 |
 | Apple TV VPN | 关闭 |
-| 已安装应用 | BabyPlayer，Bundle ID 为 `com.wufengyu.BabyPlayer` |
+| 已安装应用 | BabyPlayer，Bundle ID 为 `com.wufengyu.BabyPlayerTV` |
 
 当前工程是个人内测版本：暂不包含用户注册、登录、订阅、支付或多用户系统。Apple TV
 连接 Mac 上的 Jennifer/Jellyfin `:8096`，并自动复用同一主机访问本地 AI 服务
@@ -113,7 +113,7 @@ PIN 是临时的配对凭证。建议由使用者看着电视并亲自输入；C
 5. 在 `Team` 中选择自己的开发团队。免费账户通常显示为“姓名（Personal Team）”。
 6. 等待 Xcode 自动生成 `Xcode Managed Profile` 和 `Apple Development` 签名证书。
 
-如果提示 Bundle Identifier 已被占用，把 `com.wufengyu.BabyPlayer` 改成只属于当前账户的标识，例如：
+如果提示 Bundle Identifier 已被占用，把 `com.wufengyu.BabyPlayerTV` 改成只属于当前账户的标识，例如：
 
 ```text
 com.你的英文名.BabyPlayer
@@ -135,7 +135,7 @@ com.你的英文名.BabyPlayer
 
 ```text
 Name         Bundle Identifier         Version   Bundle Version
-BabyPlayer   com.wufengyu.BabyPlayer   0.4       1
+BabyPlayer   com.wufengyu.BabyPlayerTV   0.4       1
 ```
 
 以后只更新 BabyPlayer 代码而没有更换 Mac 时，通常不必重新输入配对 PIN。连接同一个 Wi-Fi，选择“客厅”，再次按 `Command-R` 即可覆盖安装；应用的数据通常会保留。
@@ -237,3 +237,77 @@ Apple TV 与旧 Mac 已配对，不代表会自动信任新的 Mac Mini。换机
 6. 选择“客厅”并重新运行安装。
 
 完成一次后，后续更新通常只需要保持两边连接同一个 Wi-Fi，然后在 Xcode 中按 `Command-R`。
+
+## 11. 2026-10-12：tvOS 27.0 重新签名与部署
+
+### 实际成功的配置
+
+| 项目 | 配置 |
+| --- | --- |
+| Apple TV | 客厅，Apple TV 4K 第三代，tvOS 27.0（24J361） |
+| Xcode | 27.0（27A266a），`/Applications/Xcode.app` |
+| macOS | 26.6.2（25G83） |
+| Bundle ID | `com.wufengyu.BabyPlayerTV` |
+| 已安装版本 | BabyPlayer 1.0，build 4，包含新的双胞胎卡通图标 |
+| 本次描述文件创建时间 | 2026-10-12 15:05:06（北京时间） |
+| 本次描述文件到期时间 | 2026-10-19 15:05:06（北京时间） |
+
+### 本次安装错误的原因
+
+电视已经配对、在线且启用了开发者模式，App 也已经正确签名，但安装停在开发映像
+（Developer Disk Image，DDI）准备阶段。错误链为：
+
+```text
+CoreDeviceError 12040
+  → Cryptex personalization 12051
+  → CryptexKitHost.TatsuError 4
+  → HTTP 401，TSS code 3501
+```
+
+系统日志中的具体信息是 `You must authorize with this server before making this
+request`。本次 Mac 的 Shadowrocket VPN 同时接管了 DNS 和系统 HTTP/HTTPS 代理；
+Apple 映像签发请求经过该网络路径时返回 HTTP 401。临时断开 VPN 后，同一
+`https://gs.apple.com/TSS/controller?action=2` 接口返回 HTTP 200，随后开发映像准备、
+安装和启动全部成功。没有重新登录 Apple ID、重新配对或更换证书。
+
+因此，第 2 节中“Mac VPN 可以保持开启”的条件还需要覆盖 Apple 的签发服务：
+仅绕过局域网设备流量仍可能遇到本次错误。出现以上错误时，先临时断开 Mac VPN，
+在同一个局域网完成部署，再恢复 VPN。无需因为这条 HTTP 401 提示先撤销开发证书。
+
+### 现在的重新签名方法
+
+Personal Team 的设备安装授权由描述文件限制为 7 天；开发证书本身的有效期更长。
+可以在过期之前重新申请授权。普通构建可能复用缓存描述文件，不能只根据
+`Build Succeeded` 判断已获得新的 7 天。
+
+在 Mac 和 Apple TV 已配对、电视开机且位于同一个局域网的情况下，临时断开 Mac VPN，
+然后执行：
+
+```bash
+cd /Users/wufengyu/Projects/AppleTV-儿童播放器
+./Scripts/deploy-to-apple-tv.command --refresh-profile
+```
+
+脚本会先准备开发映像，再备份并移出本应用的 Xcode 管理描述文件，交给 Automatic
+Signing 重新申请授权；随后执行 `clean build`、校验签名、安装并启动应用。
+原描述文件备份保存在
+`~/Library/Developer/Xcode/UserData/BabyPlayerProfileBackups/`，按时间分目录；其中
+`0/` 对应 Xcode UserData 的缓存，`1/` 对应 MobileDevice 的缓存。需要恢复时，将相应
+文件复制回原来的 Provisioning Profiles 目录即可。到期时间以脚本打印的
+`Profile 到期时间` 为准；成功后可以恢复 VPN。
+
+`clean build` 是必要的：本次曾遇到增量构建只更新 `embedded.mobileprovision`、
+没有重新生成包签名的情况，导致签名校验报描述文件被修改。完整清理后重新构建解决。
+脚本现在每次都会清理构建并执行 `codesign --verify --deep --strict`。
+
+当前 Mac 的命令行开发者目录仍指向 CommandLineTools；部署脚本会自动寻找完整 Xcode。
+直接运行设备命令时请显式指定：
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun devicectl device info apps --device 客厅
+```
+
+安装成功需同时确认设备端应用列表与启动结果。本次已查到 BabyPlayer 1.0（build 4），
+`devicectl device process launch` 成功，并在设备进程列表中确认了 BabyPlayer 运行。
+Xcode 首次运行检查也已通过，本次部署没有要求输入管理员密码。

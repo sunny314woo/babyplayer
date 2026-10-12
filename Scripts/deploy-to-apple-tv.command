@@ -12,7 +12,7 @@ project_root="${script_dir:h}"
 project_path="${project_root}/BabyPlayer.xcodeproj"
 scheme="BabyPlayer"
 configuration="Release"
-bundle_id="${BABYPLAYER_BUNDLE_ID:-com.wufengyu.BabyPlayer}"
+bundle_id="${BABYPLAYER_BUNDLE_ID:-com.wufengyu.BabyPlayerTV}"
 team_id="${BABYPLAYER_TEAM_ID:-RD2D85V483}"
 device_selector="${APPLE_TV_DEVICE:-}"
 preferred_device_name="${APPLE_TV_NAME:-客厅}"
@@ -30,6 +30,7 @@ usage() {
 选项：
   --device <名称或标识>  指定 Apple TV 名称、CoreDevice ID 或 UDID
   --debug                使用 Debug 配置（默认是 Release）
+  --refresh-profile      备份本应用的缓存描述文件，让 Xcode 重新申请授权
   --no-launch            安装完成后不启动应用
   --help                 显示本帮助
 
@@ -37,13 +38,14 @@ usage() {
   APPLE_TV_NAME           默认目标名称，默认：客厅
   APPLE_TV_DEVICE         等价于 --device
   BABYPLAYER_TEAM_ID      Xcode Development Team，默认：RD2D85V483
-  BABYPLAYER_BUNDLE_ID    Bundle ID，默认：com.wufengyu.BabyPlayer
+  BABYPLAYER_BUNDLE_ID    Bundle ID，默认：com.wufengyu.BabyPlayerTV
   BABYPLAYER_DERIVED_DATA 构建目录，默认：.derivedData-apple-tv
   DEVELOPER_DIR           Xcode.app 或其 Contents/Developer 路径
 
 示例：
   ./Scripts/deploy-to-apple-tv.command
   ./Scripts/deploy-to-apple-tv.command --device "客厅"
+  ./Scripts/deploy-to-apple-tv.command --refresh-profile
   ./Scripts/deploy-to-apple-tv.command --debug --no-launch
 EOF
 }
@@ -58,6 +60,7 @@ warn() {
 }
 
 no_launch=false
+refresh_profile=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --device)
@@ -67,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --debug)
       configuration="Debug"
+      shift
+      ;;
+    --refresh-profile)
+      refresh_profile=true
       shift
       ;;
     --no-launch)
@@ -91,18 +98,24 @@ resolve_developer_dir() {
   local selected=""
   local candidate=""
 
+  is_full_xcode() {
+    local developer_dir="$1"
+    [[ -x "${developer_dir}/usr/bin/xcodebuild" && \
+       -d "${developer_dir}/Platforms/AppleTVOS.platform" ]]
+  }
+
   if [[ -n "$requested" ]]; then
     if [[ "$requested" == *.app ]]; then
       requested="${requested}/Contents/Developer"
     fi
-    [[ -x "${requested}/usr/bin/xcodebuild" ]] || \
+    is_full_xcode "$requested" || \
       die "DEVELOPER_DIR 不是完整 Xcode 的开发者目录：${requested}"
     print -r -- "$requested"
     return
   fi
 
   selected="$(/usr/bin/xcode-select -p 2>/dev/null || true)"
-  if [[ -x "${selected}/usr/bin/xcodebuild" ]]; then
+  if is_full_xcode "$selected"; then
     print -r -- "$selected"
     return
   fi
@@ -111,7 +124,7 @@ resolve_developer_dir() {
     "/Applications/Xcode.app/Contents/Developer" \
     "/Applications/Xcode-beta.app/Contents/Developer" \
     /Applications/Xcode-*.app/Contents/Developer; do
-    if [[ -x "${candidate}/usr/bin/xcodebuild" ]]; then
+    if is_full_xcode "$candidate"; then
       print -r -- "$candidate"
       return
     fi
@@ -258,6 +271,54 @@ if [[ "$pairing_state" != "" && "$pairing_state" != "paired" ]]; then
   warn "设备当前不是 paired 状态；如果安装失败，请先在 Xcode 的 Devices and Simulators 中完成配对。"
 fi
 
+echo "正在准备 Apple TV 开发映像……"
+if ! "$xcrun_path" devicectl device info ddiServices \
+  --device "$device_id" --auto-mount-ddis --timeout 120 --quiet; then
+  die "开发映像准备失败，尚未开始安装。如果出现 TatsuError / HTTP 401 / 3501，请临时断开 Mac VPN 后重试；仅绕过局域网可能仍会代理 Apple 的映像签发请求。详见 APPLE_TV_XCODE_PAIRING_AND_DEPLOYMENT.md 第 11 节。"
+fi
+
+if [[ "$refresh_profile" == "true" ]]; then
+  echo "正在备份本应用的缓存描述文件；Xcode 将重新申请授权……"
+  "$python3_path" - "$bundle_id" "$team_id" <<'PY'
+import datetime
+import plistlib
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+bundle_id, team_id = sys.argv[1:]
+library = Path.home() / "Library"
+roots = [library / "Developer/Xcode/UserData/Provisioning Profiles",
+         library / "MobileDevice/Provisioning Profiles"]
+backup = library / "Developer/Xcode/UserData/BabyPlayerProfileBackups" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+count = 0
+for index, root in enumerate(roots):
+    for profile in root.glob("*.mobileprovision"):
+        decoded = subprocess.run(["/usr/bin/security", "cms", "-D", "-i", str(profile)],
+                                 capture_output=True)
+        if decoded.returncode:
+            continue
+        try:
+            payload = plistlib.loads(decoded.stdout)
+        except (ValueError, plistlib.InvalidFileException):
+            continue
+        entitlements = payload.get("Entitlements", {})
+        if not (payload.get("IsXcodeManaged") is True
+                and "tvOS" in payload.get("Platform", [])
+                and entitlements.get("get-task-allow") is True
+                and entitlements.get("application-identifier") == team_id + "." + bundle_id):
+            continue
+        destination = backup / str(index) / profile.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(profile, destination)
+        profile.unlink()
+        print("已备份：" + str(destination))
+        count += 1
+print("已备份并移出缓存的描述文件数量：" + str(count))
+PY
+fi
+
 echo "正在使用 Automatic Signing 构建并重新签名……"
 "$xcodebuild_path" \
   -project "$project_path" \
@@ -270,7 +331,7 @@ echo "正在使用 Automatic Signing 构建并重新签名……"
   CODE_SIGN_STYLE=Automatic \
   DEVELOPMENT_TEAM="$team_id" \
   BABYPLAYER_PRODUCT_BUNDLE_IDENTIFIER="$bundle_id" \
-  build
+  clean build
 
 app_path="${derived_data}/Build/Products/${configuration}-appletvos/${scheme}.app"
 [[ -d "$app_path" ]] || die "构建成功但找不到 App 包：$app_path"
@@ -286,10 +347,20 @@ for profile_path in \
   if [[ -f "$profile_path" ]]; then
     profile_plist="$(mktemp "${TMPDIR:-/tmp}/babyplayer-profile.XXXXXX.plist")"
     if "$security_path" cms -D -i "$profile_path" > "$profile_plist" 2>/dev/null; then
-      profile_name="$("$plutil_path" -extract Name raw -o - "$profile_plist" 2>/dev/null || true)"
-      profile_expiration="$("$plutil_path" -extract ExpirationDate raw -o - "$profile_plist" 2>/dev/null || true)"
-      echo "Provisioning Profile：${profile_name:-未命名}"
-      echo "Profile 到期时间：${profile_expiration:-未知}"
+      "$python3_path" - "$profile_plist" <<'PY'
+import datetime
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    profile = plistlib.load(handle)
+print("Provisioning Profile：" + profile.get("Name", "未命名"))
+for key, label in [("CreationDate", "Profile 创建时间"), ("ExpirationDate", "Profile 到期时间")]:
+    value = profile.get(key)
+    if isinstance(value, datetime.datetime):
+        value = value.replace(tzinfo=datetime.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z (%z)")
+    print(label + "：" + str(value))
+PY
     fi
     break
   fi

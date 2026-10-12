@@ -77,7 +77,7 @@ Jellyfin 不需要、也不能作为服务器安装在 Apple TV 上。选择 Sam
 
    - 勾选 `Automatically manage signing`；
    - `Team` 选择你的账户；
-   - 如果 Bundle Identifier 冲突，把 `com.wufengyu.BabyPlayer` 改成只属于你的名称，例如 `com.你的名字.BabyPlayer`。
+   - 当前 330 账户使用 `com.wufengyu.BabyPlayerTV`；如果换账户且 Bundle Identifier 冲突，把它改成只属于你的名称。
 
 4. 让 Mac 和 Apple TV 连接同一个局域网。
 
@@ -114,7 +114,7 @@ Wi-Fi，然后执行下面这一条命令即可。不需要每次重新配对，
 2. 在 Xcode 的 `Window → Devices and Simulators` 中完成 Apple TV 配对。
 3. Mac 和 Apple TV 连接同一个局域网；首次配对时让 Apple TV 保持唤醒，并准备输入电视 PIN。
 4. 确认项目 Target 的 Team 与 Bundle ID 是当前 Apple 账户可用的值。当前工程默认是
-   `RD2D85V483` 与 `com.wufengyu.BabyPlayer`，如果你的账户不同，可以修改工程设置，或使用脚本的环境变量覆盖。
+   `RD2D85V483` 与 `com.wufengyu.BabyPlayerTV`，如果你的账户不同，可以修改工程设置，或使用脚本的环境变量覆盖。
 
 完成准备后，在终端执行单条命令即可：
 
@@ -137,6 +137,7 @@ Wi-Fi，然后执行下面这一条命令即可。不需要每次重新配对，
 
 常用选项：
 
+- `--refresh-profile`：备份并移出本应用的缓存描述文件，让 Xcode 重新申请授权；可以在 7 天到期前使用，到期时间以脚本输出为准；
 - `--debug`：构建 Debug 版本；默认构建 Release 版本；
 - `--no-launch`：只安装，不自动启动；
 - `--help`：查看完整参数和环境变量。
@@ -149,6 +150,12 @@ Wi-Fi，然后执行下面这一条命令即可。不需要每次重新配对，
 若 Apple TV 不在线、未配对、与 Mac 不在同一局域网，脚本会在查找设备或安装阶段停止；重新连接设备后
 再次执行同一条命令即可。若构建阶段提示证书或 Provisioning Profile，先打开 Xcode 手动运行一次
 BabyPlayer，让 Xcode 完成账户授权和 Automatic Signing 初始化。
+
+2026-10-12 已在 tvOS 27.0 + Xcode 27.0 上重新验证部署。若开发映像准备阶段出现
+`TatsuError`、HTTP 401 或服务器代码 3501，请临时断开 Mac VPN 后重新执行，完成安装后
+恢复 VPN。本次 Shadowrocket 的 Apple 签发请求经代理返回 401，断开后返回 200 并成功
+安装；仅绕过局域网不能保证签发请求可用。详细记录见
+[部署手册第 11 节](APPLE_TV_XCODE_PAIRING_AND_DEPLOYMENT.md#11-2026-10-12tvos-270-重新签名与部署)。
 
 ### 自动定时部署（暂不启用）
 

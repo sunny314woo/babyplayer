@@ -1,77 +1,63 @@
 import AppKit
+import ImageIO
 
-private let canvas = CGSize(width: 1280, height: 768)
-private let orange = NSColor(calibratedRed: 0.976, green: 0.345, blue: 0.025, alpha: 1)
-private let brown = NSColor(calibratedRed: 0.235, green: 0.090, blue: 0.035, alpha: 1)
-private let cream = NSColor(calibratedRed: 1.000, green: 0.957, blue: 0.855, alpha: 1)
+private let outputSize = CGSize(width: 1280, height: 768)
 
 guard CommandLine.arguments.count == 2 else {
     fputs("Usage: render_app_icon.swift OUTPUT.png\n", stderr)
     exit(2)
 }
 
-guard let context = CGContext(
-    data: nil,
-    width: Int(canvas.width),
-    height: Int(canvas.height),
-    bitsPerComponent: 8,
-    bytesPerRow: Int(canvas.width) * 4,
-    space: CGColorSpaceCreateDeviceRGB(),
-    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-) else {
-    fputs("Unable to create graphics context\n", stderr)
+let scriptURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+let sourceURL = scriptURL.deletingLastPathComponent()
+    .appendingPathComponent("babyplayer-app-icon-source.png")
+let outputURL = URL(fileURLWithPath: CommandLine.arguments[1])
+
+guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+    fputs("Unable to load icon source: \(sourceURL.path)\n", stderr)
     exit(1)
 }
-context.setAllowsAntialiasing(true)
-context.setShouldAntialias(true)
 
-context.setFillColor(orange.cgColor)
-context.fill(CGRect(origin: .zero, size: canvas))
+let targetAspect = outputSize.width / outputSize.height
+let sourceAspect = CGFloat(image.width) / CGFloat(image.height)
+let cropRect: CGRect
+if sourceAspect > targetAspect {
+    let cropWidth = CGFloat(image.height) * targetAspect
+    cropRect = CGRect(x: (CGFloat(image.width) - cropWidth) / 2,
+                      y: 0,
+                      width: cropWidth,
+                      height: CGFloat(image.height))
+} else {
+    let cropHeight = CGFloat(image.width) / targetAspect
+    cropRect = CGRect(x: 0,
+                      y: (CGFloat(image.height) - cropHeight) / 2,
+                      width: CGFloat(image.width),
+                      height: cropHeight)
+}
 
-// A deliberately neutral child seen from behind: round head, tiny hair tuft,
-// short neck, and simple shoulders. It remains a single silhouette.
-context.setFillColor(brown.cgColor)
-context.fillEllipse(in: CGRect(x: 248, y: 286, width: 390, height: 390))
-context.fillEllipse(in: CGRect(x: 216, y: 386, width: 78, height: 104))
-context.fillEllipse(in: CGRect(x: 592, y: 386, width: 78, height: 104))
-context.fill(CGRect(x: 405, y: 242, width: 82, height: 96))
+guard let croppedImage = image.cropping(to: cropRect),
+      let context = CGContext(
+        data: nil,
+        width: Int(outputSize.width),
+        height: Int(outputSize.height),
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+      ) else {
+    fputs("Unable to prepare icon rendering context\n", stderr)
+    exit(1)
+}
 
-let shoulders = CGMutablePath()
-shoulders.move(to: CGPoint(x: 222, y: 104))
-shoulders.addCurve(to: CGPoint(x: 665, y: 104),
-                   control1: CGPoint(x: 246, y: 245),
-                   control2: CGPoint(x: 640, y: 245))
-shoulders.addLine(to: CGPoint(x: 665, y: 86))
-shoulders.addLine(to: CGPoint(x: 222, y: 86))
-shoulders.closeSubpath()
-context.addPath(shoulders)
-context.fillPath()
+context.interpolationQuality = .high
+context.draw(croppedImage, in: CGRect(origin: .zero, size: outputSize))
 
-let tuft = CGMutablePath()
-tuft.move(to: CGPoint(x: 405, y: 653))
-tuft.addCurve(to: CGPoint(x: 453, y: 718),
-              control1: CGPoint(x: 408, y: 688),
-              control2: CGPoint(x: 429, y: 719))
-tuft.addCurve(to: CGPoint(x: 470, y: 661),
-              control1: CGPoint(x: 477, y: 717),
-              control2: CGPoint(x: 478, y: 683))
-tuft.closeSubpath()
-context.addPath(tuft)
-context.fillPath()
-
-context.setFillColor(cream.cgColor)
-let play = CGMutablePath()
-play.move(to: CGPoint(x: 812, y: 220))
-play.addLine(to: CGPoint(x: 812, y: 548))
-play.addLine(to: CGPoint(x: 1090, y: 384))
-play.closeSubpath()
-context.addPath(play)
-context.fillPath()
-
-guard let cgImage = context.makeImage(),
-      let png = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:]) else {
+guard let renderedImage = context.makeImage(),
+      let png = NSBitmapImageRep(cgImage: renderedImage)
+        .representation(using: .png, properties: [:]) else {
     fputs("Unable to render PNG\n", stderr)
     exit(1)
 }
 
-try png.write(to: URL(fileURLWithPath: CommandLine.arguments[1]), options: .atomic)
+try png.write(to: outputURL, options: .atomic)

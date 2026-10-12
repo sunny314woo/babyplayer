@@ -1,4 +1,6 @@
 // Safe committed defaults. A local optional file overrides only this app target.
 BABYPLAYER_ASR_API_TOKEN = XX_BABYPLAYER_API_TOKEN
-BABYPLAYER_PRODUCT_BUNDLE_IDENTIFIER = com.wufengyu.BabyPlayer
+// The original Personal Team identifier became unavailable for automatic signing.
+// Keep this identifier unique to the 330324640@qq.com team.
+BABYPLAYER_PRODUCT_BUNDLE_IDENTIFIER = com.wufengyu.BabyPlayerTV
 #include? "BabyPlayerSecrets.xcconfig"
